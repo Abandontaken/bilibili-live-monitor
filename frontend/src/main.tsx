@@ -9,6 +9,7 @@ import {RoomIssue} from './RoomIssue';
 import {InstanceProvider, useApi, useInstance, type Instance} from './Instance';
 import {RoomArchive} from './RoomArchive';
 import {RoomLinks} from './RoomLinks';
+import {RoomTrend} from './RoomTrend';
 
 type Segment = {seq:number; start_utc:string; end_utc:string; text:string; status:string;
   queue_wait_ms:number; infer_ms:number; rms_dbfs:number; error:string|null; coverage_ratio?:number|null};
@@ -89,7 +90,7 @@ type WatchSummary = {policy:{mode:string;enabled:boolean;fixed_rooms?:string[]};
   candidates:WatchCandidate[];sources:{room_id:string;status:string;recording_status:string}[];
   message_health:Record<string,{state?:string;last_message_utc?:string}>};
 
-function WatchStatus(){
+export function WatchStatus(){
   const api=useApi();
   const [summary,setSummary]=useState<WatchSummary|null>(null);
   const [failed,setFailed]=useState(false);
@@ -115,30 +116,6 @@ function WatchStatus(){
       </article>})}</section>;
 }
 
-function RoomPreview({room}:{room:Room}){
-  const {base}=useInstance();
-  const container=useRef<HTMLDivElement>(null);
-  const [visible,setVisible]=useState(false);
-  const [image,setImage]=useState('');
-  useEffect(()=>{const observer=new IntersectionObserver(entries=>setVisible(entries[0].isIntersecting));
-    if(container.current)observer.observe(container.current);return()=>observer.disconnect()},[]);
-  useEffect(()=>{
-    if(!room.preview_enabled||room.status!=='capturing'||!visible)return;
-    const controller=new AbortController();let timer:ReturnType<typeof setTimeout>|undefined;
-    let current='';let alive=true;
-    async function refresh(){
-      try{if(!document.hidden){const response=await fetch(base+`api/rooms/${room.room_id}/preview.jpg`,{signal:controller.signal,cache:'no-store'});
-        if(response.ok){const blob=await response.blob();if(!alive)return;
-          const next=URL.createObjectURL(blob);if(current)URL.revokeObjectURL(current);current=next;setImage(next)}}
-      }catch{/* 下次请求重试，不影响弹幕时间线。 */}
-      if(alive)timer=setTimeout(()=>void refresh(),333);
-    }
-    void refresh();return()=>{alive=false;controller.abort();if(timer)clearTimeout(timer);if(current)URL.revokeObjectURL(current);setImage('')};
-  },[room.preview_enabled,room.status,room.room_id,visible]);
-  return <div className="cover" ref={container}>{image?<img src={image}/>:<div className="placeholder">{room.room_id.slice(-4)}</div>}
-    <span className="muted">{room.preview_enabled?'按需缩略图':'缩略图禁用'}</span></div>;
-}
-
 const RoomCard = React.memo(function RoomCard({room,status,onError}:{room:Room;status:string;onError:(s:string)=>void}){
   const api=useApi();const {base}=useInstance();
   const scroller=useRef<HTMLDivElement>(null);
@@ -148,20 +125,16 @@ const RoomCard = React.memo(function RoomCard({room,status,onError}:{room:Room;s
     if(following&&scroller.current)scroller.current.scrollTop=scroller.current.scrollHeight;
   },[room.items,following]);
   return <article className="card">
-    <RoomPreview room={room}/>
     <div className="card-body"><div className="room-heading"><a href={room.url} target="_blank" rel="noreferrer">{room.title.replace(/ - 哔哩哔哩直播.*$/,'')}</a><span className={'badge '+status}>{labels[status]||status}</span></div>
     <RoomLinks liveUrl={room.url} archiveUrl={room.home_url?base+room.home_url:undefined}/>
-    <div className="room-sub"><span>房间 {room.room_id}{room.instance_label?` · ${room.instance_label}`:''} · 流式输入 5 秒 · 上下文 ≤30 秒</span><button className="text-button" disabled={room.status==='stopped'||room.status==='waiting'} onClick={()=>api(`rooms/${room.room_id}/stop`,{method:'POST'}).catch(e=>onError(e.message))}>停止监控</button></div>
+    <div className="room-sub"><span>房间 {room.room_id}{room.instance_label?` · ${room.instance_label}`:''}</span><button className="text-button" disabled={room.status==='stopped'||room.status==='waiting'} onClick={()=>api(`rooms/${room.room_id}/stop`,{method:'POST'}).catch(e=>onError(e.message))}>停止监控</button></div>
     {room.result_url&&<p className="room-sub"><a href={base+room.result_url} target="_blank" rel="noreferrer">{room.workflow_stage==='completed'?'查看本场最终结果':'查看本场结果（处理中）'}</a></p>}
     <RoomIssue status={room.status} error={room.error} updatedAt={room.updated_at}/>
     {room.audio_error&&room.status==='capturing'&&<p className="error">音频质量或媒体进度异常：{room.audio_error}</p>}
     {room.capture_health&&<p className="room-sub">近一小时（当前采集任务）：整页重载 {room.capture_health.last_hour.page_reloads} 次 · 采音重建 {room.capture_health.last_hour.local_restarts} 次 · 异常音频 {Math.round(room.capture_health.last_hour.invalid_seconds)} 秒 · 采集缺口 {Math.round(room.capture_health.last_hour.gap_seconds)} 秒</p>}
     {!!room.reconnect_attempts&&<p className="room-sub">连续失败 {room.reconnect_attempts} 次{room.next_retry_utc?` · 下次重试 ${time(room.next_retry_utc)}`:''}</p>}
-    <p className="room-sub">保存：{({none:'关闭',audio:'原始音频',video:'原始音视频'})[room.record_mode]} · ASR：{room.asr_enabled?'启用':'禁用'} · 弹幕 / 礼物 / 入场 / 点赞：保存并显示</p>
-    {room.like_summary&&<p className="room-sub like-summary">平台累计点赞：{room.like_summary.reported_total??'尚未收到'} · 个人点赞通知：{room.like_summary.notifications} 条 / 可识别 {room.like_summary.identified_users} 人{room.like_summary.observed_utc?` · 更新 ${time(room.like_summary.observed_utc)}`:''}</p>}
-    <p className="room-sub">平台累计点赞不等于本次新增量；个人通知条数不等于点击次数。</p>
-    <p className="room-sub">入场仅展示平台通知，不代表完整在线名单；未提供可靠离场状态。</p>
     {room.record_mode!=='none'&&<p className="room-sub">录制 {room.recording_status==='recording'?'进行中':room.recording_status==='starting'?'启动中':room.recording_status==='stopped'?'已结束':room.recording_status} · {(room.recorded_seconds/60).toFixed(1)} 分钟 · {(room.recording_bytes/1e6).toFixed(1)} MB · {room.recording_files} 文件</p>}
+    {room.home_url&&<RoomTrend base={base} roomId={room.room_id}/>}
     <div className="timeline-tools"><button className="text-button" aria-pressed={following} onClick={()=>{setFollowing(true);if(scroller.current)scroller.current.scrollTop=scroller.current.scrollHeight}}>{following?'跟随最新':'已暂停·回最新'}</button><a href={base+'api/export?room_id='+room.room_id}>导出本房快照</a></div>
     <div className={'segments'+(following?' following':'')} ref={scroller} onScroll={e=>{const n=e.currentTarget;setFollowing(n.scrollHeight-n.scrollTop-n.clientHeight<32)}}>
       {!room.items.length?<p className="waiting">等待弹幕、礼物或首个音频切片…</p>:room.items.map(item=><div className={'segment '+item.kind+' '+(item.status||'')} key={item.id}>
@@ -170,7 +143,7 @@ const RoomCard = React.memo(function RoomCard({room,status,onError}:{room:Room;s
         {item.error&&item.text&&<p className="room-error">{item.error}</p>}
       </div>)}
     </div>
-    <footer>{room.asr_enabled?<><span>等待 {latest?`${(latest.queue_wait_ms/1000).toFixed(1)}s`:'—'}</span><span>推理 {latest?`${(latest.infer_ms/1000).toFixed(1)}s`:'—'}</span><span>{latest?`${latest.rms_dbfs} dBFS`:'等待音频'}</span><span>覆盖 {latest?.coverage_ratio!=null?`${(latest.coverage_ratio*100).toFixed(0)}%`:'—'}</span></>:<span>ASR 禁用 · 不创建识别音频队列</span>}</footer>
+    <details className="technical-details"><summary>诊断信息</summary><footer>{room.asr_enabled?<><span>等待 {latest?`${(latest.queue_wait_ms/1000).toFixed(1)}s`:'—'}</span><span>推理 {latest?`${(latest.infer_ms/1000).toFixed(1)}s`:'—'}</span><span>{latest?`${latest.rms_dbfs} dBFS`:'等待音频'}</span><span>覆盖 {latest?.coverage_ratio!=null?`${(latest.coverage_ratio*100).toFixed(0)}%`:'—'}</span></>:<span>ASR 禁用</span>}</footer></details>
     </div></article>;
 });
 
@@ -179,7 +152,6 @@ function SnapshotApp(){
   const [state,setState] = useState<State>({rooms:[],queue_depth:0,queue_capacity:20,asr_ready:false,asr_enabled:false,overload_count:0,inflight:null,active_count:0,pending_count:0,asr_restarts:0,asr_retries:0,asr_error:null});
   const [recordMode,setRecordMode]=useState('audio');
   const [asrEnabled,setAsrEnabled]=useState(false);
-  const [previewEnabled,setPreviewEnabled]=useState(false);
   const [connected,setConnected] = useState(false);
   const [url,setUrl] = useState('');
   const seconds = 5;
@@ -220,49 +192,47 @@ function SnapshotApp(){
   },[]);
   async function add(value:string){
     setBusy(true);setError('');
-    try{await api('rooms',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:value,chunk_seconds:seconds,record_mode:recordMode,asr_enabled:asrEnabled,preview_enabled:previewEnabled})});setUrl('')}
+    try{await api('rooms',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:value,chunk_seconds:seconds,record_mode:recordMode,asr_enabled:asrEnabled,preview_enabled:false})});setUrl('')}
     catch(e){setError((e as Error).message)}finally{setBusy(false)}
   }
   const active=state.active_count+state.pending_count;
   return <main>
     <header><div><div className="eyebrow">本地 CDP 静音捕获 · Qwen3-ASR</div><h1>B站多路直播监控看板{label?` · ${label}`:''}</h1><p>多路直播语音、弹幕与礼物混合时间线。</p></div>
       <div className="header-actions"><button className="secondary" onClick={async()=>{try{if(document.fullscreenElement)await document.exitFullscreen();else await document.documentElement.requestFullscreen()}catch(e){setError((e as Error).message)}}}>{fullscreen?'退出全屏':'进入全屏'}</button><span className={'connection '+(connected?'online':'')}><i/>{connected?'实时连接正常':'正在重连'}</span></div></header>
-    <section className="metrics">
+    <details className="dashboard-details"><summary>系统状态与资源</summary><section className="metrics">
       <div><span>监控任务（含重连 / 启动）</span><strong>{active}<small> 路</small></strong></div>
       <div><span>队列深度</span><strong>{state.queue_depth}<small> / {state.queue_capacity}</small></strong></div>
       <div><span>ASR · 重启 {state.asr_restarts} / 重试 {state.asr_retries}</span><strong className="word">{!state.asr_enabled?'禁用':state.asr_ready?'已就绪':state.asr_error?'等待恢复':'正在加载'}</strong></div>
       <div><span>队列过载次数</span><strong className={state.overload_count?'warning':''}>{state.overload_count}</strong></div>
     </section>
-    <ResourceMetrics/>
-    <WatchStatus/>
-    <form onSubmit={e=>{e.preventDefault();void add(url)}}>
+    <ResourceMetrics/></details>
+    <AutomationControls rooms={state.rooms}/>
+    <details className="dashboard-details"><summary>添加直播间</summary><form onSubmit={e=>{e.preventDefault();void add(url)}}>
       <input aria-label="直播间链接或房间号" placeholder="输入直播间链接或房间号" value={url} onChange={e=>setUrl(e.target.value)} required/>
-      <span className="room-sub">千问流式 · 每5秒更新</span>
       <select aria-label="保存类型" value={recordMode} onChange={e=>setRecordMode(e.target.value)}><option value="audio">只保存音频</option><option value="video">保存视频＋音频</option><option value="none">不保存媒体</option></select>
       <label><input type="checkbox" checked={asrEnabled} onChange={e=>setAsrEnabled(e.target.checked)}/>ASR</label>
-      <label><input type="checkbox" checked={previewEnabled} onChange={e=>setPreviewEnabled(e.target.checked)}/>缩略图</label>
       <button disabled={busy}>{busy?'正在连接…':'添加直播间'}</button>
       <button type="button" className="secondary" disabled={busy} onClick={async()=>{
         setBusy(true);setError('');try{setCandidates(await api('discover?limit=20'))}catch(e){setError((e as Error).message)}finally{setBusy(false)}
       }}>发现直播</button>
-    </form>
+    </form></details>
     {error&&<div className="alert" role="alert">{error}<button onClick={()=>setError('')}>×</button></div>}
     {state.asr_error&&<div className="alert" role="alert">模型：{state.asr_error}</div>}
     {candidates.length>0&&<section className="candidates">{candidates.map(c=><button disabled={busy} key={c.url} className="secondary" onClick={()=>void add(c.url)}>{c.title||c.url}</button>)}</section>}
     <div className="section-title"><h2>直播间 <span>{state.rooms.length}</span></h2><a className="export-link" href={base+'api/export'}>导出全部快照</a></div>
     {state.rooms.length===0&&<section className="empty">当前暂无监控房间，请输入直播间链接或房间号开始监听。</section>}
-    <section className="grid">{state.rooms.map(room=><RoomCard key={room.room_id} room={room} status={room.status==='capturing'&&state.inflight?.room_id===room.room_id?'transcribing':room.status} onError={setError}/>)}</section>
-    <p className="footnote">每房间显示最近80条弹幕、礼物与转写；完整时间线保存于本地SQLite，可导出JSONL。付费金额统一显示电池（100金瓜子＝1电池，1元＝10电池）；免费礼物仍显示银币。盲盒花费与抽中礼物单价分列，均不代表主播净收入；导出保留协议原始单位。游戏声和背景音乐可能造成误识别。</p>
+    <section className="grid">{state.rooms.map(room=><div id={'room-'+base.replace(/\W/g,'-')+room.room_id} key={room.room_id}><RoomCard room={room} status={room.status==='capturing'&&state.inflight?.room_id===room.room_id?'transcribing':room.status} onError={setError}/></div>)}</section>
+    <details className="technical-details"><summary>数据说明</summary><p className="footnote">每房间显示最近80条消息。完整时间线保存在本地，可导出快照。历史统计与金额口径见按日汇总。</p></details>
   </main>;
 }
 function SingleApp(){
   const instance=useInstance();
   const [page,setPage]=useState<'snapshot'|'assistant'>('snapshot');
-  if(instance.mode==='anonymous')return <><AutomationControls/><SnapshotApp/></>;
+  if(instance.mode==='anonymous')return <SnapshotApp/>;
   return <><nav className="top-nav" aria-label="页面">
     <button aria-pressed={page==='snapshot'} onClick={()=>setPage('snapshot')}>快照</button>
     <button aria-pressed={page==='assistant'} onClick={()=>setPage('assistant')}>直播助手</button>
-   </nav><AutomationControls/><div hidden={page!=='snapshot'}><SnapshotApp/></div>{page==='assistant'&&<main><Assistant/></main>}</>;
+   </nav><div hidden={page!=='snapshot'}><SnapshotApp/></div>{page==='assistant'&&<main><Assistant/></main>}</>;
 }
 export function App(){
   const [instances,setInstances]=useState<Instance[]|null>(null);
