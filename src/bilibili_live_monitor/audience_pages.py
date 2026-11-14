@@ -199,7 +199,7 @@ def _build(config):
             for uid in [p.get('uid'), *p.get('observed_uids', [])] if uid}
     for pid, person in material['people'].items():
         state = current['states'].get(pid, {})
-        if person['evidence']:
+        if person['evidence'] and person.get('analysis_eligible') is not False:
             validate_state(person, state, material)
         rows.append(public_person(person, state, uids))
         directory = output / pid

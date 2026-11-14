@@ -74,6 +74,10 @@ def advance(session, state):
         atomic_json(marker, saved)
     directory = Path(saved['run'])
     accepted = directory / 'accepted.json'
+    if (not accepted.exists()
+            and json.loads((directory / 'material.json').read_text()).get('update_policy')
+            != 'meaningful-interaction-v1'):
+        raise ValueError('旧未完成CRM计划须按有效互动规则重新准备，不可继续派发')
     if accepted.exists():
         current = json.loads((Path(config['workspace']) / 'current.json').read_text())
         if current['room_id'] != session['room_id']:
