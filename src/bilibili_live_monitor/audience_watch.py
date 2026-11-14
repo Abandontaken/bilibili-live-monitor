@@ -12,6 +12,9 @@ from .session_budget import BudgetPaused, check_budget
 
 
 def tick(settings):
+    from .deployment import MaintenancePaused, paused
+    if paused('crm'):
+        return {'status': 'maintenance_paused'}
     root = Path(settings['workspace']).resolve()
     root.mkdir(parents=True, exist_ok=True)
     with (root / '.lock').open('a') as lock:
@@ -38,7 +41,10 @@ def tick(settings):
                 candidates.append((epoch(raw['start_utc']), session_path, path))
         active_path = root / 'active.json'
         active = json.loads(active_path.read_text()) if active_path.exists() else None
+        new_batch = active is None
         if active is None:
+            if paused('crm', new_work=True):
+                return {'status': 'maintenance_draining'}
             for _, session_path, config_path in sorted(candidates):
                 session = load_config(session_path)
                 key = session['workflow_key']
@@ -52,6 +58,21 @@ def tick(settings):
                 break
         if active is None:
             return {'status': 'idle'}
+        from .deployment import component_call
+        # 释放watch锁后再跨版本调用，子进程复用同一批次身份和既有锁。
+        marker = root / (active['key'] + '.deployment.json')
+        import os
+        if os.environ.get('BILI_DEPLOYMENT_REGISTRY'):
+            from .deployment import pin, select
+            if not marker.exists():
+                if not new_batch:
+                    raise RuntimeError('历史CRM批次须显式登记固定版本')
+                pin(os.environ['BILI_DEPLOYMENT_REGISTRY'], 'crm', marker)
+            binding = select(os.environ['BILI_DEPLOYMENT_REGISTRY'], 'crm', marker)
+            if binding['release'] != str(Path(__file__).resolve().parents[2]):
+                fcntl.flock(lock, fcntl.LOCK_UN)
+                forwarded = component_call('crm', marker, 'bilibili_live_monitor.audience_watch', 'tick', [settings])
+                return forwarded['result']
         if active.get('automation_paused'):
             return {'status': 'paused', 'key': active['key'], 'pause': active['automation_paused']}
         if active.get('attention'):
@@ -61,7 +82,8 @@ def tick(settings):
         state = json.loads(state_path.read_text()) if state_path.exists() else {}
         state.setdefault('finish_deadline', active['started_at'] + settings.get('timeout_seconds', 21600))
         atomic_json(state_path, state)
-        session.update(audience_crm_config=active['config'], audience_state_path=str(state_path))
+        session.update(audience_crm_config=active['config'], audience_state_path=str(state_path),
+                       deployment_pin=str(marker))
         try:
             if active.get('last_error'):
                 raise ValueError(active['last_error'])
@@ -74,6 +96,8 @@ def tick(settings):
                 atomic_json(active_path, None)
                 return result
             return {'status': 'running', 'key': active['key']}
+        except MaintenancePaused:
+            return {'status': 'maintenance_paused', 'key': active['key']}
         except BudgetPaused:
             pause = state.setdefault('automation_paused', {
                 'reason': 'finish_timeout', 'paused_at': time.time(),

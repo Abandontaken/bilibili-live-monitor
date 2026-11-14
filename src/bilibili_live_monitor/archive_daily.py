@@ -59,7 +59,10 @@ def process(item, locks, *, trash_originals):
         target = archived_input(item['legacy_row'])
         if target.stat().st_size >= item['source_stat']['size']:
             raise ValueError('归档没有变小，保留原片')
-        if trash_originals:
+        retained = archive.original_retained(item['source'])
+        if retained:
+            result['original_retained'] = True
+        if trash_originals and not retained:
             result.update(archive.cleanup(item, permanent=False))
             if Path(item['source']).exists():
                 raise ValueError('Trash返回成功但原片仍存在')
@@ -92,7 +95,8 @@ def run(roots, *, execute=False, workers=2, trash_originals=False, report_dir=No
             raise ArchiveWriterBusy('已有归档作业持锁') from error
         items = plan(roots)
         pending = [item for item in items if item['action'] == 'encode'
-                   or trash_originals and item['action'] == 'archived' and Path(item['source']).is_file()]
+                   or trash_originals and item['action'] == 'archived' and Path(item['source']).is_file()
+                    and not archive.original_retained(item['source'])]
         pending = pending[:max_files] if max_files is not None else pending
         summary = {'read_only': not execute, 'workers': workers, 'trash_originals': trash_originals,
                     'inventory': dict(Counter(item['action'] for item in items)),
@@ -139,6 +143,9 @@ def main():
     parser.add_argument('--report-dir', type=Path)
     parser.add_argument('--max-files', type=int)
     args = parser.parse_args()
+    if args.execute:
+        from .deployment import require_running
+        require_running('archive', new_work=True)
     try:
         result = run(args.sessions_root, execute=args.execute, workers=args.workers,
                      trash_originals=args.trash_originals, report_dir=args.report_dir, max_files=args.max_files)

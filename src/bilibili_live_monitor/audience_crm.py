@@ -98,15 +98,16 @@ def collect(config, sessions):
             event = {'id': digest([room, session['id'], event_key])[:32], 'at': at,
                      'session_id': session['id'], 'kind': kind, 'name': name}
             if kind == 'gift':
+                from .gift_value import VALUE_BASIS, gift_text
                 count, amount = nonnegative_integer(gift.get('num')), gift_amount(gift)
                 event.update(gift_name=str(gift.get('gift_name') or family), count=count,
-                             amount_milli=amount)
+                             amount_milli=amount, gift_value_basis=VALUE_BASIS)
                 person['counts']['gift_events'] += 1
                 person['counts']['gift_count'] += count or 0
                 person['counts']['gift_count_unknown'] += count is None
                 person['counts']['amount_milli'] += amount or 0
                 person['counts']['amount_unknown'] += amount is None
-                event['text'] = str(data.get('text') or event['gift_name'])
+                event['text'] = gift_text(gift, str(data.get('text') or event['gift_name']))
             else:
                 person['counts'][kind] += 1
                 event['text'] = str(data.get('text') or '')
@@ -563,7 +564,15 @@ def main():
     parser.add_argument('--run', type=Path)
     parser.add_argument('--result', type=Path)
     args = parser.parse_args()
+    if args.action != 'validate':
+        from .deployment import require_running
+        require_running('crm', new_work=args.action == 'prepare')
     config = json.loads(args.config.read_text())
+    if args.action != 'validate':
+        import os
+        if os.environ.get('BILI_TASK_PIN') or os.environ.get('BILI_RELEASE_ROOT'):
+            from .deployment import check_task
+            check_task(config, 'crm')
     if args.action == 'prepare':
         directory, plan = prepare(config, load_material(config))
         result = {'run': str(directory), 'plan_id': plan['id'], 'tasks': len(plan['tasks'])}

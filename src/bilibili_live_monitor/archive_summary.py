@@ -8,6 +8,7 @@ from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 from .archive_metrics import aggregate_metrics
+from .gift_value import VALUE_BASIS
 from .time_utils import epoch
 
 FIELDS = ('online_mean', 'online_peak', 'watched_last', 'followers_net', 'amount',
@@ -24,7 +25,8 @@ def summaries(source, sessions):
                      'session': '上午场' if local.hour < 12 else '下午场' if local.hour < 19 else '晚间场',
                      'start_utc': session['start'], 'updated_at': session['end'],
                      'hours': (upper - lower) / 3600, 'status': session['status'],
-                     'has_result': session['has_result'],
+                      'has_result': session['has_result'],
+                      'gift_value_basis': VALUE_BASIS,
                      'metrics': metrics})
     return sorted(rows, key=lambda row: row['start_utc'], reverse=True)
 
@@ -53,6 +55,11 @@ def shared_summaries(path, local_rows, origin=None):
         values = {key: value if type(value := metrics.get(key)) in (int, float) and math.isfinite(value)
                   else None for key in FIELDS}
         match = matches.get(row.get('start_utc'))
+        if row.get('gift_value_basis', data.get('gift_value_basis')) != VALUE_BASIS:
+            values['amount'] = ((match.get('metrics') or {}).get('amount') if 'metrics' in match else
+                                (match.get('summary') or {}).get('gift_value_yuan')) if match else None
+            values['amount_nonself'] = None
+            values['paid_donors_nonself'] = None
         remote_path = row.get('url')
         detail_url = (origin + remote_path if origin and isinstance(remote_path, str)
                       and re.fullmatch(r'/(?:s|share)/[A-Za-z0-9_-]+/', remote_path) else None)
@@ -61,7 +68,7 @@ def shared_summaries(path, local_rows, origin=None):
         status = row.get('status', 'completed')
         status = status if status in ('live', 'finalizing', 'completed') else 'finalizing'
         rows.append({key: row.get(key) for key in ('date', 'session', 'start_utc', 'updated_at')}
-                    | {'hours': hours, 'status': status, 'metrics': values,
+                    | {'hours': hours, 'status': status, 'metrics': values, 'gift_value_basis': VALUE_BASIS,
                        'key': match['key'] if match else None, 'has_result': bool(match and match['has_result']),
                        'detail_url': detail_url if not match or not match['has_result'] else None})
     return rows

@@ -39,7 +39,7 @@ export function SessionOverviewChart({rows}:{rows:SummaryRow[]}){
    <span className="overview-online">▰ 平均在线人数 · 左轴</span><span className="overview-gifts">━● 每场礼物总金额 · 右轴</span>
   </div></div>
   {!points.length?<p>暂无场次数据。</p>:<>
-   <div className="overview-chart-units"><span>平均在线（人）</span><span>礼物金额（元）</span></div>
+   <div className="overview-chart-units"><span>平均在线（人）</span><span>礼物价值（元）</span></div>
    <div className="overview-chart-grid">
     <svg className="overview-axis" viewBox={`0 0 52 ${height}`} preserveAspectRatio="none" aria-label="左轴：平均在线人数">
      {[0,1,2,3,4].map(i=><text key={i} x="46" y={y(leftMax*i/4,leftMax)+4} textAnchor="end">{tick(leftMax*i/4)}</text>)}

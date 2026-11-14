@@ -22,7 +22,8 @@ export function giftText(gift:Gift|null|undefined, original:string){
     const message=original.replace(/^醒目留言 \d+ 元[：:]\s?/, '');
     return `醒目留言 ${gift.price_yuan*10} 电池：${message}`;
   }
-  if(!gift.gift_name||!amount(gift.num)||gift.num<1)return original;
+  if(!gift.gift_name||!amount(gift.num)||gift.num<1)
+    return `${gift.blind_gift?'盲盒结果：':'赠送 '}${gift.gift_name||'未知礼物'} · 数量未知 · 礼物价值未知`;
   if(gift.event_type==='GUARD_BUY'){
     return `购买 ${gift.gift_name} ×${gift.num}（大航海等级 ${gift.guard_level}）`+
       (amount(gift.guard_price_gold)?` · 平台报告金额 ${batteries(gift.guard_price_gold)}`:'');
@@ -30,9 +31,8 @@ export function giftText(gift:Gift|null|undefined, original:string){
   const blind=gift.blind_gift;
   let text=`${blind?'盲盒结果：':'赠送 '}${gift.gift_name} ×${gift.num}`;
   if(gift.coin_type==='gold'){
-    if(amount(gift.total_coin))text+=` · ${blind?'盲盒花费 ':''}${batteries(gift.total_coin)}`;
-    if(blind&&amount(gift.price))text+=` · 抽中礼物单价 ${batteries(gift.price)}`;
-    if(blind&&amount(blind.original_gift_price))text+=` · 原盲盒单价 ${batteries(blind.original_gift_price)}`;
+    const value=amount(gift.price)?gift.price*gift.num:blind?null:gift.total_coin;
+    text+=amount(value)?` · 礼物价值 ${batteries(value)}`:' · 礼物价值未知';
   }else if(gift.coin_type==='silver'&&amount(gift.total_coin)){
     text+=` · ${gift.total_coin} 银币`;
   }

@@ -63,6 +63,8 @@ def post(config, payload):
 
 
 def launch(config, kind, shard_id, resume_session=None):
+    from .deployment import require_running
+    require_running('crm' if kind == 'audience_finalize' else 'sessions')
     from .session_budget import check_budget
     check_budget(config, kind=kind)
     root, plan, shard = context(config, kind, shard_id)
@@ -92,8 +94,9 @@ def launch(config, kind, shard_id, resume_session=None):
         command = [sys.executable, '-m', 'bilibili_live_monitor.cursor_finalize', 'worker',
                    '--config', config['_config_path'], '--kind', kind, '--shard', shard_id, '--token', token]
         try:
+            from .deployment import child_environment
             reply = post(config, {'command': command, 'cwd': str(Path.cwd()),
-                'env': {'PYTHONPATH': str(Path(__file__).resolve().parents[1])},
+                'env': {**child_environment(), 'PYTHONPATH': str(Path(__file__).resolve().parents[1])},
                 'label': f'cursor_finalize_{plan["id"][:12]}_{shard_id}',
                 'timeout': 2850, 'diagnose_on_failure': False})
             if reply.get('diagnose_on_failure') is not False or not reply.get('pid'):
@@ -167,6 +170,7 @@ def stop_group(proc):
 
 
 def worker(config, kind, shard_id, token):
+    from .deployment import MaintenancePaused, require_running
     root, plan, shard = context(config, kind, shard_id)
     runs = root / 'cursor_workers'
     path = runs / f'{shard_id}.json'
@@ -177,6 +181,13 @@ def worker(config, kind, shard_id, token):
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         with (runs / 'launch.lock').open('a') as registry:
             fcntl.flock(registry, fcntl.LOCK_EX)
+            try:
+                require_running('crm' if kind == 'audience_finalize' else 'sessions')
+            except MaintenancePaused:
+                state.update(state='maintenance_paused_before_start', adapter_pid=os.getpid(),
+                             ended_at=time.time())
+                atomic_json(path, state)
+                return state
             if (runs / 'stop.json').exists():
                 state.update(state='cancelled_before_start', ended_at=time.time())
                 atomic_json(path, state)
@@ -195,6 +206,12 @@ def worker(config, kind, shard_id, token):
         stdout = runs / f'{shard_id}.stdout.jsonl'
         stderr = runs / f'{shard_id}.stderr.log'
         with stdout.open('wb') as out, stderr.open('wb') as err:
+            try:
+                require_running('crm' if kind == 'audience_finalize' else 'sessions')
+            except MaintenancePaused:
+                state.update(state='maintenance_paused_before_start', ended_at=time.time())
+                atomic_json(path, state)
+                return state
             try:
                 proc = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=out, stderr=err,
                                         cwd=runs, start_new_session=True)
@@ -249,6 +266,16 @@ def worker(config, kind, shard_id, token):
         return state
 
 
+def maintenance_adapter_stopped(state):
+    if state.get('pgid') or not state.get('adapter_pid'):
+        return False
+    try:
+        os.kill(state['adapter_pid'], 0)
+    except ProcessLookupError:
+        return True
+    return False
+
+
 def retry(config, kind, shard_id):
     """明确失败且无写入者后，有界续接同模型；保留前次完整证据。"""
     from .session_budget import check_budget
@@ -263,13 +290,17 @@ def retry(config, kind, shard_id):
             raise ValueError('本场已停止，不能重试')
         path = runs / f'{shard_id}.json'
         state = json.loads(path.read_text())
-        if state.get('state') not in ('failed', 'interrupted') or Path(shard['result']).exists():
+        maintenance = state.get('state') == 'maintenance_paused_before_start'
+        if state.get('state') not in ('failed', 'interrupted', 'maintenance_paused_before_start') or Path(shard['result']).exists():
             raise ValueError('仅明确失败且尚未转正的分片可重试')
+        if maintenance:
+            if not maintenance_adapter_stopped(state):
+                raise ValueError('原adapter尚未确认退出，不能恢复')
         if state.get('pgid') and group_exists(state['pgid']):
             raise ValueError('前次进程组仍存在，不能重试')
-        history = runs / 'history' / shard_id
+        history = runs / ('maintenance_history' if maintenance else 'history') / shard_id
         attempts = list(history.iterdir()) if history.exists() else []
-        if len(attempts) >= 2:
+        if not maintenance and len(attempts) >= 2:
             raise ValueError('已达两次恢复上限，保留现场报告失败')
         archive = history / state['token']
         archive.mkdir(parents=True)
@@ -287,7 +318,7 @@ def retry(config, kind, shard_id):
                     continue
                 if isinstance(event, dict) and event.get('type') == 'system' and event.get('session_id'):
                     session_ids.append(event['session_id'])
-        resume_session = session_ids[-1] if session_ids else None
+        resume_session = session_ids[-1] if session_ids else state.get('resume_session')
     return launch(config, kind, shard_id, resume_session=resume_session)
 
 
@@ -428,7 +459,9 @@ def stop_workers(config, *, kinds=KINDS):
                     request(base + f'/processes/{job["pid"]}/stop', {})
                 stopped = False  # 下一轮读到适配器清理后终态才确认。
             else:
-                if state.get('state') == 'submitting':
+                if state.get('state') == 'maintenance_paused_before_start':
+                    stopped = maintenance_adapter_stopped(state) and stopped
+                elif state.get('state') == 'submitting':
                     # stop标记阻止任何响应晚到的适配器真正启动Cursor。
                     state.update(state='cancelled_before_start', ended_at=time.time())
                     atomic_json(path, state)
@@ -464,8 +497,9 @@ def coordinator_prompt(config, prompt, root):
     final_steps = ('最终逐条检查纠错候选真实引文、跨片歌名及边界，拒绝官方歌词替代改词/漏听。所有Cursor已退出后继续原合同的merge、来源登记、corrections逐条重审、正常finish。'
                    if kind == 'finalize' else
                    '最终逐条检查校正真实引文、覆盖和跨片用词一致性，保留未确定内容。所有Cursor已退出后仅按原合同执行talk_finalize finish，不执行音乐merge、歌曲来源登记或corrections。')
-    command = shlex.join([sys.executable, '-m', 'bilibili_live_monitor.cursor_finalize', 'start',
-                          '--config', config['_config_path'], '--kind', kind])
+    from .deployment import task_command
+    command = task_command(config, 'bilibili_live_monitor.cursor_finalize') + ' ' + shlex.join([
+        'start', '--config', config['_config_path'], '--kind', kind])
     return prompt + f'''
 执行后端为Cursor CLI Grok（不是OpenCode task子代理），模型固定{MODEL}，总协调由OpenCode完成。
 先读plan.json，按片调用 `{command} --shard 000`（000替换实际编号）。此命令通过本机Process Launcher启动拥有wait/超时/日志/退出码的单片适配器，短时返回，不是另一个总协调。
@@ -488,6 +522,11 @@ def main():
     parser.add_argument('--token')
     args = parser.parse_args()
     config = load_config(args.config)
+    from .deployment import check_task, require_running
+    component = 'crm' if args.kind == 'audience_finalize' else 'sessions'
+    if args.action != 'worker':
+        require_running(component)
+    check_task(config, component)
     if args.action == 'worker':
         value = worker(config, args.kind, args.shard, args.token)
     else:

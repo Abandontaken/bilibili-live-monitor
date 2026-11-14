@@ -4,7 +4,6 @@ import hashlib
 import json
 import shlex
 import subprocess
-import sys
 from pathlib import Path
 
 from .finalize_context import danmaku_context
@@ -171,7 +170,8 @@ class SubmissionNotSent(RuntimeError):
 def submit(config, session, on_handoff=lambda: None):
     plan = prepare(config)
     root = Path(config['workspace']) / 'finalize'
-    command = shlex.join([sys.executable, '-m', 'bilibili_live_monitor.session_finalize'])
+    from .deployment import task_command
+    command = task_command(config, 'bilibili_live_monitor.session_finalize')
     flag = '--config ' + shlex.quote(config['_config_path'])
     prompt = f'''FINALIZE_PLAN:{plan['id']}
 你负责本场离线finalize总任务，从头到尾完成，不等待外部逐批提示。
@@ -226,6 +226,9 @@ def main():
     parser.add_argument('action', choices=['merge', 'finish', 'corrections'])
     parser.add_argument('--config', required=True, type=Path)
     args = parser.parse_args()
+    from .deployment import check_task, require_running
+    require_running('sessions')
+    check_task(load_config(args.config))
     print(json.dumps({'merge': merge, 'finish': finish, 'corrections': corrections}[args.action](load_config(args.config)), ensure_ascii=False))
 
 

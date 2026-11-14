@@ -75,6 +75,20 @@ def test_audio_retains_first_packet_and_preserves_overlapping_packet_anchors():
     validation.verify_evidence(reference, reference, 'output', command_packets(packets))
 
 
+def test_missing_nominal_duration_preserves_v2_validation_but_rejects_legacy():
+    packets = [packet('0'), {'pts_time': '0.021', 'data_hash': 'B'}]
+    reference = validation.normalize_reference(info([frame('0')]), mixed=False)
+    reference['audio_evidence'] = validation.audio_evidence('input', command_packets(packets))
+    assert reference['audio_evidence']['spans_us'] is None
+    validation.verify_evidence(reference, reference, 'output', command_packets(packets))
+    with pytest.raises(ValueError, match='有效样本'):
+        validation.verify_evidence(reference, reference, 'output', command_packets([
+            packets[0], {**packets[1], 'decoded_samples': 512}]))
+    reference['validation_policy'] = validation.LEGACY_POLICY
+    with pytest.raises(ValueError, match='跨度证据缺失'):
+        validation.verify_evidence(reference, reference, 'output', command_packets(packets))
+
+
 def test_wrong_per_frame_dimensions_and_pts_are_rejected():
     reference = validation.normalize_reference(info([frame('0'), frame('0.033')]), mixed=True)
     reference['audio_evidence'] = validation.audio_evidence('input', command_packets([packet('0')]))

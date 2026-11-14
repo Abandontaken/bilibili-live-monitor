@@ -171,8 +171,8 @@ def test_v2_protobuf_batch_keeps_every_result_and_64bit_sender(tmp_path):
     assert decoded[0]['gift']['sender_uid'] == str(2**64 - 1)
     assert decoded[0]['gift']['event_type'] == 'SEND_GIFT_V2'
     assert decoded[0]['gift']['blind_gift']['original_gift_price'] == 200
-    assert '盲盒结果' in decoded[0]['text'] and '结果标价 100' in decoded[0]['text']
-    assert '原始盲盒价格原值 200（未换算）' in decoded[0]['text']
+    assert '盲盒结果' in decoded[0]['text'] and '礼物价值 ¥0.10' in decoded[0]['text']
+    assert '原始盲盒价格' not in decoded[0]['text']
     store = Store(tmp_path / 'monitor.sqlite3')
     for message in decoded * 2:
         store.live_message('123456', message)

@@ -148,6 +148,9 @@ def test_archive_uses_normalized_source_and_keeps_original_identity(source, monk
     monkeypatch.setattr(archive.validation, 'audio_evidence', lambda *_: {})
     monkeypatch.setattr(archive.validation, 'audio_tail_filter', lambda *_: [])
     monkeypatch.setattr(archive.validation, 'normalize_reference', lambda info, **_: info)
+    monkeypatch.setattr(archive.validation, 'video_filter', lambda *_a, **_k: archive.validation.TIME_FILTER)
+    monkeypatch.setattr(archive.validation, 'video_tags', lambda *_: [])
+    monkeypatch.setattr(archive.validation, 'audio_mux_options', lambda *_: [])
     monkeypatch.setattr(archive.shutil, 'disk_usage', lambda p: SimpleNamespace(free=10**12))
     monkeypatch.setattr(archive, 'verify_output', lambda info, path: {'format': {'duration': '2'}})
     commands = []
