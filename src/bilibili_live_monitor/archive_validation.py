@@ -79,8 +79,10 @@ def audio_evidence(path, command):
         raise ValueError('没有可验证的音频包')
     pts = [microseconds(p['pts_time']) for p in packets]
     # 仅保留给历史v1回执重验；v2不将名义duration当成跨容器有效样本跨度。
-    spans = [min(microseconds(p['duration_time']), pts[i + 1] - pts[i])
-             if i + 1 < len(packets) else microseconds(p['duration_time']) for i, p in enumerate(packets)]
+    spans = None
+    if all(p.get('duration_time') not in (None, 'N/A') for p in packets):
+        spans = [min(microseconds(p['duration_time']), pts[i + 1] - pts[i])
+                 if i + 1 < len(packets) else microseconds(p['duration_time']) for i, p in enumerate(packets)]
     digest = hashlib.sha256('\n'.join(p['data_hash'] for p in packets).encode()).hexdigest()
     streams = data['streams']
     if len(streams) != 1:
@@ -107,7 +109,8 @@ def audio_evidence(path, command):
                 skip += side.get('skip_samples', 0)
                 discard += side.get('discard_padding', 0)
         trims.append([skip, discard])
-    return {'packets': len(packets), 'payload_sha256': digest, 'pts_us': pack(pts), 'spans_us': pack(spans),
+    return {'packets': len(packets), 'payload_sha256': digest, 'pts_us': pack(pts),
+            'spans_us': pack(spans) if spans is not None else None,
             'config': config, 'decoded_samples': pack(samples), 'trims': pack(trims)}
 
 
@@ -236,6 +239,8 @@ def verify_evidence(reference, output, target, command):
     if not close(before['pts_us'], after['pts_us'], 1000):
         raise ValueError('音频时间轴改变，保留原片')
     if reference.get('validation_policy') == LEGACY_POLICY:
+        if not before.get('spans_us') or not after.get('spans_us'):
+            raise ValueError('历史音频跨度证据缺失，保留原片')
         if not close(before['spans_us'], after['spans_us'], 1000):
             raise ValueError('音频时间轴改变，保留原片')
         return  # Old receipts cannot claim evidence they never recorded.
