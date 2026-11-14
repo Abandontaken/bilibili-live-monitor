@@ -142,7 +142,7 @@ def create_gateway(config, *, transport=None):
             response.headers['Cache-Control'] = 'no-cache'
         return response
     archive_cache = {}
-    archive_lock = asyncio.Lock()
+    archive_locks = {}
 
     def instance(ident):
         if ident not in instances:
@@ -165,12 +165,21 @@ def create_gateway(config, *, transport=None):
         return row, archive
 
     @app.get('/instances/{ident}/api/rooms/{room_id}/archive')
-    async def room_archive(ident: str, room_id: str):
+    async def room_archive(ident: str, room_id: str, trend: bool = False):
         row, archive = archive_room(ident, room_id)
-        async with archive_lock:
+        async with archive_locks.setdefault((ident, room_id), asyncio.Lock()):
             cached = archive_cache.get((ident, room_id))
-            if cached and time.monotonic() - cached[0] < 30:
-                return cached[1]
+            if cached and time.monotonic() - cached[0] < (300 if trend else 30):
+                return {'summaries': cached[1].get('summaries', []), 'updated_at': cached[1].get('updated_at')} if trend else cached[1]
+            summary_file = archive.get('summary_files', {}).get(room_id)
+            if trend and summary_file:
+                from .archive_summary import shared_summaries
+                try:
+                    summaries = await asyncio.to_thread(shared_summaries, summary_file, [])
+                    return {'summaries': summaries, 'updated_at': max(
+                        (s.get('updated_at') or '' for s in summaries), default=None)}
+                except (OSError, ValueError, TypeError) as error:
+                    raise HTTPException(503, '暂时无法读取场次趋势') from error
             try:
                 from .room_archive import archive_data
                 summary_file = archive.get('summary_files', {}).get(room_id)
@@ -194,7 +203,7 @@ def create_gateway(config, *, transport=None):
             except (OSError, ValueError, TypeError) as error:
                 raise HTTPException(503, '暂时无法读取房间归档，请稍后刷新') from error
             archive_cache[ident, room_id] = time.monotonic(), data
-            return data
+            return {'summaries': data.get('summaries', []), 'updated_at': data.get('updated_at')} if trend else data
 
     @app.get('/instances/{ident}/rooms/{room_id}/')
     async def room_home(ident: str, room_id: str):
@@ -317,7 +326,11 @@ def create_gateway(config, *, transport=None):
                 response = await app.state.client.request(request.method, row['url'] + '/api/' + path,
                     content=await request.body(), headers={'Content-Type': 'application/json'})
                 response.raise_for_status()
-                return JSONResponse(browser_automation(response.json()), status_code=response.status_code)
+                hidden = set(row.get('hidden_rooms', []))
+                raw = response.json()
+                summary = browser_automation({**raw, **{key: [item for item in raw.get(key, [])
+                    if item.get('room_id') not in hidden] for key in ('rooms', 'likes', 'notifications')}})
+                return JSONResponse(summary, status_code=response.status_code)
             except httpx.HTTPStatusError as error:
                 raise HTTPException(error.response.status_code, '自动化操作未完成，请检查本机日志') from error
             except (httpx.HTTPError, ValueError) as error:

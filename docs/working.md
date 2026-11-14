@@ -765,3 +765,10 @@
 ```json
 {"change":"partial-archive-metrics","entry":"archive_metrics.aggregate_metrics","consumer":"archive_summary.summaries 与外部主页同步适配器","missing_fields":"null，逐字段独立计算","followers_delta":"至少两条场内观测；不借用昨日值，不用单点伪造零增长","gift_identity":"未知金额或付费身份不伪造完整分账","deployment":"独立于合并；外部同步适配器与构建校验须一并支持 null"}
 ```
+# 首页信息层级调整
+
+- 固定房间面板合并主播定位、按日汇总与账号欢迎控制；匿名模式不显示账号操作。
+- 首页卡片内显示场次趋势，移除缩略图和重复配置说明，诊断默认折叠；录制分钟、大小和文件数保持原样。
+- 趋势首次进入视口后加载，五分钟刷新；共享汇总直接读取现有文件，其他归档按房间锁与缓存隔离，失败保留旧图并提示。
+- 隐藏房间同步过滤首页自动化的房间、点赞和通知投影，不修改历史账本。
+- 验证：Python 全量 1266 passed / 1 skipped（初版）；最新网关 25 passed、Node 6 passed、Vitest 66 passed、TypeScript/Vite build 与 Ruff 通过。尚未部署。
