@@ -22,7 +22,7 @@ bili-live media-codec prepare --source /PRIVATE/recordings/ROOM/CAPTURE-00016.mk
 | `mixed_parameters` | 普通固定画幅读取仍拒绝；自动归档专用`allow_mixed=True`恢复初始参数后，逐帧等比归一、严格验收 |
 | `unmanaged` | 非本录制器命名的素材沿用原读取与验证流程 |
 
-范围：H264 MKV、单组SPS/PPS、最多回查512个同capture分片，新参数不能超过原CodecPrivate分配空间。长场次不能仅因正常无内嵌参数的分片超过32个就丢失起始锚点。
+范围：H264 MKV、单组SPS/PPS、最多回查512个同capture分片。新参数超过原CodecPrivate容量时使用独立Matroska副本扩容，并核对全部媒体包/时间戳；不覆盖原片。冲突候选必须排除静默裁画面，两套都能解码仍不足以选参。长场次不能仅因正常无内嵌参数的分片超过32个就丢失起始锚点。
 缺少历史、超出范围、数据损坏或恢复验收失败时明确报错，不猜参数、不重编码修复。
 参数变动背景参考[录播姬的修复技术文档](https://rec.danmuji.org/dev/repair/)。
 

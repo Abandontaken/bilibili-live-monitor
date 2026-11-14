@@ -8,7 +8,7 @@ PAGE = ('<html><title>Anonymous</title><main data-revision="1"><h1>Anonymous</h1
 SNAPSHOT = {'phase': 'live', 'session_start': '2026-01-01T12:00:00+00:00',
             'updated_at': '2026-01-01T13:00:00+00:00',
             'session_summary': {'watched': 1234, 'followers_change': -2, 'gift_count': 0,
-                                'gift_amount_yuan': 12.5, 'gift_amount_unknown': True}}
+                                'gift_value_yuan': 12.5, 'gift_amount_unknown': True}}
 
 
 def test_one_navigation_then_title_time_cards_and_charts():

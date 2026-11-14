@@ -8,10 +8,21 @@ from fractions import Fraction
 LEGACY_POLICY = 'adaptive-pk-aac-v1'
 POLICY = 'adaptive-pk-aac-v2'
 POLICIES = {LEGACY_POLICY, POLICY}
+INPUT_VIDEO_POLICY = 'decoded-video-parameters-v2'
+RENDER_POLICY = 'sdr-reference-render-v1'
 CANVAS = (1920, 1440)
 TIME_FILTER = 'settb=AVTB,setpts=if(eq(N\\,0)\\,PTS\\,max(PTS\\,PREV_OUTPTS+1))'
 MIXED_FILTER = ('scale=1920:1440:force_original_aspect_ratio=decrease:force_divisible_by=2:eval=frame,'
                 'pad=1920:1440:(ow-iw)/2:(oh-ih)/2:eval=frame,setsar=1,' + TIME_FILTER)
+
+
+class InputVideoParametersError(ValueError):
+    """完整解码证实的输入规格限制，不代表源损坏。"""
+
+    def __init__(self, message, evidence):
+        super().__init__(message)
+        self.evidence = {key: evidence[key] for key in ('frames', 'shapes', 'colors', 'ranges', 'declaration_epochs')
+                         if key in evidence}
 
 
 def microseconds(value):
@@ -34,10 +45,21 @@ def video_evidence(frames):
     if not frames:
         raise ValueError('没有可验证的视频帧')
     shapes = sorted({(f['width'], f['height'], f['pix_fmt'], f.get('sample_aspect_ratio') or 'unknown') for f in frames})
+    epochs = []
+    previous = None
+    for index, frame in enumerate(frames):
+        signature = [frame.get(key) or 'unknown' for key in (
+            'width', 'height', 'pix_fmt', 'sample_aspect_ratio', 'color_space',
+            'color_transfer', 'color_primaries', 'color_range')]
+        if signature != previous:
+            epochs.append({'start_frame': index, 'parameters': signature})
+            previous = signature
     return {'frames': len(frames), 'shapes': [list(shape) for shape in shapes],
             'colors': [list(color) for color in sorted({tuple(f.get(k) or 'unknown' for k in
                        ('color_space', 'color_transfer', 'color_primaries')) for f in frames})],
-            'pts_us': pack([microseconds(f['best_effort_timestamp_time']) for f in frames])}
+             'ranges': sorted({f.get('color_range') or 'unknown' for f in frames}),
+             'declaration_epochs': epochs,
+             'pts_us': pack([microseconds(f['best_effort_timestamp_time']) for f in frames])}
 
 
 def audio_evidence(path, command):
@@ -107,19 +129,53 @@ def audio_tail_filter(evidence):
     return ['-bsf:a', expression]
 
 
+def audio_mux_options(evidence):
+    """正起点且无既有裁剪时用fragment时间轴，避免普通MP4尾部误裁。
+
+    保持edit-list以保留绝对起点；关闭它会整体平移音频。实际包、PTS、
+    样本与裁剪仍须由v2完整验收，不把改封装当作验收豁免。
+    """
+    pts = unpack(evidence['pts_us'])
+    if pts and pts[0] > 0 and all(trim == [0, 0] for trim in unpack(evidence['trims'])):
+        return ['-movflags', '+delay_moov+frag_keyframe+default_base_moof', '-use_editlist', '1']
+    return []
+
+
 def normalize_reference(info, *, mixed):
     """只改变预期解码画布；真实输入元数据另存于归档回执。"""
     reference = json.loads(json.dumps(info))
     video = next(s for s in reference['streams'] if s['codec_type'] == 'video')
     evidence = reference['video_evidence']
-    if evidence['colors'] != [['bt709', 'bt709', 'bt709']]:
-        raise ValueError('未验证的逐帧色彩参数；保留原片')
+    if any(len(color) != 3 or any(value not in ('unknown', 'bt709') for value in color)
+           for color in evidence['colors']):
+        raise InputVideoParametersError('未验证的逐帧色彩参数；保留原片', evidence)
+    if any(value not in ('unknown', 'tv') for value in evidence.get('ranges', ['unknown'])):
+        raise InputVideoParametersError('未支持的色阶范围；保留原片', evidence)
     for width, height, pixel, sar in evidence['shapes']:
         if (not 0 < width <= 1920 or not 0 < height <= 1440 or width % 2 or height % 2
-                or pixel != 'yuv420p' or sar != '1:1'):
-            raise ValueError('未验证的逐帧画幅、像素格式或像素比例；保留原片')
+                or pixel != 'yuv420p' or sar not in ('unknown', '1:1')):
+            raise InputVideoParametersError('未验证的逐帧画幅、像素格式或像素比例；保留原片', evidence)
     if not mixed and len(evidence['shapes']) != 1:
-        raise ValueError('发现未声明的片内画幅变化；保留原片')
+        raise InputVideoParametersError('发现未声明的片内画幅变化；保留原片', evidence)
+    unknown = evidence['colors'] == [['unknown', 'unknown', 'unknown']]
+    square = all(shape[3] == '1:1' for shape in evidence['shapes'])
+    limited = 'pc' not in evidence.get('ranges', ['unknown'])
+    mode = ('preserve-unknown' if unknown and not mixed and limited else
+            'bt709' if evidence['colors'] == [['bt709', 'bt709', 'bt709']] and square and limited else
+            'reference-render')
+    colors = (evidence['colors'][0] if mode != 'reference-render' else
+              ['bt709', *['bt709' if all(color[index] == 'bt709' for color in evidence['colors']) else 'unknown'
+                           for index in (1, 2)]])
+    reference['rendering'] = {'policy': RENDER_POLICY, 'mode': mode,
+                              'unknown_matrix_interpretation': 'swscale-auto-bt601' if mode == 'reference-render' else None,
+                              'unknown_range_interpretation': 'limited',
+                              'unknown_sar_interpretation': 'square-display' if mixed or mode == 'reference-render' else None,
+                              'source_claim': 'input declarations retained in pre_normalization_source_info; defaults are rendering choices'}
+    video.update(zip(('color_space', 'color_transfer', 'color_primaries'), colors))
+    video['color_range'] = 'tv'
+    evidence['colors'] = [colors]
+    evidence['ranges'] = ['tv']
+    evidence.pop('declaration_epochs', None)  # Real epochs remain in the unmodified decoded input receipt.
     if mixed:
         video.update(width=CANVAS[0], height=CANVAS[1], coded_width=CANVAS[0], coded_height=CANVAS[1],
                      sample_aspect_ratio='1:1', display_aspect_ratio='4:3')
@@ -128,7 +184,10 @@ def normalize_reference(info, *, mixed):
         # Stream metadata may describe an old container epoch. The actual
         # decoded frames, rather than that stale display size, define native.
         width, height, _, _ = evidence['shapes'][0]
-        video.update(width=width, height=height, sample_aspect_ratio='1:1')
+        video.update(width=width, height=height)
+        if mode != 'preserve-unknown':
+            video['sample_aspect_ratio'] = '1:1'
+            evidence['shapes'] = [[width, height, 'yuv420p', '1:1']]
     video['nb_read_frames'] = str(evidence['frames'])
     pts, normalized = unpack(evidence['pts_us']), []
     for value in pts:
@@ -138,11 +197,34 @@ def normalize_reference(info, *, mixed):
     return reference
 
 
+def video_filter(reference, *, mixed):
+    """只在参考渲染路径转换YUV矩阵/范围；setparams只声明转换后的含义。"""
+    mode = reference['rendering']['mode']
+    vf = MIXED_FILTER if mixed else TIME_FILTER
+    if mode == 'reference-render':
+        conversion = 'in_color_matrix=auto:out_color_matrix=bt709:in_range=auto:out_range=tv'
+        if mixed:
+            vf = vf.replace('scale=1920:1440:', 'scale=1920:1440:' + conversion + ':', 1)
+        else:
+            vf = 'scale=' + conversion + ',setsar=1,' + vf
+    video = next(s for s in reference['streams'] if s['codec_type'] == 'video')
+    return (vf + ',setparams=range=limited:colorspace=' + video['color_space']
+            + ':color_trc=' + video['color_transfer'] + ':color_primaries=' + video['color_primaries'])
+
+
+def video_tags(reference):
+    video = next(s for s in reference['streams'] if s['codec_type'] == 'video')
+    return ['-color_range', 'tv', '-colorspace', video['color_space'],
+            '-color_trc', video['color_transfer'], '-color_primaries', video['color_primaries']]
+
+
 def verify_evidence(reference, output, target, command):
     before, after = reference['video_evidence'], output['video_evidence']
     if (before['shapes'] != after['shapes'] or before['frames'] != after['frames']
             or before['colors'] != after['colors']):
         raise ValueError('逐帧画幅、比例或帧数改变，保留原片')
+    if reference.get('rendering', {}).get('policy') == RENDER_POLICY and before['ranges'] != after['ranges']:
+        raise ValueError('输出色阶范围改变，保留原片')
     def close(a, b, tolerance):
         a, b = unpack(a), unpack(b)
         return len(a) == len(b) and all(abs(x - y) <= tolerance for x, y in zip(a, b))

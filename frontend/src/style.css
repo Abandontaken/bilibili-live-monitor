@@ -40,3 +40,7 @@ form{flex-wrap:wrap}form label{display:flex;align-items:center;gap:6px;white-spa
 .historical-room-issue {margin-top:8px; font-size:11px; color:#70828e; overflow-wrap:anywhere;}
 .historical-room-issue summary {cursor:pointer;}
 .historical-room-issue p {margin-top:6px; color:inherit;}
+.room-directory{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0 20px}.room-directory a{background:#fff;border:1px solid #d7e1e5;border-radius:8px;padding:7px 12px;color:#167c71;text-decoration:none}
+.room-trend{margin:14px 0}.room-trend .archive-panel{padding:12px}.room-trend h2{font-size:16px}.room-trend .overview-chart-heading{align-items:flex-start;flex-wrap:wrap}.technical-details{margin-top:10px;color:#70828e}.technical-details summary{cursor:pointer}.grid{grid-template-columns:repeat(auto-fit,minmax(min(100%,480px),1fr))}
+.dashboard-details{margin:12px 24px;color:#526c79}.dashboard-details>summary{cursor:pointer;padding:8px 0}.card{scroll-margin-top:20px}.room-directory a:hover{border-color:#167c71;background:#edf8f5}
+.fixed-room-heading{display:flex;align-items:center;gap:16px;flex-wrap:wrap}.fixed-room-heading h3{margin:8px 0;flex:1}.fixed-room-heading a{color:#167c71}.automation-panel details>summary{cursor:pointer;padding:8px 0}

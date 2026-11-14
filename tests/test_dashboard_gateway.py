@@ -44,6 +44,24 @@ def test_hidden_rooms_leave_home_but_keep_daily_archive_route():
         validate_instances([{'id': 'one', 'label': 'one', 'url': 'http://127.0.0.1:1', 'hidden_rooms': [234567]}])
 
 
+def test_hidden_rooms_leave_account_controls_only():
+    upstream_data = {'account': {'mode': 'account'}, 'rooms': [
+        {'room_id': '123456', 'label': '甲'}, {'room_id': '234567', 'label': '乙'}]}
+
+    def upstream(request):
+        return httpx.Response(200, json=upstream_data)
+
+    config = {'instances': [
+        {'id': 'account', 'label': '账号', 'url': 'http://127.0.0.1:8765', 'hidden_rooms': ['234567']},
+        {'id': 'guest', 'label': '匿名', 'url': 'http://127.0.0.1:8766'}]}
+    with TestClient(create_gateway(config, transport=httpx.MockTransport(upstream))) as client:
+        account = client.get('/instances/account/api/automation').json()
+        guest = client.get('/instances/guest/api/automation').json()
+    assert [room['room_id'] for room in account['rooms']] == ['123456']
+    assert [room['room_id'] for room in guest['rooms']] == ['123456', '234567']
+    assert len(upstream_data['rooms']) == 2
+
+
 def test_hidden_rooms_leave_guard_list_without_changing_upstream_policy():
     fixed = ['https://live.bilibili.com/123456', 'https://live.bilibili.com/234567']
     platform = {'revision': 7, 'policy': {'mode': 'fixed', 'fixed_rooms': fixed},

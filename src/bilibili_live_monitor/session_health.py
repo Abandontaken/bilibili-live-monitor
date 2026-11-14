@@ -4,7 +4,6 @@ import fcntl
 import json
 import re
 import sqlite3
-import sys
 import time
 from pathlib import Path
 from urllib.parse import urlencode
@@ -17,16 +16,21 @@ INTERVAL = 300
 
 
 def schedule(config, *, delay=INTERVAL):
+    from .deployment import paused, task_launch
+    if paused('sessions'):
+        return None
     label = 'session_health_' + config['workflow_key']
     jobs = request(config['launcher'] + '/scheduled?' + urlencode({'label': label, 'status': 'pending'}))
     for job in jobs:
         if job.get('label') == label:
             return job['id']
+    command, environment = task_launch(config['workspace'], 'bilibili_live_monitor.session_health')
     result = request(config['launcher'] + '/run', {
-        'command': [sys.executable, '-m', 'bilibili_live_monitor.session_health',
+        'command': [*command,
                     '--config', str(Path(config['workspace']) / 'config.json'), '--schedule'],
         'cwd': str(Path(config['workspace'])), 'label': label,
-        'delay_seconds': delay, 'timeout': 120, 'diagnose_on_failure': False})
+        'delay_seconds': delay, 'timeout': 120, 'diagnose_on_failure': False,
+        'env': environment})
     return result['scheduled_job_id']
 
 
@@ -107,6 +111,10 @@ def inspect(config, previous, now):
 
 
 def run(config, *, reschedule=False, dry_run=False):
+    from .deployment import check_task, paused
+    if paused('sessions'):
+        return {'maintenance_paused': True}
+    check_task(config)
     workspace = Path(config['workspace'])
     with (workspace / 'health.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)

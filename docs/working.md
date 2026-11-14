@@ -765,3 +765,8 @@
 ```json
 {"change":"partial-archive-metrics","entry":"archive_metrics.aggregate_metrics","consumer":"archive_summary.summaries 与外部主页同步适配器","missing_fields":"null，逐字段独立计算","followers_delta":"至少两条场内观测；不借用昨日值，不用单点伪造零增长","gift_identity":"未知金额或付费身份不伪造完整分账","deployment":"独立于合并；外部同步适配器与构建校验须一并支持 null"}
 ```
+# 2026-11-14 组件发布与兼容整合
+
+- 新增不可变发布清单、独立组件绑定、任务版本固定、维护守卫和运行身份观察；收尾子任务继承固定源码与解释器，跨组件调用使用目标组件绑定。
+- 整合礼物结果面值及展示版本、归档保留与输入分类，保留 CRM 有效增量资格规则；首页沿用 PR77 已审阅实现。
+- 验证：整合树 Python 1324 passed / 1 skipped；Ruff 与前端 TypeScript/Vite 构建通过。发布工具第四轮独立审阅限定通过，最终整合审阅另行记录；这些离线结果不代表全系统切换验收。

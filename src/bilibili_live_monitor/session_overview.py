@@ -74,7 +74,7 @@ def safe_target(value):
 
 def summary_cards(snapshot):
     totals = snapshot.get('session_summary') or {}
-    amount = totals.get('gift_amount_yuan')
+    amount = totals.get('gift_value_yuan')
     amount_text = (f'¥{amount:,.2f}' if isinstance(amount, (int, float)) and not isinstance(amount, bool)
                    and math.isfinite(amount) and amount >= 0 else '—')
     count = display_count(totals.get('gift_count'))
@@ -84,12 +84,12 @@ def summary_cards(snapshot):
         amount_text += '+'
     metrics = [('累计看过', display_count(totals.get('watched'))),
                ('累计涨粉', display_count(totals.get('followers_change'), signed=True)),
-               ('礼物总数', count), ('礼物平台金额', amount_text)]
+               ('礼物总数', count), ('礼物价值', amount_text)]
     cards = ''.join(f'<div class="session-card"><span>{label}</span><strong>{value}</strong></div>'
                     for label, value in metrics)
     return ('<section id="session-summary" aria-label="本场汇总"><h2>本场汇总</h2>'
             f'<div class="session-cards">{cards}</div>'
-            '<p>按本场已收到的数据汇总；看过人数采用平台累计值。金额为平台报告金额，非主播实收。</p></section>')
+            '<p>按本场已收到的数据汇总；看过人数采用平台累计值。盲盒按抽中礼物面值统计，非主播实收。</p></section>')
 
 
 def session_metadata(snapshot):

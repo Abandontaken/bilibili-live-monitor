@@ -29,7 +29,7 @@ def skip_path(source):
 def parameter_dependent(reason):
     return reason.startswith('codec_') or reason in (
         'source_decode_error', 'mixed_codec_parameters', 'unsupported_profile',
-        'unsupported_streams', 'source_timestamps', 'invalid_duration')
+        'unsupported_streams', 'source_timestamps', 'invalid_duration', 'source_video_parameters')
 
 
 def dependency_fingerprint(source):
@@ -55,6 +55,9 @@ def dependency_fingerprint(source):
 def reusable_skip(saved, item):
     if not (saved.get('source') == item['source'] and saved.get('source_stat') == item['source_stat']
             and saved.get('policy') == ARCHIVE_POLICY and saved.get('status') == 'skipped'):
+        return False
+    if (saved.get('reason') == 'source_video_parameters'
+            and saved.get('input_video_policy') != archive_validation.INPUT_VIDEO_POLICY):
         return False
     if 'dependencies' in saved or parameter_dependent(saved.get('reason', '')):
         return (saved.get('codec_policy') == archive_validation.POLICY

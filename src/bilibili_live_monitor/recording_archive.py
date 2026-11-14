@@ -33,6 +33,9 @@ def retain_original(item, skip):
         if getattr(skip, 'dependencies', current) != current:
             raise ValueError('检查期间参数依赖改变，不能记忆旧阻塞')
         saved['dependencies'] = current
+    if skip.reason == 'source_video_parameters':
+        saved['input_video_policy'] = validation.INPUT_VIDEO_POLICY
+        saved['input_video_evidence'] = skip.input_video_evidence
     atomic_json(skip_path(item['source']), saved)
     return {**saved, 'original_present': True}
 
@@ -51,7 +54,7 @@ def probe(path, *, frames=False):
     args = ['ffprobe', '-v', 'error', '-show_format', '-show_streams', '-of', 'json']
     if frames:
         args += ['-count_frames', '-show_frames', '-show_entries',
-                 'frame=media_type,best_effort_timestamp_time,width,height,pix_fmt,sample_aspect_ratio,color_space,color_transfer,color_primaries']
+                 'frame=media_type,best_effort_timestamp_time,width,height,pix_fmt,sample_aspect_ratio,color_space,color_transfer,color_primaries,color_range']
     result = command([*args, str(path)])
     if frames and result.stderr:
         error = subprocess.CalledProcessError(0, args, stderr=result.stderr)
@@ -266,7 +269,12 @@ def _encode(item, lock_fd):
         if archive_policy.decode_error(error):
             raise ArchiveSkip('source_decode_error', '原片解码损坏，保留原片：' + str(error.stderr)[-1500:], warning=True) from error
         raise
-    source_info = validation.normalize_reference(decoded_input, mixed=mixed)
+    try:
+        source_info = validation.normalize_reference(decoded_input, mixed=mixed)
+    except validation.InputVideoParametersError as error:
+        skip = ArchiveSkip('source_video_parameters', str(error), warning=True)
+        skip.input_video_evidence = error.evidence
+        raise skip from error
     if source_info['timestamp_max_adjustment_us'] > 1000:
         raise ArchiveSkip('source_timestamps', '原片时间戳需要超过1毫秒修正，保留原片', warning=True)
     # 留出录制余量；Trash并不释放空间，不能计入可用空间。
@@ -282,13 +290,14 @@ def _encode(item, lock_fd):
                  '-threads', '2', '-filter_threads', '2', '-copyts',
                  '-reinit_filter', '0',
                  '-i', str(media_source), '-map', '0:v:0', '-map', '0:a:0',
-                 '-noautoscale', '-vf', validation.MIXED_FILTER if mixed else validation.TIME_FILTER,
+                  '-noautoscale', '-vf', validation.video_filter(source_info, mixed=mixed),
                  '-c:v', 'hevc_videotoolbox', '-allow_sw', '0', '-require_sw', '0',
                  '-profile:v', 'main', '-pix_fmt', 'yuv420p', '-b:v', '2800k',
-                 '-color_range', 'tv', '-colorspace', 'bt709', '-color_trc', 'bt709', '-color_primaries', 'bt709',
+                  *validation.video_tags(source_info),
                   '-fps_mode', 'passthrough', '-enc_time_base:v', 'filter', '-video_track_timescale', '1000000',
                     '-c:a', 'copy', '-copyinkf:a', *validation.audio_tail_filter(source_info['audio_evidence']),
-                    '-avoid_negative_ts', 'disabled', '-tag:v', 'hvc1', str(temporary)],
+                     '-avoid_negative_ts', 'disabled', *validation.audio_mux_options(source_info['audio_evidence']),
+                     '-tag:v', 'hvc1', str(temporary)],
                 pass_fds=(lock_fd,) if isinstance(lock_fd, int) else tuple(lock_fd))
         output_info = verify_output(source_info, temporary)
         check_source(item)
@@ -300,7 +309,8 @@ def _encode(item, lock_fd):
                  'output': str(target), 'output_stat': file_stat(target), 'source_info': source_info,
                   'legacy_row': item['legacy_row'],
                    'media_input': str(media_source), 'codec_parameters': codec_parameters,
-                   'pre_normalization_source_info': decoded_input,
+                    'pre_normalization_source_info': decoded_input,
+                    'audio_mux_options': validation.audio_mux_options(source_info['audio_evidence']),
                    'normalization': 'aspect-preserving-1920x1440' if mixed else 'native',
                    'source_info_scope': 'decoded reference after documented normalization',
                   'output_duration': float(output_info['format']['duration']), 'video_bitrate': 2_800_000,
@@ -312,7 +322,19 @@ def _encode(item, lock_fd):
         temporary.unlink(missing_ok=True)
 
 
+def original_retained(source):
+    """保留标记只按存在判断；损坏内容、目录或悬空链接也禁止清理。"""
+    marker = Path(str(Path(source).resolve()) + '.archive-retain')
+    try:
+        marker.lstat()
+    except FileNotFoundError:
+        return False
+    return True
+
+
 def cleanup(item, *, permanent=False):
+    if original_retained(item['source']):
+        raise ValueError('原片有显式保留标记，禁止删除或Trash')
     check_source(item)
     source = Path(item['source'])
     saved = archive_receipt(source)
@@ -323,6 +345,8 @@ def cleanup(item, *, permanent=False):
         source_info = probe(source, frames=True)
     verify_output(source_info, archive_path(source))
     check_source(item)
+    if original_retained(source):
+        raise ValueError('原片有显式保留标记，禁止删除或Trash')
     if permanent:
         source.unlink()
     else:

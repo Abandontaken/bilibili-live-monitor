@@ -5,7 +5,6 @@ import json
 import math
 import re
 import secrets
-import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -138,6 +137,8 @@ class SessionWorkflows:
             opencode_cwd=None, opencode_python=None, remote=record['remote'], url=record['url'],
             blind_gift_name=[], no_blind_gifts=False, include_guard_lamps=False)
         if not path.exists():
+            from .deployment import pin_current
+            pin_current(directory, new_task=True)
             initialize(args, resume=True)
         for filename, empty in (('annotations.json', {'reviews': [], 'completed_followups': [], 'song_requests': []}),
                                 ('verified_songs.json', [])):
@@ -220,11 +221,16 @@ class SessionWorkflows:
         return True
 
     async def tick(self):
+        from .deployment import paused
+        if paused('sessions'):
+            return
         if not self.enabled or time.time() < self.next_check:
             return
         self.next_check = time.time() + 5
         from .automation import confirmed_state
         for rid in self.automation.rooms:
+            if paused('sessions', new_work=True):
+                break
             candidate = self.automation.candidate(rid)
             if confirmed_state(candidate) == 'live' and not candidate.get('blocked') and not candidate.get('blocked_alias'):
                 errors = self.automation.state.setdefault('workflow_errors', {})
@@ -240,6 +246,8 @@ class SessionWorkflows:
                 continue
             try:
                 path = self.initialize(record)
+                from .deployment import pin_current, task_launch
+                pin_current(path.parent)
                 status_path = path.parent / 'workflow.json'
                 state = json.loads(status_path.read_text()) if status_path.exists() else {}
                 for field in ('final_session', 'finalize_progress'):
@@ -259,9 +267,11 @@ class SessionWorkflows:
                     continue
                 record['retry_after'] = time.time() + 60
                 self.save()
+                command, environment = task_launch(path.parent, 'bilibili_live_monitor.session_runner')
                 await asyncio.to_thread(request, self.config.get('launcher', 'http://127.0.0.1:7997') + '/run', {
-                    'command': [sys.executable, '-m', 'bilibili_live_monitor.session_runner', '--config', str(path)],
-                    'cwd': str(path.parent), 'label': label, 'diagnose_on_failure': False})
+                    'command': [*command, '--config', str(path)],
+                    'cwd': str(path.parent), 'label': label, 'diagnose_on_failure': False,
+                    'env': environment})
                 record['stage'] = 'running'
                 record.pop('error', None)
             except Exception as error:

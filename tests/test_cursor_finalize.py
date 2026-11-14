@@ -23,6 +23,52 @@ def setup(tmp_path, kind='finalize'):
     return config, plan, root
 
 
+@pytest.mark.parametrize('pause_call', [1, 2])
+def test_maintenance_before_cursor_start_is_recoverable(tmp_path, monkeypatch, pause_call):
+    from bilibili_live_monitor import deployment
+    config, _, root = setup(tmp_path)
+    monkeypatch.setattr(cursor, 'post', lambda c, p: {'pid': 123, 'diagnose_on_failure': False})
+    resume = '11111111-2222-4333-8444-555555555555'
+    first = cursor.launch(config, 'finalize', '000', resume_session=resume)
+    checks = []
+    def guard(*args, **kwargs):
+        checks.append(True)
+        if len(checks) == pause_call:
+            raise deployment.MaintenancePaused('maintenance')
+    monkeypatch.setattr(deployment, 'require_running', guard)
+    monkeypatch.setattr(cursor.subprocess, 'Popen', lambda *a, **k: pytest.fail('must not start Cursor'))
+    paused = cursor.worker(config, 'finalize', '000', first['token'])
+    assert paused['state'] == 'maintenance_paused_before_start'
+    assert 'pgid' not in paused
+    monkeypatch.setattr(deployment, 'require_running', lambda *a, **k: None)
+    def exited(pid, sig):
+        raise ProcessLookupError
+    monkeypatch.setattr(cursor.os, 'kill', exited)
+    restarted = cursor.retry(config, 'finalize', '000')
+    assert restarted['token'] != first['token']
+    assert restarted['state'] == 'submitting'
+    assert restarted['resume_session'] == resume
+    assert not (root / 'cursor_workers/history').exists()
+    assert (root / 'cursor_workers/maintenance_history/000' / first['token']).is_dir()
+
+
+def test_stop_confirms_maintenance_adapter_only_after_exit(tmp_path, monkeypatch):
+    from bilibili_live_monitor import live_share_watch
+    config, _, root = setup(tmp_path)
+    runs = root / 'cursor_workers'
+    runs.mkdir()
+    atomic_json(runs / '000.json', {'state': 'maintenance_paused_before_start',
+                                  'adapter_pid': 123, 'token': 'test'})
+    monkeypatch.setattr(live_share_watch, 'request', lambda *a: [])
+    monkeypatch.setattr(cursor.os, 'kill', lambda *a: None)
+    assert not cursor.stop_workers(config, kinds=('finalize',))
+    def exited(*args):
+        raise ProcessLookupError
+    monkeypatch.setattr(cursor.os, 'kill', exited)
+    assert cursor.stop_workers(config, kinds=('finalize',))
+    assert cursor.stop_workers(config, kinds=('finalize',))
+
+
 def test_explicit_final_model_prevents_realtime_fallback():
     with pytest.raises(ValueError, match='final_model'):
         validate_settings({'final_subagent': cursor.BACKEND, 'model': 'qwen/local'}, {})

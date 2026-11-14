@@ -1,7 +1,6 @@
 """场次结束后的观众状态更新；独立总会话用指定子代理处理按人分片。"""
 import json
 import shlex
-import sys
 from pathlib import Path
 
 from . import audience_crm as crm
@@ -18,9 +17,9 @@ def cursor_prompt(session, config, directory, prompt):
     prompt = prompt.replace(old, '仅对reused=false的任务使用Cursor Grok CLI查证；不使用OpenCode task，不创建下一级代理。')
     prompt = prompt.replace('使用OpenCode工具自主查证后续', '使用CLI文件读取/检索工具自主查证后续')
     prompt = prompt.replace('或排定时任务。', '或安排本任务监督以外的定时任务。')
-    command = shlex.join(['env', f'PYTHONPATH={Path(__file__).resolve().parents[1]}', sys.executable,
-        '-m', 'bilibili_live_monitor.cursor_finalize', 'start', '--config', session['_config_path'],
-        '--kind', 'audience_finalize'])
+    from .deployment import task_command
+    command = task_command(session, 'bilibili_live_monitor.cursor_finalize', component='crm') + ' ' + shlex.join([
+        'start', '--config', session['_config_path'], '--kind', 'audience_finalize'])
     return prompt + f'''
 总协调仍由本OpenCode会话完成，先创建可见todo并按人更新状态、CLI session及验收结果；总协调模型保持原指定配置，不改成分片模型。
 plan.tasks按列表位置从0编号，补零至少3位，例如000；编号对应同一person_id，不把person_id当数字序号。
@@ -51,6 +50,8 @@ def advance(session, state):
     """返回True才允许本场收尾；失败不改旧档案，不重复提交不确定的任务。"""
     if not session.get('audience_crm_config'):
         return True
+    from .deployment import require_running
+    require_running('crm')
     from .session_budget import check_budget
     check_budget(session, state)
     from .session_ai import ai_control
@@ -61,6 +62,15 @@ def advance(session, state):
         session = {**session, 'model': config['coordinator_model']}
     state_path = Path(session.get('audience_state_path') or Path(session['workspace']) / 'workflow.json')
     root = Path(session['workspace']) / 'audience_finalize'
+    from .deployment import component_call
+    pin_path = Path(session.get('deployment_pin') or root / 'deployment.json')
+    session = {**session, 'deployment_pin': str(pin_path)}
+    forwarded = component_call('crm', pin_path, __name__, 'advance', [session, state],
+                               new_task=not (root / 'plan.json').exists())
+    if forwarded is not None:
+        state.clear()
+        state.update(forwarded['arguments'][1])
+        return forwarded['result']
     root.mkdir(exist_ok=True)
     marker = root / 'plan.json'
     if not marker.exists():
@@ -108,10 +118,9 @@ def advance(session, state):
         else:
             raise ValueError('CRM提交结果不确定，须核查原会话，不自动重发')
     if not state.get('audience_submitted'):
-        command = shlex.join([sys.executable, '-m', 'bilibili_live_monitor.audience_crm',
-                             'finish', '--config', str(path), '--run', str(directory)])
-        if config['author_agent'] == CURSOR_AUTHOR:
-            command = shlex.join(['env', f'PYTHONPATH={Path(__file__).resolve().parents[1]}']) + ' ' + command
+        from .deployment import task_command
+        command = task_command(session, 'bilibili_live_monitor.audience_crm', component='crm') + ' ' + shlex.join([
+            'finish', '--config', str(path), '--run', str(directory)])
         prompt = f'''{tag}
 你负责此场CRM总协调，不改代码、不发布、不通知。读取{directory / 'plan.json'}及{directory / 'instructions.txt'}。
 plan.json中reused=true的任务已由程序校验复用上一版result，直接保留无需重跑；仅对reused=false（本场有新互动、新提名或来源变更）的任务使用task的{config['author_agent']}子代理处理input/result，最多同时10个；不可静默改模型或创建下一级代理。

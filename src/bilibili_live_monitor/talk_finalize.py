@@ -4,7 +4,6 @@ import hashlib
 import json
 import shlex
 import sqlite3
-import sys
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -176,8 +175,9 @@ def submit(config, session, on_handoff=lambda: None):
     from .session_finalize import dispatch
     plan = prepare(config)
     root = Path(config['workspace']) / 'talk_finalize'
-    command = shlex.join([sys.executable, '-m', 'bilibili_live_monitor.talk_finalize',
-                          'finish', '--config', config['_config_path']])
+    from .deployment import task_command
+    command = task_command(config, 'bilibili_live_monitor.talk_finalize') + ' ' + shlex.join([
+        'finish', '--config', config['_config_path']])
     prompt = f'''FINALIZE_PLAN:{plan['id']}
 你是杂谈转写终审总协调，只处理{root}计划。先读取plan.json，再用task分发给{plan['subagent']}，最多同时{plan['concurrency']}片。
 禁止联网搜索、查歌、调用浏览器或访问其他房间。仅根据本场转写与相邻上下文保守修正语音识别错字和标点，不总结、不润色，不补造听不清内容，不改变立场或原意。
@@ -198,6 +198,9 @@ def main():
     parser.add_argument('action', choices=['finish'])
     parser.add_argument('--config', required=True, type=Path)
     args = parser.parse_args()
+    from .deployment import check_task, require_running
+    require_running('sessions')
+    check_task(load_config(args.config))
     print(json.dumps(finish(load_config(args.config)), ensure_ascii=False))
 
 

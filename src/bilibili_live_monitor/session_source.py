@@ -30,4 +30,8 @@ def read_source(database: Path, room_id: str, start: str, end: str = '9999') -> 
         segments = [json.loads(data) for data, in db.execute(
             "SELECT data FROM segments WHERE room_id=? AND json_extract(data,'$.start_utc')>=? "
             "AND json_extract(data,'$.start_utc')<? ORDER BY seq", (room_id, start, end))]
+    from .gift_value import gift_text
+    for kind, _, item in items:
+        if kind == 'gift' and isinstance(item.get('gift'), dict):
+            item['text'] = gift_text(item['gift'], item.get('text', ''))
     return {'raw': raw, 'items': items, 'segments': segments}

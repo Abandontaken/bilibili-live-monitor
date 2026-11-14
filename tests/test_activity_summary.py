@@ -60,8 +60,8 @@ def test_reported_currency_units_quantity_and_duplicate_events():
     assert gift_amount({'event_type': 'GUARD_BUY', 'num': 3, 'guard_price_gold': 198000}) == 198000
     assert gift_amount({'event_type': 'SUPER_CHAT_MESSAGE', 'price_yuan': 30}) == 30000
     assert gift_amount({'coin_type': 'silver', 'total_coin': 100000}) == 0
-    assert gift_amount({'coin_type': 'gold', 'price': 500000, 'total_coin': 6000,
-                        'blind_gift': {'original_gift_price': 6000}}) == 6000
+    assert gift_amount({'coin_type': 'gold', 'num': 2, 'price': 500000, 'total_coin': 6000,
+                        'blind_gift': {'original_gift_price': 3000}}) == 1000000
     first = gift(10, 'same', 3, 6000)
     source = {'raw': [], 'segments': [], 'items': [first, first,
               gift(20, 'same', 2, 4000, event_type='SEND_GIFT_V2', batch_index=1),

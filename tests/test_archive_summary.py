@@ -44,6 +44,18 @@ def test_unobserved_session_is_not_zero_gifts():
     assert summaries(source, [session])[0]['metrics']['amount'] == 0
 
 
+def test_old_shared_input_amount_is_recomputed_or_unknown(tmp_path):
+    path = tmp_path / 'summary.json'
+    path.write_text(json.dumps({'sessions': [
+        {'date': '2026-01-01', 'session': '晚间场', 'start_utc': 'start', 'metrics': {'amount': 15}},
+        {'date': '2025-01-01', 'session': '晚间场', 'metrics': {'amount': 30}}]}))
+    local = [{'start_utc': 'start', 'key': 'local', 'has_result': True, 'metrics': {'amount': 2233}}]
+    rows = shared_summaries(path, local)
+    assert rows[0]['metrics']['amount'] == 2233
+    assert rows[1]['metrics']['amount'] is None
+    assert all(row['gift_value_basis'] == 'gift-output-v1' for row in rows)
+
+
 def test_shared_metadata_rejects_nested_fields(tmp_path):
     path = tmp_path / 'summary.json'
     path.write_text(json.dumps({'sessions': [{'date': {'private': 'value'}, 'metrics': {}}]}))

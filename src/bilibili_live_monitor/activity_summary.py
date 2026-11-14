@@ -2,6 +2,7 @@
 from bisect import bisect_left, bisect_right
 from collections import Counter
 
+from .gift_value import VALUE_BASIS, gift_value
 from .time_utils import epoch, iso
 
 
@@ -75,19 +76,8 @@ def nonnegative_integer(value):
 
 
 def gift_amount(gift):
-    """Return platform amount in thousandths of a yuan; no quantity multiplier for totals."""
-    if gift.get('event_type') == 'SUPER_CHAT_MESSAGE':
-        amount = nonnegative_integer(gift.get('price_yuan'))
-        if amount is not None:
-            return amount * 1000
-        return nonnegative_integer(gift.get('total_coin'))
-    if gift.get('event_type') == 'GUARD_BUY':
-        return nonnegative_integer(gift.get('guard_price_gold'))
-    if gift.get('coin_type') == 'silver':
-        return 0
-    if gift.get('coin_type') == 'gold':
-        return nonnegative_integer(gift.get('total_coin'))
-    return None
+    """兼容已有聚合调用名；统一返回主播收到礼物的价值（千分元）。"""
+    return gift_value(gift)
 
 
 def gift_observations(source, *, platform_uid=False, event_time_only=False):
@@ -149,7 +139,8 @@ def summarize_gifters(source):
         row['amount_milli'] += amount or 0
         row['amount_unknown'] += amount is None
     return [{'name':row['name'], 'gift_count':row['gift_count'],
-             'gift_count_unknown':row['gift_count_unknown'],
+              'gift_count_unknown':row['gift_count_unknown'],
+             'gift_value_basis': VALUE_BASIS, 'value_yuan': row['amount_milli']/1000,
              'amount_yuan':row['amount_milli']/1000, 'amount_unknown':row['amount_unknown']}
             for row in sorted(people.values(), key=lambda item:-item['amount_milli'])]
 
@@ -158,12 +149,13 @@ def render_gifters(rows):
     import html
 
     body = ''.join('<tr><td>'+html.escape(row['name'])+'</td><td>'+str(row['gift_count'])+
-                   ('+' if row['gift_count_unknown'] else '')+'</td><td>'+f'{row["amount_yuan"]:.2f}'+
+                   ('+' if row['gift_count_unknown'] else '')+'</td><td>'+
+                   (f'{row["value_yuan"]:.2f}' if row.get('gift_value_basis') == VALUE_BASIS and row.get('value_yuan') is not None else '—')+
                    ('+' if row['amount_unknown'] else '')+'</td></tr>' for row in rows)
     return ('<section id="gift-summary"><h2>每人送礼汇总</h2>'
             '<div class="activity-table"><table><thead><tr><th>观众</th><th>礼物件数</th>'
-            '<th>累计金额（元）</th></tr></thead><tbody>'+ (body or '<tr><td colspan="3">暂无礼物记录</td></tr>')+
-            '</tbody></table></div><p>按礼物平台标价汇总，包含盲盒结果；非主播实收。'
+            '<th>礼物价值（元）</th></tr></thead><tbody>'+ (body or '<tr><td colspan="3">暂无礼物记录</td></tr>')+
+            '</tbody></table></div><p>盲盒按抽中礼物面值统计，非主播实收。'
             '“+”表示另有金额或数量未知的礼物。</p></section>')
 
 

@@ -7,6 +7,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from .activity_summary import gift_observations, nonnegative_integer
+from .gift_value import value_fields
 from .session_source import read_source
 from .song_followers import merged_windows
 from .time_utils import epoch, iso
@@ -114,6 +115,7 @@ def archive_data(session_root, database, room_id, name, include_summaries=True, 
             summary = (snap or {}).get('session_summary', {})
             if not isinstance(summary, dict):
                 raise ValueError('场次汇总须为对象')
+            summary = {**summary, 'gift_amount_yuan': summary.get('gift_value_yuan')}
             row = {'key': directory.name, 'start': iso(start), 'end': iso(end),
                    'status': wf.get('stage', 'created'), 'has_result': snap is not None,
                    'summary': {k: summary.get(k)
@@ -160,7 +162,7 @@ def archive_data(session_root, database, room_id, name, include_summaries=True, 
                 'warnings': warnings, 'updated_at': None}
         if share_label is not None:
             result['gift_share'] = {'label': share_label, 'percentage': None}
-        return result
+        return value_fields(result)
     earliest = min([a for a, _ in windows] + [epoch(s['start']) for s in sessions])
     source = read_source(Path(database), room_id, iso(earliest))
     if sources:
@@ -188,6 +190,11 @@ def archive_data(session_root, database, room_id, name, include_summaries=True, 
                 seen.add(entry['source_key'])
     from .archive_summary import summaries
     session_summaries = summaries(source, sessions) if include_summaries else []
+    # 场次卡片不再依赖旧快照的投入口径；直接复用同范围原子事件的结果价值。
+    computed = {row['key']: row['metrics']['amount'] for row in
+                (session_summaries if include_summaries else summaries(source, sessions))}
+    for session in sessions:
+        session['summary']['gift_amount_yuan'] = computed.get(session['key'])
     windows = merged_windows(windows)
 
     def observed(at):
@@ -309,4 +316,4 @@ def archive_data(session_root, database, room_id, name, include_summaries=True, 
     result['periods'] = period_overview(result['days'], now=now, share_amounts=share_amounts, share_label=share_label)
     if share_label is not None:
         result['gift_share'] = overall_share(result['days'], share_amounts, share_label)
-    return result
+    return value_fields(result)

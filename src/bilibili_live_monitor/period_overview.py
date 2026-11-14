@@ -3,6 +3,8 @@ import math
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+from .gift_value import value_fields
+
 
 def period_overview(days, *, now=None, share_amounts=None, share_label=None):
     today = (now or datetime.now(ZoneInfo('Asia/Shanghai'))).astimezone(ZoneInfo('Asia/Shanghai')).date()
@@ -25,7 +27,7 @@ def period_overview(days, *, now=None, share_amounts=None, share_label=None):
             item['gift_share'] = {'label': share_label,
                                  'percentage': own / total * 100 if total and not unknown and None not in amounts else None}
         result.append(item)
-    return result
+    return value_fields(result)
 
 
 def fans_club_period(days, start, end):

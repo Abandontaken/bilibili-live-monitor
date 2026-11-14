@@ -39,7 +39,7 @@ test('匿名实例无发言和账号操作，状态请求使用自身实例',asy
   const state={...fixture(false),account:{...fixture(false).account,mode:'anonymous'}};
   const fetch=vi.fn(async()=>({ok:true,json:async()=>state}));vi.stubGlobal('fetch',fetch);
   render(<InstanceProvider instance={{id:'guest',label:'匿名',mode:'anonymous',base:'/instances/guest/'}}><AutomationControls/></InstanceProvider>);
-  await screen.findByText('匿名监控');
+  await screen.findByText('匿名监控 · 固定房间');
   expect(screen.queryByText('执行点赞')).toBeNull();
   expect(screen.queryByText('开启自动欢迎')).toBeNull();
   expect(screen.queryByText('关闭自动欢迎')).toBeNull();

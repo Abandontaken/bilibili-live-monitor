@@ -73,7 +73,7 @@ def public_person(person, state, uids):
             'last_observed': person['last_observed'], 'pending': pending}
 
 
-def detail(person, state, material, config, uids=None):
+def detail(person, state, material, config, uids=None, gift_values=None):
     home = config['home_url']
     sessions = {s['id']: s for s in material['sessions']}
     from .audience_sources import evidence_map
@@ -120,9 +120,13 @@ def detail(person, state, material, config, uids=None):
         session = sessions[sid]
         chats = sum(e['kind'] == 'danmaku' for e in events)
         gifts = [e for e in events if e['kind'] == 'gift']
-        amount = sum(e.get('amount_milli') or 0 for e in gifts) / 1000
-        unknown = '+' if any(e.get('amount_milli') is None for e in gifts) else ''
-        gift_text = f' · 礼物 {len(gifts)} 笔 · 平台标价 ¥{amount:.2f}{unknown}' if gifts else ''
+        from .gift_value import VALUE_BASIS
+        values = [(gift_values.get(e['id']) if gift_values is not None else
+                   e.get('amount_milli') if e.get('gift_value_basis') == VALUE_BASIS else None) for e in gifts]
+        amount = sum(v or 0 for v in values) / 1000
+        unknown = '+' if any(v is None for v in values) else ''
+        displayed = f'¥{amount:.2f}{unknown}' if any(v is not None for v in values) else '—'
+        gift_text = f' · 礼物 {len(gifts)} 笔 · 礼物价值 {displayed}' if gifts else ''
         body += (f'<li><a href="{esc(safe_url(session["url"], home))}">{esc(session["label"])}</a>'
                  f'<small>弹幕 {chats} 条{gift_text}</small>'
                  f'<small>记录时间 {esc(stamp(events[0]["at"]))} 至 {esc(stamp(events[-1]["at"]))}</small></li>')
@@ -152,6 +156,7 @@ fetch('index.json',{cache:'no-cache'}).then(r=>{if(!r.ok)throw Error('load');ret
 
 def build(config):
     import fcntl
+    import hashlib
     import tempfile
     output = Path(config['output_dir'])
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -163,7 +168,11 @@ def build(config):
             raise ValueError('公开目录已存在且不是版本指针，不能直接覆盖')
         with tempfile.TemporaryDirectory(prefix='building-', dir=versions) as staging:
             result = _build({**config, 'output_dir': staging})
-            target = versions / result['plan_id']
+            # material身份与展示版本分开；改展示口径不改已验收的引用和AI状态。
+            rendered = json.dumps([(name, hashlib.sha256((Path(staging) / name).read_bytes()).hexdigest())
+                                   for name in sorted(result['files'])]).encode()
+            result['render_id'] = hashlib.sha256(rendered).hexdigest()[:16]
+            target = versions / (result['plan_id'] + '-' + result['render_id'])
             if not target.exists():
                 Path(staging).rename(target)
             else:
@@ -197,6 +206,8 @@ def _build(config):
     rows, files = [], ['index.html', 'index.json']
     uids = {str(uid) for p in material['people'].values()
             for uid in [p.get('uid'), *p.get('observed_uids', [])] if uid}
+    from .gift_value_backfill import audience_value_map
+    gift_values = audience_value_map(material, config)
     for pid, person in material['people'].items():
         state = current['states'].get(pid, {})
         if person['evidence'] and person.get('analysis_eligible') is not False:
@@ -204,7 +215,7 @@ def _build(config):
         rows.append(public_person(person, state, uids))
         directory = output / pid
         directory.mkdir(exist_ok=True)
-        (directory / 'index.html').write_text(detail(person, state, material, config, uids))
+        (directory / 'index.html').write_text(detail(person, state, material, config, uids, gift_values))
         files.append(pid + '/index.html')
     atomic_json(output / 'index.json', {'scope': config['scope'], 'label': config['label'], 'people': rows})
     body = (f'<nav><a href="{esc(config["home_url"])}">场次主页</a></nav><h1>{esc(config["label"])}的观众备忘</h1>'

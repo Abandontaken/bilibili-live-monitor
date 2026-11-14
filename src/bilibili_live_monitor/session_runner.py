@@ -71,6 +71,8 @@ def stop_ai(config, session, *, children=False):
 
 
 def ensure_ai(config, purpose):
+    from .deployment import require_running
+    require_running('crm' if purpose == 'audience_finalize' else 'sessions')
     check_budget(config)
     title = f'{purpose} {config["label"]} {config["workflow_key"]}'
     return ai_control(config, 'create', project=config['opencode_project'], title=title)['id']
@@ -305,6 +307,8 @@ def advance(config, state, now):
 
 def run(path):
     config = load_config(path)
+    from .deployment import MaintenancePaused, check_task
+    check_task(config)
     workspace = Path(config['workspace'])
     with (workspace / 'workflow.lock').open('a') as lock, (workspace / 'publisher.lock').open('a') as publisher:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -319,6 +323,9 @@ def run(path):
         atomic_json(status_path, state)
         next_health_check = 0
         while state['stage'] not in ('completed', 'attention'):
+            from .deployment import paused
+            if paused('sessions'):
+                return 0  # 维护停止不更改业务阶段，也不发布attention页。
             started = time.time()
             config = load_config(path)
             try:
@@ -339,6 +346,8 @@ def run(path):
                 advance(config, state, started)
                 state['last_error'] = None
                 state['consecutive_errors'] = 0
+            except MaintenancePaused:
+                return 0
             except BudgetPaused:
                 pause_budget(state, time.time())
             except Exception as error:
