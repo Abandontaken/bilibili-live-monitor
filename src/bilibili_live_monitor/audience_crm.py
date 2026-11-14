@@ -185,12 +185,14 @@ def collect(config, sessions):
         if agentic:
             attended = [[sid, session_digests[sid]] for sid in person['sessions'] if sid in session_digests]
             person['revision'] = digest([person['revision'], attended, recalled_refs, contract_revision])
-    material = {'schema_version': 2 if agentic else 1, 'room_id': room, 'scope': config['scope'],
+    material = {'schema_version': 2 if agentic else 1, 'update_policy': 'meaningful-interaction-v1',
+            'room_id': room, 'scope': config['scope'],
             'label': config['label'], 'people': people,
             'sessions': [{k: s[k] for k in ('id', 'label', 'url', 'start', 'end')} for s in sessions]}
     if agentic:
         material.update(source_evidence=full_evidence, source_documents=documents,
                         analysis_contract=digest(AGENTIC_PROMPT))
+    apply_update_scope(config, material, prior)
     return material
 
 
@@ -300,6 +302,73 @@ def prepare(config, material):
         return _prepare(config, material)
 
 
+def update_reasons(config, person, material, session_ids, prior):
+    """只召回本次有效互动/提名候选；来源变化本身不是重新分析的理由。"""
+    reasons = []
+    if any(e['session_id'] in session_ids and e['kind'] in ('danmaku', 'gift')
+           for e in person['history']):
+        reasons.append('viewer_interaction')
+    names = set(person['names'])
+    for name in person['names']:
+        names.update(re.findall(r'[\u4e00-\u9fff]{2,}', name))
+        for prefix in ('大家叫我', '叫我', '我是'):
+            if name.startswith(prefix) and len(name[len(prefix):]) >= 2:
+                names.add(name[len(prefix):])
+    names.update(config.get('aliases', {}).get(person['id'], []))
+    names = {name.casefold() for name in names if len(name) >= 2}
+    songs = {song for promise in (prior or {}).get('promises', [])
+             if promise['status'] != 'fulfilled'
+             for song in re.findall('《([^》]+)》', promise['text'])}
+    evidence = material.get('source_evidence', {}).values() if 'source_evidence' in material else person['evidence']
+    for item in evidence:
+        if item['session_id'] not in session_ids or item.get('kind') != 'transcript':
+            continue
+        text = item['text']
+        if any(name in text.casefold() for name in names):
+            reasons.append('named_candidate')
+        if any(song in text for song in songs) and any(word in text for word in ('学会', '答应', '补', '欠', '唱过')):
+            reasons.append('promise_candidate')
+    return sorted(set(reasons))
+
+
+def apply_update_scope(config, material, previous):
+    """未互动者不新增档案；已有档案沿用上一版已验收的逐字引用，不重查无关来源。"""
+    if not previous.get('material'):
+        return
+    old = json.loads(Path(previous['material']).read_text())
+    if old['room_id'] != material['room_id'] or old['scope'] != material['scope']:
+        raise ValueError('历史引用来源属于其他主播')
+    known = {s['id'] for s in old['sessions']}
+    session_ids = set(config.get('_update_sessions',
+        [s['id'] for s in material['sessions'] if s['id'] not in known]))
+    material['update_sessions'] = sorted(session_ids)
+    from .audience_sources import evidence_map
+    for pid, person in material['people'].items():
+        prior = previous.get('states', {}).get(pid)
+        reasons = update_reasons(config, person, material, session_ids, prior)
+        person['analysis_eligible'] = bool(prior or reasons)
+        if not prior or reasons:
+            continue
+        # 保留已接纳历史的证据快照；不把修订后的来源伪装为原引用。
+        old_person = old['people'][pid]
+        validate_state(old_person, prior, old)
+        evidence = evidence_map(old_person, old)
+        current_evidence = evidence_map(person, material)
+        refs = {ref['id'] for section in SECTIONS for row in prior[section] for ref in row['refs']}
+        for ref in sorted(refs):
+            if ref in current_evidence and current_evidence[ref]['text'] == evidence[ref]['text']:
+                continue
+            item = {**evidence[ref], 'retained_from_plan': previous['plan_id']}
+            if item['session_id'] not in {s['id'] for s in material['sessions']}:
+                raise ValueError('保留历史引用所需场次缺失')
+            person['evidence'] = [e for e in person['evidence'] if e['id'] != ref]
+            person['evidence'].append(item)
+            # 本人历史引用使用明确标注的旧快照，不覆盖其他人查证所用的新共享原文。
+            if 'source_evidence' in material and ref not in material['source_evidence']:
+                material['source_evidence'][ref] = item
+        person['evidence'].sort(key=lambda item: (epoch(item['at']), item['id']))
+
+
 def _prepare(config, material):
     """冻结按人输入；每个独立结果可重试；状态不匹配绝不静默沿用。"""
     root = Path(config['workspace']).resolve()
@@ -320,12 +389,19 @@ def _prepare(config, material):
     previous = json.loads(previous_file.read_text()) if previous_file.exists() else {}
     if previous and (previous['room_id'] != material['room_id'] or previous['scope'] != material['scope']):
         raise ValueError('不能复用其他主播的观众状态')
+    previous_material = json.loads(Path(previous['material']).read_text()) if previous.get('material') else None
+    update_sessions = material.get('update_sessions')
+    if update_sessions is None and previous_material is not None:
+        known = {s['id'] for s in previous_material['sessions']}
+        update_sessions = [s['id'] for s in material['sessions'] if s['id'] not in known]
     tasks = []
     for pid, person in material['people'].items():
-        if not person['evidence']:
+        if not person['evidence'] or person.get('analysis_eligible') is False:
             continue
         source, result = directory / f'{pid}.input.json', directory / f'{pid}.result.json'
         prior = previous.get('states', {}).get(pid)
+        reasons = (update_reasons(config, person, material, set(update_sessions), prior)
+                   if update_sessions is not None else ['initial_history'])
         payload = {'person_id': pid, 'revision': person['revision'], 'name': person['name'],
             'names': person['names'], 'counts': person['counts'], 'previous': prior,
             'evidence': person['evidence'], 'timezone': 'Asia/Shanghai',
@@ -336,18 +412,31 @@ def _prepare(config, material):
         temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
         temporary.replace(source)
         reused = False
-        if prior and prior.get('revision') == person['revision']:
+        reuse_reason = None
+        if prior and (prior.get('revision') == person['revision'] or not reasons):
             try:
-                atomic_json(result, validate_state(person, prior, material))
+                # 事实计数/进场/来源文件可以更新；有效历史正文保持逐条不变，引用仍须校验。
+                retained = {**prior, 'revision': person['revision']}
+                atomic_json(result, validate_state(person, retained, material))
                 reused = True
+                reuse_reason = 'unchanged_revision' if prior.get('revision') == person['revision'] else 'no_relevant_interaction'
             except ValueError:
                 reused = False
+                reasons.append('invalid_previous_evidence')
+        if not prior:
+            reasons.append('missing_previous_state')
         tasks.append({'person_id': pid, 'reused': reused, 'input': str(source),
-                      'input_sha256': digest(json.loads(source.read_text())),
-                      'result': str(result)})
+                       'input_sha256': digest(json.loads(source.read_text())),
+                       'result': str(result), 'update_reasons': sorted(set(reasons)),
+                       'reuse_reason': reuse_reason})
     plan = {'id': signature, 'room_id': material['room_id'], 'scope': material['scope'],
             'concurrency': 10, 'subagent': 'ollama_glm_5_3_flash', 'tasks': tasks,
-            'previous_plan_id': previous.get('plan_id')}
+             'previous_plan_id': previous.get('plan_id'),
+             'selection_summary': {'eligible_people': len(tasks),
+                 'reused': sum(task['reused'] for task in tasks),
+                 'updates': sum(not task['reused'] for task in tasks),
+                 'not_analyzed': sum(p.get('analysis_eligible') is False for p in material['people'].values()),
+                 'update_sessions': update_sessions}}
     atomic_json(directory / 'plan.json', plan)
     (directory / 'instructions.txt').write_text(AGENTIC_PROMPT if source_manifest else PROMPT)
     return directory, plan
@@ -362,12 +451,16 @@ def finish(config, directory):
         raise ValueError('计划目录必须位于本主播私有runs目录')
     material = json.loads((directory / 'material.json').read_text())
     plan = json.loads((directory / 'plan.json').read_text())
+    if (material.get('update_policy') != 'meaningful-interaction-v1'
+            and not (directory / 'accepted.json').exists()):
+        raise ValueError('旧未完成CRM计划须按有效互动规则重新准备，不可直接接纳')
     if (plan['id'] != directory.name or digest(material) != plan['id']
             or material['room_id'] != config['room_id'] or material['scope'] != config['scope']):
         raise ValueError('冻结素材或主播身份已变化')
     from .audience_sources import verify_sources
     verify_sources(directory, material)
-    expected = {pid for pid, person in material['people'].items() if person['evidence']}
+    expected = {pid for pid, person in material['people'].items()
+                if person['evidence'] and person.get('analysis_eligible') is not False}
     if {task['person_id'] for task in plan['tasks']} != expected or len(plan['tasks']) != len(expected):
         raise ValueError('计划没有恰好覆盖有证据的观众')
     states = {}
@@ -378,6 +471,11 @@ def finish(config, directory):
                 or digest(json.loads(source.read_text())) != task['input_sha256']):
             raise ValueError('观众分片输入已变化')
         states[pid] = validate_state(material['people'][pid], json.loads(result.read_text()), material)
+        if task.get('reused') and task.get('reuse_reason'):
+            retained = {**json.loads(source.read_text())['previous'],
+                        'revision': material['people'][pid]['revision']}
+            if states[pid] != validate_state(material['people'][pid], retained, material):
+                raise ValueError('复用历史内容已变化，不能静默丢弃旧档案')
     # 完整版本先落盘，再一次切换指针。失败时保留原有current。
     current = {'plan_id': plan['id'], 'room_id': material['room_id'], 'scope': material['scope'],
                'material': str(directory / 'material.json'), 'states': states}
@@ -438,7 +536,14 @@ def load_material(config):
                 legacy['source']['segments'].extend({**row, 'seq': row.get('seq', row.get('source_key')),
                     'is_final': True} for row in rows if row.get('text'))
         sessions.append(legacy)
-    return collect(config, sessions)
+    if config.get('_include_session'):
+        included = load_config(config['_include_session'])
+        sid = included.get('workflow_key') or digest(included['start_utc'])[:24]
+        if sid not in {s['id'] for s in sessions}:
+            raise ValueError('本场CRM更新来源未封口或未纳入素材')
+        config = {**config, '_update_sessions': [sid]}
+    material = collect(config, sessions)
+    return material
 
 
 def session_source(config):
