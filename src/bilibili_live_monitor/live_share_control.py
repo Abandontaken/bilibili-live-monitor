@@ -101,6 +101,7 @@ def initialize(args, *, resume=False):
             raise ValueError('工作目录不是目录')
         allowed = {'config.json', 'annotations.json', 'verified_songs.json'}
         allowed |= {name + '.tmp' for name in allowed}
+        allowed |= {'deployment.json', 'deployment.json.lock'}
         if any(not resume or p.name not in allowed or not p.is_file() or p.is_symlink()
                for p in workspace.iterdir()):
             raise ValueError('工作目录非空；必须为每场直播创建新目录')

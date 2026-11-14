@@ -5,6 +5,28 @@ import pytest
 from bilibili_live_monitor import audience_watch, deployment, session_health, session_runner
 
 
+def test_dispatcher_initializes_pre_pinned_workspace_and_preserves_old_binding(tmp_path, monkeypatch):
+    from test_session_workflow import automation, settings
+
+    from bilibili_live_monitor.session_workflow import SessionWorkflows
+    registry = tmp_path / 'registry.json'
+    deployment.atomic(registry, {'components': {'sessions': {'release': '/synthetic/old'}}})
+    monkeypatch.setenv('BILI_DEPLOYMENT_REGISTRY', str(registry))
+    monkeypatch.setattr(deployment, 'validate_binding', lambda binding: binding)
+    service, candidate = automation(tmp_path)
+    manager = SessionWorkflows(service, settings(tmp_path))
+    first = manager.prepare('123456', candidate)
+    config = manager.initialize(first)
+    marker = config.with_name('deployment.json')
+    original_pin, original_config = marker.read_bytes(), config.read_bytes()
+    deployment.atomic(registry, {'components': {'sessions': {'release': '/synthetic/new'}}})
+    assert manager.initialize(first) == config
+    assert marker.read_bytes() == original_pin and config.read_bytes() == original_config
+    candidate['live_start'] = '2030-01-02 08:00:00'
+    second = manager.initialize(manager.prepare('123456', candidate))
+    assert deployment.read(second.with_name('deployment.json'))['binding']['release'] == '/synthetic/new'
+
+
 def test_paused_watch_does_not_create_workspace(tmp_path, monkeypatch):
     guard = tmp_path / 'guard.json'
     deployment.atomic(guard, {'mode': 'paused'})
