@@ -18,6 +18,9 @@ def main():
         if pin['component'] != args.component:
             raise ValueError('任务组件身份不符')
         binding = pin['binding']
+        # 旧运行快照可能早于发布控制模块；控制实现取当前组件，业务仍由run按原pin执行。
+        if not (Path(binding['release']) / 'src/bilibili_live_monitor/deployment.py').is_file():
+            binding = json.loads(args.registry.read_text())['components'][args.component]
     else:
         binding = json.loads(args.registry.read_text())['components'][args.component]
     sys.path.insert(0, str(Path(binding['release']) / 'src'))
