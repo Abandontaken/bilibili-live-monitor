@@ -87,7 +87,29 @@ def visible_platform(platform, instance):
         str(c.get('room_id') or ''), c.get('url', '').rstrip('/').rsplit('/', 1)[-1]}]}
 
 
-def room_snapshot(state, platform, automation, instance):
+def presentation_sessions(instance):
+    """读取完整场次索引，避免最近 20 条运行摘要漏掉低频开播房间。"""
+    from .room_archive import read_object
+    if not instance.get('session_root'):
+        return []
+    root = Path(instance['session_root']).resolve()
+    result = []
+    for path in root.glob('*/config.json'):
+        if not re.fullmatch(r'[a-f0-9]{24}', path.parent.name):
+            continue
+        try:
+            row = read_object(root, path)
+            start = row.get('start_utc')
+            if not isinstance(start, str) or not str(row.get('room_id', '')).isdigit():
+                continue
+            datetime.fromisoformat(start)
+            result.append({'room_id': str(row['room_id']), 'key': path.parent.name, 'start': start})
+        except (OSError, ValueError, TypeError):
+            continue
+    return result
+
+
+def room_snapshot(state, platform, automation, instance, sessions=()):
     account = automation.get('account', {})
     mode = account.get('mode', 'account')
     label = '匿名' if mode == 'anonymous' else next(
@@ -141,7 +163,7 @@ def room_snapshot(state, platform, automation, instance):
         if rid in instance.get('archive', {}).get('rooms', {}):
             room['home_url'] = f'rooms/{rid}/'
             room['display_name'] = instance['archive']['rooms'][rid]
-        records = [r for r in automation.get('session_workflows', []) if r.get('room_id') == rid]
+        records = [r for r in [*sessions, *automation.get('session_workflows', [])] if r.get('room_id') == rid]
         if records:
             latest = max(records, key=lambda r: r.get('start', ''))
             key = latest.get('key', '')
@@ -166,6 +188,8 @@ def room_snapshot(state, platform, automation, instance):
 
 
 def create_gateway(config, *, transport=None):
+    from .dashboard_resources import resource_url, yamon_metrics
+    resources_url = resource_url(config.get('resources_url'))
     instances = validate_instances(config['instances'])
 
     @asynccontextmanager
@@ -187,6 +211,7 @@ def create_gateway(config, *, transport=None):
         return response
     archive_cache = {}
     archive_locks = {}
+    session_cache = {}
 
     def instance(ident):
         if ident not in instances:
@@ -198,7 +223,11 @@ def create_gateway(config, *, transport=None):
             for path in ('/api/state', '/api/platform', '/api/automation')))
         for response in responses:
             response.raise_for_status()
-        return room_snapshot(*(response.json() for response in responses), row)
+        cached = session_cache.get(row['id'])
+        if not cached or time.monotonic() - cached[0] >= 30:
+            records = await asyncio.to_thread(presentation_sessions, row)
+            cached = session_cache[row['id']] = (time.monotonic(), records)
+        return room_snapshot(*(response.json() for response in responses), row, sessions=cached[1])
 
     def archive_room(ident, room_id):
         row = instance(ident)
@@ -266,7 +295,20 @@ def create_gateway(config, *, transport=None):
     @app.get('/api/dashboard/instances')
     async def instance_list():
         return [{'id': row['id'], 'label': row['label'], 'mode': row.get('mode', 'account'),
-                 'base': f'instances/{row["id"]}/'} for row in instances.values()]
+                  'base': f'instances/{row["id"]}/'} for row in instances.values()]
+
+    @app.get('/api/dashboard/resources')
+    async def system_resources():
+        if not resources_url:
+            raise HTTPException(503, '未配置整机资源来源')
+        try:
+            async with asyncio.timeout(3):
+                response = await app.state.client.get(resources_url + '/api/metrics', timeout=2)
+                response.raise_for_status()
+                data = yamon_metrics(response.json())
+            return JSONResponse(data, headers={'Cache-Control': 'no-store'})
+        except (httpx.HTTPError, TimeoutError, ValueError) as error:
+            raise HTTPException(503, '整机资源采样暂不可用') from error
 
     @app.get('/instances/{ident}/api/state')
     async def state(ident: str):
