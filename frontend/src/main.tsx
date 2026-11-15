@@ -1,20 +1,24 @@
-import React, {useEffect, useLayoutEffect, useRef, useState} from 'react';
+import React, {useCallback, useEffect, useLayoutEffect, useRef, useState} from 'react';
 import {createRoot} from 'react-dom/client';
 import './style.css';
+import './homepage.css';
 import {giftLabel, giftText, type Gift} from './gifts';
 import {transcriptLabel} from './transcripts';
 import {Assistant} from './Assistant';
-import {AutomationControls} from './Automation';
+import {AutomationControls,AutomationProvider} from './Automation';
 import {RoomIssue} from './RoomIssue';
 import {InstanceProvider, useApi, useInstance, type Instance} from './Instance';
 import {RoomArchive} from './RoomArchive';
 import {RoomLinks} from './RoomLinks';
 import {RoomTrend} from './RoomTrend';
+import {RoomPeriodMetrics} from './RoomPeriodMetrics';
 
 type Segment = {seq:number; start_utc:string; end_utc:string; text:string; status:string;
   queue_wait_ms:number; infer_ms:number; rms_dbfs:number; error:string|null; coverage_ratio?:number|null};
 type LikeSummary = {reported_total?:number|null;observed_utc?:string|null;notifications:number;identified_users:number};
 type Room = {room_id:string; title:string; url:string; cover_url:string; status:string;
+   stale?:boolean;last_success?:string|null;
+   display_name?:string;fixed_task?:boolean;current_issue?:boolean;policy_paused?:boolean;
   instance_label?:string;account_mode?:string;result_url?:string;workflow_stage?:string;home_url?:string;
   like_summary?:LikeSummary|null;
   reconnect_attempts?:number;next_retry_utc?:string|null;
@@ -33,6 +37,7 @@ type Item = {id:number;room_id:string;kind:'transcript'|'danmaku'|'gift'|'entry'
 type Change = {kind:'room';data:Room}|{kind:'segment';data:Segment&{room_id:string}}|{kind:'item';data:Item}
   |{kind:'likes';data:{room_id:string;summary:LikeSummary}};
 type State = {rooms:Room[]; queue_depth:number; queue_capacity:number; asr_ready:boolean;
+   fixed_task_count?:number;raw_fixed_count?:number;
   asr_enabled:boolean;
   overload_count:number; inflight:{room_id:string;seq:number}|null;active_count:number;pending_count:number;
   asr_restarts:number;asr_retries:number;asr_error:string|null};
@@ -65,12 +70,12 @@ function ResourceMetrics(){
     async function refresh(){
       setNow(Date.now());
       try{const response=await fetch(base+'assets/resource_metrics.json',{cache:'no-store',signal:controller.signal});
-        if(response.ok){const next:unknown=await response.json();if(alive&&validResources(next))setData(next)}}catch{/* 独立采样器可选；不影响监控。 */}
+        if(response.ok){const next:unknown=await response.json();if(alive)setData(validResources(next)?next:null)}else if(alive)setData(null)}catch{if(alive)setData(null)}
     }
     void refresh();const timer=setInterval(()=>void refresh(),5000);
     return()=>{alive=false;controller.abort();clearInterval(timer)};
   },[]);
-  if(!data)return null;
+   if(!data)return <section className="metrics resource-unavailable"><div><span>监控 CPU</span><strong>—</strong></div><div><span>监控 RSS</span><strong>—</strong></div><p role="status">资源暂不可用</p></section>;
   const stale=now-data.epoch*1000>30000;
   return <section aria-label="机器资源与带宽">
     <div className="metrics">
@@ -125,15 +130,18 @@ const RoomCard = React.memo(function RoomCard({room,status,onError}:{room:Room;s
     if(following&&scroller.current)scroller.current.scrollTop=scroller.current.scrollHeight;
   },[room.items,following]);
   return <article className="card">
-    <div className="card-body"><div className="room-heading"><a href={room.url} target="_blank" rel="noreferrer">{room.title.replace(/ - 哔哩哔哩直播.*$/,'')}</a><span className={'badge '+status}>{labels[status]||status}</span></div>
+    <div className="card-body"><div className="room-heading"><a href={room.url} target="_blank" rel="noreferrer">{room.display_name||room.title.replace(/ - 哔哩哔哩直播.*$/,'')}</a><span className={'badge '+status}>{room.stale?'状态未知':labels[status]||status}</span></div>
+    {room.stale&&<p role="status">实例暂不可用 · 以下为上次结果 · {room.last_success?new Date(room.last_success).toLocaleString('zh-CN'):'尚未取得快照'}</p>}
     <RoomLinks liveUrl={room.url} archiveUrl={room.home_url?base+room.home_url:undefined}/>
     <div className="room-sub"><span>房间 {room.room_id}{room.instance_label?` · ${room.instance_label}`:''}</span><button className="text-button" disabled={room.status==='stopped'||room.status==='waiting'} onClick={()=>api(`rooms/${room.room_id}/stop`,{method:'POST'}).catch(e=>onError(e.message))}>停止监控</button></div>
     {room.result_url&&<p className="room-sub"><a href={base+room.result_url} target="_blank" rel="noreferrer">{room.workflow_stage==='completed'?'查看本场最终结果':'查看本场结果（处理中）'}</a></p>}
-    <RoomIssue status={room.status} error={room.error} updatedAt={room.updated_at}/>
-    {room.audio_error&&room.status==='capturing'&&<p className="error">音频质量或媒体进度异常：{room.audio_error}</p>}
+    {!room.stale&&<RoomIssue status={room.status} error={room.error} updatedAt={room.updated_at}/>}
+    {!room.stale&&room.audio_error&&room.status==='capturing'&&<p className="error">音频质量或媒体进度异常：{room.audio_error}</p>}
     {room.capture_health&&<p className="room-sub">近一小时（当前采集任务）：整页重载 {room.capture_health.last_hour.page_reloads} 次 · 采音重建 {room.capture_health.last_hour.local_restarts} 次 · 异常音频 {Math.round(room.capture_health.last_hour.invalid_seconds)} 秒 · 采集缺口 {Math.round(room.capture_health.last_hour.gap_seconds)} 秒</p>}
     {!!room.reconnect_attempts&&<p className="room-sub">连续失败 {room.reconnect_attempts} 次{room.next_retry_utc?` · 下次重试 ${time(room.next_retry_utc)}`:''}</p>}
     {room.record_mode!=='none'&&<p className="room-sub">录制 {room.recording_status==='recording'?'进行中':room.recording_status==='starting'?'启动中':room.recording_status==='stopped'?'已结束':room.recording_status} · {(room.recorded_seconds/60).toFixed(1)} 分钟 · {(room.recording_bytes/1e6).toFixed(1)} MB · {room.recording_files} 文件</p>}
+    {room.home_url&&<RoomPeriodMetrics base={base} roomId={room.room_id}/>}
+    <AutomationControls rooms={[room]} roomId={room.room_id}/>
     {room.home_url&&<RoomTrend base={base} roomId={room.room_id}/>}
     <div className="timeline-tools"><button className="text-button" aria-pressed={following} onClick={()=>{setFollowing(true);if(scroller.current)scroller.current.scrollTop=scroller.current.scrollHeight}}>{following?'跟随最新':'已暂停·回最新'}</button><a href={base+'api/export?room_id='+room.room_id}>导出本房快照</a></div>
     <div className={'segments'+(following?' following':'')} ref={scroller} onScroll={e=>{const n=e.currentTarget;setFollowing(n.scrollHeight-n.scrollTop-n.clientHeight<32)}}>
@@ -147,12 +155,14 @@ const RoomCard = React.memo(function RoomCard({room,status,onError}:{room:Room;s
     </div></article>;
 });
 
-function SnapshotApp(){
-  const {base,label}=useInstance();const api=useApi();
+type Report=(id:string,state:State,connected:boolean)=>void;
+function SnapshotApp({onState}:{onState?:Report}){
+  const {base,label,id,mode}=useInstance();const api=useApi();
   const [state,setState] = useState<State>({rooms:[],queue_depth:0,queue_capacity:20,asr_ready:false,asr_enabled:false,overload_count:0,inflight:null,active_count:0,pending_count:0,asr_restarts:0,asr_retries:0,asr_error:null});
   const [recordMode,setRecordMode]=useState('audio');
   const [asrEnabled,setAsrEnabled]=useState(false);
   const [connected,setConnected] = useState(false);
+  const [lastSnapshot,setLastSnapshot]=useState<string|null>(null);
   const [url,setUrl] = useState('');
   const seconds = 5;
   const [busy,setBusy] = useState(false);
@@ -161,6 +171,7 @@ function SnapshotApp(){
   const [fullscreen,setFullscreen]=useState(false);
   const timer = useRef<ReturnType<typeof setTimeout>|null>(null);
   const changes=useRef<Change[]>([]);
+  useEffect(()=>{onState?.(id,state,connected)},[id,state,connected,onState]);
   useEffect(()=>{const update=()=>setFullscreen(Boolean(document.fullscreenElement));
     document.addEventListener('fullscreenchange',update);return()=>document.removeEventListener('fullscreenchange',update)},[]);
   useEffect(()=>{
@@ -182,9 +193,9 @@ function SnapshotApp(){
           }return {...s,rooms}});
       },200)};
     const events = new EventSource(base + 'api/events');
-    events.onopen=()=>setConnected(true);
+    events.onopen=()=>{};
     events.onerror=()=>setConnected(false);
-    events.addEventListener('snapshot',e=>{changes.current=[];setConnected(true);setState(JSON.parse((e as MessageEvent).data))});
+    events.addEventListener('snapshot',e=>{changes.current=[];setLastSnapshot(new Date().toISOString());setConnected(true);setState(JSON.parse((e as MessageEvent).data))});
     events.addEventListener('unavailable',()=>setConnected(false));
     for(const kind of ['room','segment','item','likes'] as const)events.addEventListener(kind,e=>enqueue({kind,data:JSON.parse((e as MessageEvent).data)}));
     events.addEventListener('metrics',e=>setState(s=>({...s,...JSON.parse((e as MessageEvent).data)})));
@@ -197,16 +208,17 @@ function SnapshotApp(){
   }
   const active=state.active_count+state.pending_count;
   return <main>
-    <header><div><div className="eyebrow">本地 CDP 静音捕获 · Qwen3-ASR</div><h1>B站多路直播监控看板{label?` · ${label}`:''}</h1><p>多路直播语音、弹幕与礼物混合时间线。</p></div>
+    {!onState&&<><header><div><div className="eyebrow">本地 CDP 静音捕获 · Qwen3-ASR</div><h1>B站多路直播监控看板{label?` · ${label}`:''}</h1><p>多路直播语音、弹幕与礼物混合时间线。</p></div>
       <div className="header-actions"><button className="secondary" onClick={async()=>{try{if(document.fullscreenElement)await document.exitFullscreen();else await document.documentElement.requestFullscreen()}catch(e){setError((e as Error).message)}}}>{fullscreen?'退出全屏':'进入全屏'}</button><span className={'connection '+(connected?'online':'')}><i/>{connected?'实时连接正常':'正在重连'}</span></div></header>
-    <details className="dashboard-details"><summary>系统状态与资源</summary><section className="metrics">
+    <details open className="dashboard-details"><summary>系统状态与资源</summary><section className="metrics">
       <div><span>监控任务（含重连 / 启动）</span><strong>{active}<small> 路</small></strong></div>
       <div><span>队列深度</span><strong>{state.queue_depth}<small> / {state.queue_capacity}</small></strong></div>
       <div><span>ASR · 重启 {state.asr_restarts} / 重试 {state.asr_retries}</span><strong className="word">{!state.asr_enabled?'禁用':state.asr_ready?'已就绪':state.asr_error?'等待恢复':'正在加载'}</strong></div>
       <div><span>队列过载次数</span><strong className={state.overload_count?'warning':''}>{state.overload_count}</strong></div>
     </section>
-    <ResourceMetrics/></details>
-    <AutomationControls rooms={state.rooms}/>
+    <ResourceMetrics/></details></>}
+    <div className="section-title"><h2>{label||'直播间'} <span>{state.fixed_task_count??state.rooms.length}</span></h2><span className={'connection '+(connected?'online':'')}>{connected?'实时连接正常':'正在重连'}</span></div>
+    {mode!=='anonymous'&&<AutomationControls settingsOnly/>}
     <details className="dashboard-details"><summary>添加直播间</summary><form onSubmit={e=>{e.preventDefault();void add(url)}}>
       <input aria-label="直播间链接或房间号" placeholder="输入直播间链接或房间号" value={url} onChange={e=>setUrl(e.target.value)} required/>
       <select aria-label="保存类型" value={recordMode} onChange={e=>setRecordMode(e.target.value)}><option value="audio">只保存音频</option><option value="video">保存视频＋音频</option><option value="none">不保存媒体</option></select>
@@ -219,31 +231,61 @@ function SnapshotApp(){
     {error&&<div className="alert" role="alert">{error}<button onClick={()=>setError('')}>×</button></div>}
     {state.asr_error&&<div className="alert" role="alert">模型：{state.asr_error}</div>}
     {candidates.length>0&&<section className="candidates">{candidates.map(c=><button disabled={busy} key={c.url} className="secondary" onClick={()=>void add(c.url)}>{c.title||c.url}</button>)}</section>}
-    <div className="section-title"><h2>直播间 <span>{state.rooms.length}</span></h2><a className="export-link" href={base+'api/export'}>导出全部快照</a></div>
+    <a className="export-link" href={base+'api/export'}>导出全部快照</a>
     {state.rooms.length===0&&<section className="empty">当前暂无监控房间，请输入直播间链接或房间号开始监听。</section>}
-    <section className="grid">{state.rooms.map(room=><div id={'room-'+base.replace(/\W/g,'-')+room.room_id} key={room.room_id}><RoomCard room={room} status={room.status==='capturing'&&state.inflight?.room_id===room.room_id?'transcribing':room.status} onError={setError}/></div>)}</section>
+    <section className={'grid '+(mode==='anonymous'?'anonymous-grid':'account-grid')}>{state.rooms.filter(r=>r.fixed_task!==false).map(original=>{const room={...original,stale:!connected,last_success:lastSnapshot};return <div id={'room-'+base.replace(/\W/g,'-')+room.room_id} key={room.room_id}>{mode==='anonymous'?<CompactRoom room={room}/>:<RoomCard room={room} status={room.status==='capturing'&&state.inflight?.room_id===room.room_id?'transcribing':room.status} onError={setError}/>}</div>})}</section>
+    {state.rooms.some(r=>r.fixed_task===false)&&<details className="dashboard-details"><summary>临时任务 · {state.rooms.filter(r=>r.fixed_task===false).length}</summary><div className="grid">{state.rooms.filter(r=>r.fixed_task===false).map(room=>mode==='anonymous'?<CompactRoom key={room.room_id} room={{...room,stale:!connected,last_success:lastSnapshot}}/>:<RoomCard key={room.room_id} room={{...room,stale:!connected,last_success:lastSnapshot}} status={room.status} onError={setError}/>)}</div></details>}
     <details className="technical-details"><summary>数据说明</summary><p className="footnote">每房间显示最近80条消息。完整时间线保存在本地，可导出快照。历史统计与金额口径见按日汇总。</p></details>
   </main>;
 }
-function SingleApp(){
+function CompactRoom({room}:{room:Room}){
+ const {base}=useInstance();
+ return <article className="card compact-room"><div className="card-body">
+  <div className="room-heading"><strong title={room.display_name||room.title}>{room.display_name||room.title}</strong><span className={'badge '+room.status}>{room.stale?'状态未知':room.policy_paused?'已暂停':labels[room.status]||room.status}</span></div>
+  {room.stale&&<p role="status">实例暂不可用 · 以下为上次结果 · {room.last_success?new Date(room.last_success).toLocaleString('zh-CN'):'尚未取得快照'}</p>}
+  <small>房间 {room.room_id}</small>
+  {!room.stale&&room.current_issue&&<RoomIssue status="error" error={room.error||room.audio_error||'需要人工处理'}/>}
+  {room.home_url?<RoomPeriodMetrics base={base} roomId={room.room_id}/>:<p>归档暂时无法读取</p>}
+  <RoomLinks liveUrl={room.url} archiveUrl={room.home_url?base+room.home_url:undefined}/>
+  {room.result_url&&<a href={base+room.result_url}>查看本场结果</a>}
+ </div></article>;
+}
+function SingleApp({onState}:{onState?:Report}){
   const instance=useInstance();
   const [page,setPage]=useState<'snapshot'|'assistant'>('snapshot');
-  if(instance.mode==='anonymous')return <SnapshotApp/>;
+   if(instance.mode==='anonymous')return <SnapshotApp onState={onState}/>;
   return <><nav className="top-nav" aria-label="页面">
     <button aria-pressed={page==='snapshot'} onClick={()=>setPage('snapshot')}>快照</button>
     <button aria-pressed={page==='assistant'} onClick={()=>setPage('assistant')}>直播助手</button>
-   </nav><div hidden={page!=='snapshot'}><SnapshotApp/></div>{page==='assistant'&&<main><Assistant/></main>}</>;
+   </nav><div hidden={page!=='snapshot'}><SnapshotApp onState={onState}/></div>{page==='assistant'&&<main><Assistant/></main>}</>;
+}
+function SystemHealth({instances,reports}:{instances:Instance[];reports:Record<string,{state:State;connected:boolean}>}){
+ const rows=instances.map(i=>reports[i.id]),complete=rows.every(r=>r?.connected&&r.state.fixed_task_count!=null);
+ const known=rows.filter((r):r is {state:State;connected:boolean}=>!!r?.connected&&r.state.fixed_task_count!=null);
+ const sum=(key:'fixed_task_count'|'queue_depth'|'queue_capacity')=>known.reduce((n,r)=>n+(r.state[key]??0),0);
+ const rooms=known.flatMap(r=>r.state.rooms.filter(r=>r.fixed_task));
+ const value=(n:number)=>complete?n:known.length?`${n} + —`:'—';
+ return <section className="system-health" aria-label="系统状态与资源"><header><h1>B站多路直播监控看板</h1><button className="secondary" onClick={()=>{void (document.fullscreenElement?document.exitFullscreen():document.documentElement.requestFullscreen()).catch(()=>{})}}>进入全屏</button></header>
+ <p role="status">{complete?'实时连接正常':'部分实例暂不可用'}</p><div className="metrics">
+ <div><span>配置监控任务</span><strong>{value(sum('fixed_task_count'))}<small> 路</small></strong></div>
+ <div><span>当前实际采集</span><strong>{value(rooms.filter(r=>r.status==='capturing').length)}</strong><small>录制 {value(rooms.filter(r=>r.status==='capturing'&&r.recording_status==='recording').length)}</small></div>
+ <div><span>当前异常</span><strong>{value(rooms.filter(r=>r.current_issue).length)}</strong></div>
+ <div><span>ASR 队列</span><strong>{value(sum('queue_depth'))}<small> / {value(sum('queue_capacity'))}</small></strong><small>处理中 {value(known.filter(r=>r.state.inflight).length)}</small></div>
+ </div><details><summary>诊断信息</summary>{instances.map(i=>{const r=reports[i.id];return <p key={i.id}>{i.label} · {r?.connected?'实时连接正常':'暂不可用'} · 配置 {r?.state.fixed_task_count??'—'} / 原始 {r?.state.raw_fixed_count??'—'} · ASR {r?.connected?(!r.state.asr_enabled?'禁用':r.state.asr_error?'等待恢复':r.state.asr_ready?'已就绪':'正在加载'):'—'}</p>})}</details>
+ <InstanceProvider instance={instances[0]}><ResourceMetrics/></InstanceProvider></section>;
 }
 export function App(){
   const [instances,setInstances]=useState<Instance[]|null>(null);
+  const [reports,setReports]=useState<Record<string,{state:State;connected:boolean}>>({});
+  const report=useCallback<Report>((id,state,connected)=>setReports(old=>({...old,[id]:{state,connected}})),[]);
   useEffect(()=>{let alive=true;fetch(import.meta.env.BASE_URL+'api/dashboard/instances')
     .then(r=>{if(!r.ok)throw new Error('single');return r.json()})
     .then((rows:Instance[])=>{if(alive)setInstances(rows.map(row=>({...row,base:import.meta.env.BASE_URL+row.base})))})
     .catch(()=>{if(alive)setInstances([])});return()=>{alive=false}},[]);
   if(instances===null)return <main>正在连接监控实例…</main>;
-  if(!instances.length)return <SingleApp/>;
-  return <>{instances.map(instance=><section key={instance.id} aria-label={instance.label}>
-    <InstanceProvider instance={instance}><SingleApp/></InstanceProvider></section>)}</>;
+   if(!instances.length)return <AutomationProvider><SingleApp/></AutomationProvider>;
+   return <div className="dashboard-shell"><SystemHealth instances={instances} reports={reports}/>{instances.map(instance=><section key={instance.id} aria-label={instance.label}>
+    <InstanceProvider instance={instance}>{instance.mode==='anonymous'?<SingleApp onState={report}/>:<AutomationProvider><SingleApp onState={report}/></AutomationProvider>}</InstanceProvider></section>)}</div>;
 }
 const archiveRoute=window.location.pathname.match(/^(.*\/instances\/[^/]+\/)rooms\/(\d+)\/$/);
 createRoot(document.getElementById('root')!).render(<React.StrictMode>{archiveRoute?

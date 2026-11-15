@@ -6,8 +6,10 @@ import logging
 import re
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -59,6 +61,22 @@ def candidate_room_id(candidate):
     return str(candidate.get('room_id') or candidate.get('url', '').rstrip('/').rsplit('/', 1)[-1])
 
 
+def presentation_aliases(instance):
+    """只读已冻结场次的明确采集号/平台号关系，不按主播名猜测身份。"""
+    mappings = {}
+    root = instance.get('session_root')
+    if root:
+        for path in Path(root).glob('*/config.json'):
+            try:
+                row = json.loads(path.read_text())
+                capture, platform = str(row['room_id']), str(row.get('platform_room_id', row['room_id']))
+                if capture.isdigit() and platform.isdigit() and capture != platform:
+                    mappings.setdefault(platform, set()).add(capture)
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+    return {key: next(iter(values)) for key, values in mappings.items() if len(values) == 1}
+
+
 def visible_platform(platform, instance):
     """首页守候列表与房间卡片同样隐藏已移交房间；上游固定名单与封禁记录不变。"""
     hidden = set(instance.get('hidden_rooms', []))
@@ -74,12 +92,26 @@ def room_snapshot(state, platform, automation, instance):
     mode = account.get('mode', 'account')
     label = '匿名' if mode == 'anonymous' else next(
         (p['label'] for p in account.get('profiles', []) if p['id'] == account.get('active')), instance['label'])
-    rooms = {r['room_id']: dict(r) for r in state.get('rooms', [])}
+    aliases = instance.get('_room_aliases', {})
+    hidden = {aliases.get(r, r) for r in instance.get('hidden_rooms', [])}
+    rooms = {r['room_id']: dict(r) for r in state.get('rooms', []) if r['room_id'] not in aliases}
+    for room in state.get('rooms', []):
+        if room['room_id'] in aliases:
+            rid = aliases[room['room_id']]
+            rooms.setdefault(rid, {**room, 'room_id': rid})
     fixed = platform.get('policy', {}).get('fixed_rooms', [])
+    if fixed:
+        for room in rooms.values():
+            room['fixed_task'] = False
+    fixed_ids = []
     for candidate in platform.get('candidates', []):
         if candidate.get('url') not in fixed:
             continue
-        rid = candidate_room_id(candidate)
+        rid = aliases.get(candidate_room_id(candidate), candidate_room_id(candidate))
+        if rid in hidden:
+            continue
+        if rid not in fixed_ids:
+            fixed_ids.append(rid)
         if rid not in rooms:
             rooms[rid] = dict(room_id=rid, title=candidate.get('title') or rid, url=candidate['url'],
                 cover_url='', status='waiting', record_mode=platform['policy'].get('record_mode', 'audio'),
@@ -87,6 +119,13 @@ def room_snapshot(state, platform, automation, instance):
                 recording_status='disabled', recorded_seconds=0, recording_bytes=0, recording_files=0,
                 error=None, chunk_seconds=5, segments=[], items=[])
         room = rooms[rid]
+        room['fixed_task'] = True
+        room['current_issue'] = bool(candidate.get('blocked') or candidate.get('blocked_alias')
+            or candidate.get('status_error') or candidate.get('watch_state') == 'attention'
+            or room['status'] in ('error', 'reconnecting')
+            or (room['status'] == 'capturing' and room.get('audio_error')))
+        room['watch_state'] = candidate.get('watch_state', 'unknown')
+        room['policy_paused'] = not platform['policy'].get('enabled', False)
         if (room['status'] == 'stopped' and platform['policy'].get('enabled')
                 and candidate.get('live_status') in (0, 2) and not candidate.get('blocked')):
             room.update(status='waiting', error=None)
@@ -95,12 +134,13 @@ def room_snapshot(state, platform, automation, instance):
         elif candidate.get('status_error'):
             room.update(status='error', error=candidate['status_error'])
     # 已移交其他实例的房间不在本实例首页显示；房间主页与历史场次链接仍可直接访问。
-    for rid in instance.get('hidden_rooms', []):
+    for rid in hidden:
         rooms.pop(rid, None)
     for rid, room in rooms.items():
         room.update(instance_id=instance['id'], instance_label=label, account_mode=mode)
         if rid in instance.get('archive', {}).get('rooms', {}):
             room['home_url'] = f'rooms/{rid}/'
+            room['display_name'] = instance['archive']['rooms'][rid]
         records = [r for r in automation.get('session_workflows', []) if r.get('room_id') == rid]
         if records:
             latest = max(records, key=lambda r: r.get('start', ''))
@@ -120,7 +160,9 @@ def room_snapshot(state, platform, automation, instance):
                         logging.getLogger(__name__).warning('房间 %s 的场次状态不可读，保留采集状态', rid)
                     if (directory / 'public/index.html').is_file():
                         room['result_url'] = f'sessions/{key}/'
-    return {**state, 'rooms': list(rooms.values()), 'instance_label': label}
+    ordered = [rooms[rid] for rid in fixed_ids] + [r for rid, r in rooms.items() if rid not in fixed_ids]
+    return {**state, 'rooms': ordered, 'instance_label': label,
+            'fixed_task_count': len(fixed_ids), 'raw_fixed_count': len(fixed)}
 
 
 def create_gateway(config, *, transport=None):
@@ -128,6 +170,8 @@ def create_gateway(config, *, transport=None):
 
     @asynccontextmanager
     async def lifespan(app):
+        for row in instances.values():
+            row['_room_aliases'] = await asyncio.to_thread(presentation_aliases, row)
         async with httpx.AsyncClient(timeout=20, follow_redirects=False, trust_env=False, transport=transport) as client:
             app.state.client = client
             yield
@@ -165,12 +209,21 @@ def create_gateway(config, *, transport=None):
         return row, archive
 
     @app.get('/instances/{ident}/api/rooms/{room_id}/archive')
-    async def room_archive(ident: str, room_id: str, trend: bool = False):
+    async def room_archive(ident: str, room_id: str, trend: bool = False, overview: bool = False):
+        if trend and overview:
+            raise HTTPException(400, '请选择一种归档视图')
         row, archive = archive_room(ident, room_id)
+        def project(data):
+            if overview:
+                return {key: value for key, value in {**data, 'periods': [p for p in data.get('periods', [])
+                    if p['days'] == 7]}.items() if key in ('periods', 'updated_at', 'timezone', 'warnings')}
+            return {'summaries': data.get('summaries', []), 'updated_at': data.get('updated_at')} if trend else data
         async with archive_locks.setdefault((ident, room_id), asyncio.Lock()):
             cached = archive_cache.get((ident, room_id))
-            if cached and time.monotonic() - cached[0] < (300 if trend else 30):
-                return {'summaries': cached[1].get('summaries', []), 'updated_at': cached[1].get('updated_at')} if trend else cached[1]
+            today = datetime.now(ZoneInfo('Asia/Shanghai')).date().isoformat()
+            if (cached and cached[2] == today
+                    and time.monotonic() - cached[0] < (300 if trend or overview else 30)):
+                return project(cached[1])
             summary_file = archive.get('summary_files', {}).get(room_id)
             if trend and summary_file:
                 from .archive_summary import shared_summaries
@@ -202,8 +255,8 @@ def create_gateway(config, *, transport=None):
                         data['gift_share'] = summary_gift_share(data['summaries'], data['gift_share']['label'])
             except (OSError, ValueError, TypeError) as error:
                 raise HTTPException(503, '暂时无法读取房间归档，请稍后刷新') from error
-            archive_cache[ident, room_id] = time.monotonic(), data
-            return {'summaries': data.get('summaries', []), 'updated_at': data.get('updated_at')} if trend else data
+            archive_cache[ident, room_id] = time.monotonic(), data, today
+            return project(data)
 
     @app.get('/instances/{ident}/rooms/{room_id}/')
     async def room_home(ident: str, room_id: str):
