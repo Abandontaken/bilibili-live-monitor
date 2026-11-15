@@ -18,6 +18,8 @@ from .media_codec import configure_parser as configure_media_codec
 from .media_codec import main as media_codec_main
 from .offline_asr import configure_parser
 from .offline_asr import main as offline_asr_main
+from .pk_bar import configure_parser as configure_pk_bar
+from .pk_bar import main as pk_bar_main
 from .recording_archive import configure_parser as configure_archive
 from .recording_archive import main as archive_main
 from .rotation import configure_parser as configure_rotation
@@ -47,7 +49,10 @@ def main():
     configure_media_codec(commands)
     configure_gift_assets(commands)
     configure_gift_render(commands)
+    configure_pk_bar(commands)
     args = parser.parse_args()
+    if args.command == 'pk-bar':
+        return pk_bar_main(args)
     if args.command == 'gift-assets':
         return gift_assets_main(args)
     if args.command == 'gift-render':
