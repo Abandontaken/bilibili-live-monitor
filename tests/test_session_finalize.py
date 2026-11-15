@@ -214,6 +214,26 @@ def test_final_publish_rechecks_reviews_after_stopping_writers(tmp_path, monkeyp
     assert state['stage'] == 'finalizing'
 
 
+def test_serial_review_finishes_from_accumulated_history(tmp_path, monkeypatch):
+    config, rows = fixture(tmp_path)
+    plan = final.prepare(config)
+    results(config, plan)
+    final.merge(config)
+    final.finish(config)
+    path = Path(config['workspace']) / 'annotations.json'
+    annotations = json.loads(path.read_text())
+    annotations['reviews'] = annotations['reviews'][-1:]
+    atomic_json(path, annotations)
+    config['finalize_parallel'] = False
+    state = {'stage': 'offline_review', 'final_session': 'parent',
+             'cutoff': epoch(config['start_utc']) + 3600}
+    monkeypatch.setattr(runner, 'ai_control', lambda *a, **k: {'type': 'idle'})
+    monkeypatch.setattr(runner.watch, 'ai_once', lambda *a, **k: pytest.fail('already reviewed'))
+    runner.advance(config, state, 1)
+    assert state['stage'] == 'finalizing'
+    assert state['unreviewed_windows'] == 0
+
+
 def test_changed_frozen_input_cannot_finish(tmp_path):
     config, rows = fixture(tmp_path)
     plan = final.prepare(config)

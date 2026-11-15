@@ -4,12 +4,14 @@ from .live_share import epoch
 
 
 def reconcile_activity(source, rows):
-    windows = [(epoch(row['start']), epoch(row['window_end'])) for row in rows]
+    windows = [(epoch(row['start']), epoch(row['window_end'])) for row in rows
+               if row.get('kind') in ('song', 'talk') and not row.get('time_unknown')]
+    cutoff = max((epoch(row['window_end']) for row in rows), default=None)
     totals = {'total': 0, 'covered': 0, 'unclassified': 0, 'overlap': 0}
     unknown = {'total': 0, 'covered': 0, 'unclassified': 0}
     unclassified_events = 0
-    for at, _, amount, _, _ in gift_observations(source):
-        matches = sum(start <= at < end for start, end in windows)
+    for at, _, amount, _, _ in gift_observations(source, event_time_only=True):
+        matches = sum(start <= at < end or at == cutoff == end for start, end in windows) if at is not None else 0
         group = 'covered' if matches else 'unclassified'
         if not matches:
             unclassified_events += 1

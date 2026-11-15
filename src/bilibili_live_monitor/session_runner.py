@@ -249,7 +249,8 @@ def advance(config, state, now):
         from .session_finalize import reviewed as is_reviewed
         from .transcript_corrections import correction_context
         corrections, _ = correction_context(workspace, source)
-        reviews = json.loads((workspace / 'annotations.json').read_text()).get('reviews', [])
+        from .annotation_history import read_annotations
+        reviews = read_annotations(workspace).get('reviews', [])
         reviewed = {r.get('seq'): r for r in reviews if isinstance(r, dict)}
         remaining = sum(s.get('is_final') and bool(s.get('text')) and not is_reviewed(
                          reviewed.get(s['seq']), {**s, **corrections.get(s['seq'], {})})
