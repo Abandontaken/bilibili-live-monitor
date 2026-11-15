@@ -165,9 +165,10 @@ def prefer_offline(live, offline):
 
 
 def export_snapshot(config):
+    from .annotation_history import read_annotations
     workspace = Path(config['workspace'])
     state, cutoff, source = source_at_cutoff(config)
-    annotations = json.loads((workspace / 'annotations.json').read_text())
+    annotations = read_annotations(workspace)
     completed = state.get('phase') == 'completed' or state.get('stop_intent')
     health = dict(state.get('last_health', {}))
     if completed:
@@ -182,6 +183,7 @@ def export_snapshot(config):
 
 def verify_snapshot(config):
     from .activity_summary import accounting_errors
+    from .annotation_history import read_annotations
     workspace = Path(config['workspace'])
     public = workspace / 'public'
     snapshot = json.loads((public / 'snapshot.json').read_text())
@@ -210,7 +212,7 @@ def verify_snapshot(config):
     if (state.get('phase') == 'completed' or state.get('stop_intent')) and snapshot.get('phase') not in stopped_phases:
         errors.append('completed_page_still_live')
     known = set(config.get('approved_songs', [])) | set(verified_titles(workspace))
-    annotations = json.loads((workspace / 'annotations.json').read_text())
+    annotations = read_annotations(workspace)
     current = {s['seq']: fingerprint(s) for s in source['segments'] if s.get('is_final') and s.get('text')}
     reviews = {r.get('seq'): r for r in annotations.get('reviews', []) if isinstance(r, dict)
                and r.get('fingerprint') == current.get(r.get('seq')) and r.get('seq') in current}

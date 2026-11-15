@@ -221,8 +221,10 @@ def make_snapshot(source: dict, *, start: str, now: str, label: str, phase: str,
             return None
     for key in ('latest_transcript_at', 'latest_message_at'):
         safe_health[key] = safe_time(health.get(key))
+    from .activity_reconciliation import reconcile_activity
     from .activity_summary import summarize_activity, summarize_gifters, summarize_session
     from .gift_value import VALUE_BASIS, value_fields
+    activity_summary = summarize_activity(source, activity, upper, completed=phase == 'completed', start=lower)
     return value_fields({'schema_version': 1, 'activity_accounting_version': 2, 'gift_value_basis': VALUE_BASIS,
             'label': label, 'session_start': start, 'updated_at': now,
             'phase': phase, 'series': {k: sorted(v.values()) for k, v in buckets.items()},
@@ -230,7 +232,8 @@ def make_snapshot(source: dict, *, start: str, now: str, label: str, phase: str,
             'activity': activity, 'ai_updated_at': safe_time(annotations.get('updated_at')),
             'coverage': [[s['start_utc'], s['end_utc']] for s in segments.values()],
             'followups': public_followups(source, start, annotations, followup_overrides, approved_songs, followup_rules),
-            'activity_summary': summarize_activity(source, activity, upper, completed=phase == 'completed', start=lower),
+            'activity_summary': activity_summary,
+            'activity_reconciliation': reconcile_activity(source, activity_summary),
             'session_summary': summarize_session(source),
             'gift_summary': summarize_gifters(source),
             'notes': ['在线人数为平台上报口径；入场、礼物为本系统收到的事件数。',
@@ -344,7 +347,10 @@ def render_snapshot(snapshot: dict, *, navigation=None) -> str:
         period = '—' if item.get('time_unknown') else f'{clock(epoch(item["start"]))}–{clock(epoch(item["end"]))}'
         rows.append(f'<tr><td>{period}</td>'
                     f'<td{song_attr}>{esc(title)}</td><td>{fans}</td><td>{count}</td><td>{amount}</td><td>{state}</td></tr>')
-    footer += ('<section id="activity-summary"><h2>歌曲与杂谈</h2>'
+    from .activity_reconciliation import render_reconciliation
+    reconciliation = (render_reconciliation(snapshot['activity_reconciliation'])
+                      if snapshot.get('activity_reconciliation') else '')
+    footer += ('<section id="activity-summary"><h2>歌曲与杂谈</h2>' + reconciliation +
                '<p>按礼物发生时间归入互不重叠的内容区间；每笔仅计一次，缺口或内容不明列为未分类。'
                '涨粉为区间内观测净变化；盲盒按抽中礼物面值统计，非主播实收。'
                '“+”表示另有金额或数量未知的礼物。</p><div class="activity-table"><table>'

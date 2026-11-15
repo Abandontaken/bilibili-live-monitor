@@ -203,12 +203,35 @@ def test_final_publish_rechecks_reviews_after_stopping_writers(tmp_path, monkeyp
     final.merge(config)
     final.finish(config)
     state = {'stage': 'finalizing', 'final_session': 'parent'}
-    atomic_json(Path(config['workspace']) / 'annotations.json', {'reviews': []})
+    annotations = json.loads((Path(config['workspace']) / 'annotations.json').read_text())
+    for review in annotations['reviews']:
+        review['fingerprint'] = 'invalidated-after-finish'
+    atomic_json(Path(config['workspace']) / 'annotations.json', annotations)
     monkeypatch.setattr(runner, 'stop_ai', lambda *a, **k: True)
     monkeypatch.setattr(runner.watch, 'publish', lambda *a: pytest.fail('must not publish'))
     with pytest.raises(ValueError):
         runner.advance(config, state, 1)
     assert state['stage'] == 'finalizing'
+
+
+def test_serial_review_finishes_from_accumulated_history(tmp_path, monkeypatch):
+    config, rows = fixture(tmp_path)
+    plan = final.prepare(config)
+    results(config, plan)
+    final.merge(config)
+    final.finish(config)
+    path = Path(config['workspace']) / 'annotations.json'
+    annotations = json.loads(path.read_text())
+    annotations['reviews'] = annotations['reviews'][-1:]
+    atomic_json(path, annotations)
+    config['finalize_parallel'] = False
+    state = {'stage': 'offline_review', 'final_session': 'parent',
+             'cutoff': epoch(config['start_utc']) + 3600}
+    monkeypatch.setattr(runner, 'ai_control', lambda *a, **k: {'type': 'idle'})
+    monkeypatch.setattr(runner.watch, 'ai_once', lambda *a, **k: pytest.fail('already reviewed'))
+    runner.advance(config, state, 1)
+    assert state['stage'] == 'finalizing'
+    assert state['unreviewed_windows'] == 0
 
 
 def test_changed_frozen_input_cannot_finish(tmp_path):

@@ -156,4 +156,8 @@ def session_overview(content, name, snapshot, *, navigation=None):
     if safe_target(destinations.get('audience_url')):
         from .audience_navigation import with_audience_links
         content = with_audience_links(content, destinations['audience_url'])
+    if snapshot.get('activity_reconciliation') and 'id="activity-reconciliation"' not in content:
+        from .activity_reconciliation import render_reconciliation
+        content = content.replace('<h2>歌曲与杂谈</h2>',
+                                  '<h2>歌曲与杂谈</h2>' + render_reconciliation(snapshot['activity_reconciliation']), 1)
     return content

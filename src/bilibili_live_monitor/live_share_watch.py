@@ -9,6 +9,7 @@ import time
 import urllib.request
 from pathlib import Path
 
+from bilibili_live_monitor.annotation_history import read_annotations
 from bilibili_live_monitor.content_mode import content_ai_enabled
 from bilibili_live_monitor.live_share import (
     atomic_json,
@@ -85,8 +86,7 @@ def build(config, state, platform, api_state, now, upload=True):
     last_text = max((s['end_utc'] for s in source['segments'] if s.get('text')
                      and epoch(s['end_utc']) <= cutoff), default=None)
     message = platform.get('message_health', {}).get(config['room_id'], {})
-    path = Path(config['workspace']) / 'annotations.json'
-    annotations = json.loads(path.read_text()) if path.exists() else {}
+    annotations = read_annotations(config['workspace'])
     health = {'recording': room['recording_status'] == 'recording', 'asr_enabled': room['asr_enabled'],
               'asr_ready': api_state['asr_ready'], 'queue_depth': api_state['queue_depth'],
               'recording_growth_seconds': growth, 'recording_growth_bytes': byte_growth,
@@ -131,8 +131,7 @@ def ai_once(config, state, source, now, *, final=False):
     cutoff = min(now, state.get('cutoff', state.get('last_live_at', epoch(config['start_utc']))))
     source = scope_source(source, config['start_utc'], cutoff)
     workspace = Path(config['workspace'])
-    previous_path = workspace / 'annotations.json'
-    previous = json.loads(previous_path.read_text()) if previous_path.exists() else {}
+    previous = read_annotations(workspace)
     reviewed = {r.get('seq'): r.get('fingerprint') for r in previous.get('reviews', [])
                  if isinstance(r, dict) and r.get('investigation_version') == 2 and r.get('music_source') in
                 {'probable_live', 'recording', 'uncertain', 'none'}}
