@@ -1,5 +1,11 @@
 # 工作记录
 
+## 归档前端不可变产物（2026-11-15）
+
+- `npm run build:archive --prefix frontend` 预编译 `ArchiveEmbed` 为独立 JS、CSS 与 HTML 模板；`--frontend` / `--output` 支持明确的构建源和发布目录。
+- 发布目录按源码清单、依赖锁、编译器版本和构建脚本计算身份；携带源码副本及产物 SHA256 清单。复用已有目录时校验产物，拒绝篡改，不在生产同步阶段依赖 `node_modules`。
+- 验证：Node 8 项、Vitest 70 项、TypeScript / Vite 构建通过；两站私有适配器隔离验收确认新旧页面逐字节一致、冷缓存无 Node 调用、损坏产物拒绝。CRM 固定原第三方版本的新独立环境中，现有发布的相关定向测试 157 项通过。私有入口迁移与删除验收另留本机回执。
+
 ## Dashboard 资源来源与完整场次结果索引（2026-11-15）
 
 - `resources_url` → YAMON `/api/metrics` → 同源 `/api/dashboard/resources`；显式本机 HTTP 配置、只读字段投影、3 秒总超时、`no-store`。CPU / GPU / 内存 / 网络全部按整机口径；缺项为 null，过期采样不展示数值。
