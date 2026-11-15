@@ -31,6 +31,20 @@ def test_zero_and_extreme_scores_are_readable():
     assert pk_bar.bar_ratio(1000, 1000) == .5
 
 
+def test_final_disabled_expired_and_result():
+    origin = pk_bar.epoch('2030-01-01T00:00:00Z')
+    state = {'at': 0, 'status': 301, 'members': [], 'final_end': None}
+    plan = {'video_start': '2030-01-01T00:00:00Z', 'room': '123',
+            'connection': [0, 100], 'snapshots': [state]}
+    assert pk_bar.display_state(plan, 1)['stage'] == 'settling'
+    state['final_end'] = origin+10
+    assert pk_bar.display_state(plan, 1)['stage'] == 'final'
+    assert pk_bar.display_state(plan, 10)['stage'] == 'settling'
+    state['status'] = 304
+    assert pk_bar.display_state(plan, 1)['stage'] == 'result'
+    assert pk_bar.display_state(plan, 20)['remaining'] is None
+
+
 def test_snapshot_ownership_and_no_future_score(tmp_path, monkeypatch):
     db = tmp_path/'source.sqlite3'
     video = tmp_path/'source.mp4'

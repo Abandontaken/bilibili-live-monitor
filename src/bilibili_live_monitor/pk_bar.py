@@ -135,8 +135,11 @@ def display_state(plan, seconds):
         stage = 'battle' if deadline and now < deadline else 'settling'
         if deadline and 0 < deadline-now <= state.get('sprint', 10):
             stage = 'sprint'
-    elif status in (301, 304) and state.get('final_end'):
-        stage, deadline = 'final', state['final_end']
+    elif status == 301:
+        deadline = state.get('final_end')
+        stage = 'final' if deadline and now < deadline else 'settling'
+    elif status == 304:
+        stage = 'result'
     elif status in (401, 404, 501):
         stage = 'result'
     elif status in (601, 602):
