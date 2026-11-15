@@ -1,5 +1,14 @@
 import {useEffect,useState} from 'react';
 
+let running=0;
+const waiting:(()=>void)[]=[];
+async function archiveFetch(url:string,controller:AbortController){
+ await new Promise<void>(resolve=>{const start=()=>{running++;resolve()};if(running<2)start();else waiting.push(start)});
+ const timeout=setTimeout(()=>controller.abort(),60000);
+ try{controller.signal.throwIfAborted();return await fetch(url,{cache:'no-store',signal:controller.signal});}
+ finally{clearTimeout(timeout);running--;waiting.shift()?.();}
+}
+
 export function useArchiveData<T>(url:string,interval:number,initial:T|null=null,validate?:(value:unknown)=>boolean){
  const [data,setData]=useState<T|null>(initial),[error,setError]=useState('');
  useEffect(()=>{
@@ -10,15 +19,14 @@ export function useArchiveData<T>(url:string,interval:number,initial:T|null=null
    clearTimeout(timer);
    if(document.hidden){schedule();return;}
    busy=true;controller=new AbortController();
-   const timeout=setTimeout(()=>controller?.abort(),10000);
    try{
-    const response=await fetch(url,{cache:'no-store',signal:controller.signal});
+     const response=await archiveFetch(url,controller);
     if(!response.ok)throw Error('归档暂时无法读取');
     const value=await response.json();
     if(validate&&!validate(value))throw Error('归档暂时无法读取');
     if(alive){setData(value);setError('');}
    }catch{if(alive)setError('归档暂时无法读取');}
-   finally{clearTimeout(timeout);busy=false;schedule();}
+    finally{busy=false;schedule();}
   }
   const visible=()=>{if(!document.hidden)void refresh()};
   document.addEventListener('visibilitychange',visible);

@@ -1,4 +1,4 @@
-import React, {useEffect, useState} from 'react';
+import React, {createContext, useContext, useEffect, useState} from 'react';
 import {WelcomeCopy} from './WelcomeCopy';
 import {useInstance} from './Instance';
 import {CopyLikeScript} from './CopyLikeScript';
@@ -14,7 +14,12 @@ async function api(base:string,path:string,body?:unknown,method='POST'){
 }
 
 type CardRoom={room_id:string;title:string;url:string;home_url?:string;status:string;recording_status:string};
-export function AutomationControls({rooms:cards}:{rooms?:CardRoom[]}){
+const AutomationContext=createContext<ReturnType<typeof useAutomation>|null>(null);
+export function AutomationProvider({children}:{children:React.ReactNode}){
+  const value=useAutomation();
+  return <AutomationContext.Provider value={value}>{children}</AutomationContext.Provider>;
+}
+function useAutomation(){
   const {base}=useInstance();
   const [state,setState]=useState<State|null>(null);
   const [error,setError]=useState('');
@@ -34,14 +39,20 @@ export function AutomationControls({rooms:cards}:{rooms?:CardRoom[]}){
     setBusy(true);setError('');try{await api(base,path,body,method);setState(await api(base,''))}
     catch(e){setError((e as Error).message)}finally{setBusy(false)}
   }
+  return {base,state,error,busy,profile,setProfile,counts,setCounts,platformError,platform,act};
+}
+export function AutomationControls({rooms:cards,roomId,settingsOnly=false}:{rooms?:CardRoom[];roomId?:string;settingsOnly?:boolean}){
+  const shared=useContext(AutomationContext);
+  if(!shared)return <AutomationProvider><AutomationControls rooms={cards} roomId={roomId} settingsOnly={settingsOnly}/></AutomationProvider>;
+  const {base,state,error,busy,profile,setProfile,counts,setCounts,platformError,platform,act}=shared;
   if(!state)return error?<p role="alert">自动化状态：{error}</p>:null;
   const anonymous=state.account.mode==='anonymous';
-  const entries=cards?cards.map(card=>({card,room:state.rooms.find(r=>r.room_id===card.room_id),
+  const entries=settingsOnly?[]:cards?cards.filter(c=>!roomId||c.room_id===roomId).map(card=>({card,room:state.rooms.find(r=>r.room_id===card.room_id),
     candidate:platform?.candidates?.find(c=>c.room_id===card.room_id||c.url===card.url)})):
     state.rooms.map(room=>({room,card:undefined,candidate:platform?.candidates?.find(c=>c.room_id===room.room_id)}));
   return <section className="automation-panel" aria-label="直播自动化控制">
-    <h2>{anonymous?'匿名监控 · 固定房间':'固定房间'}</h2>
-    {!anonymous&&state.account.managed&&<details><summary>账号设置</summary><div className="automation-actions">
+    {!roomId&&!settingsOnly&&<h2>{anonymous?'匿名监控 · 固定房间':'固定房间'}</h2>}
+    {(settingsOnly||!roomId)&&!anonymous&&state.account.managed&&<details><summary>账号设置</summary><div className="automation-actions">
       <span>当前：{state.account.profiles.find(p=>p.id===state.account.active)?.label} · {state.account.logged_in?`已登录 ${state.account.name||''}`:'未登录，自动发送暂停'}</span>
       <select aria-label="账号资料" value={profile||state.account.active} disabled={busy||state.account.switching} onChange={e=>setProfile(e.target.value)}>
         {state.account.profiles.map(p=><option key={p.id} value={p.id}>{p.label}</option>)}
@@ -57,8 +68,7 @@ export function AutomationControls({rooms:cards}:{rooms?:CardRoom[]}){
         card?.recording_status==='recording'?'正在录制':candidate?.watch_state==='retrying'?'录制恢复中':
         candidate?.watch_state==='confirming_offline'?'正在确认下播':room?.confirmed==='live'?'已开播':room?.confirmed==='offline'?'等待开播':'待确认';
       return <article key={id}>
-        <div className="fixed-room-heading"><h3>{room?.label||card?.title} <small>{status}</small></h3>
-        {card&&<a href={'#room-'+base.replace(/\W/g,'-')+id}>定位卡片</a>}{card?.home_url&&<a href={base+card.home_url}>按日汇总 →</a>}</div>
+        {!roomId&&<div className="fixed-room-heading"><h3>{room?.label||card?.title} <small>{status}</small></h3></div>}
         {issue&&<p role="status">{candidate?.last_error||candidate?.status_error||'请检查本房间状态'}</p>}
         {!anonymous&&room&&<>
         <button aria-pressed={room.enabled} disabled={busy} onClick={()=>void act('/rooms/'+room.room_id,{enabled:!room.enabled},'PUT')}>{room.enabled?'关闭自动欢迎':'开启自动欢迎'}</button>
@@ -74,7 +84,7 @@ export function AutomationControls({rooms:cards}:{rooms?:CardRoom[]}){
         <p className="footnote">欢迎：{room.delivery}{room.error?' · '+room.error:''}。{latest&&`点赞：${latest.status}，前端触发 ${latest.triggered}/${latest.requested} 次（非服务器计入数）。`}</p>
         </details></>}
       </article>})}
-    {state.notifications.length>0&&<p className="footnote">最近通知：{state.notifications.slice(-4).map(n=>`${n.label} ${n.event==='live'?'开播':'下播'} · ${n.status}`).join('；')}</p>}
+    {settingsOnly&&state.notifications.length>0&&<p className="footnote">最近通知：{state.notifications.slice(-4).map(n=>`${n.label} ${n.event==='live'?'开播':'下播'} · ${n.status}`).join('；')}</p>}
     {error&&<p role="alert">{error}</p>}
     {platformError&&<p role="alert">{platformError}；欢迎控制仍可使用。</p>}
   </section>;
