@@ -1,5 +1,6 @@
 """只读历史PK消息，按录像时钟重放比分条；不连接生产网页。"""
 import bisect
+import hashlib
 import json
 import math
 import sqlite3
@@ -8,7 +9,7 @@ from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageChops, ImageDraw, ImageFont
 
 from .gift_assets import sha_file, write_json
 
@@ -96,6 +97,8 @@ def make_plan(database, room, pk_id, video, video_start, font, *, connection=Non
                 member = next((m for m in state['members'] if m['room_id'] == update.get('room_id')), None)
                 if member is not None:
                     member.update({k: update[k] for k in ('votes', 'winner_type') if k in update})
+                    if update.get('winner_type') in (-1, 2):
+                        member['is_winner'] = {-1: 0, 2: 1}[update['winner_type']]
             if command == 'PK_BATTLE_END':
                 state['status'] = 401
             elif command == 'PK_BATTLE_VIDEO_PUNISH_BEGIN':
@@ -173,6 +176,8 @@ def gradient(draw, left, right, bottom, start, end):
 
 
 def strip(plan, seconds):
+    if plan.get('style_assets'):
+        return styled_strip(plan, seconds)
     width = plan['width']
     scale = width/1600
     height = max(64, round(88*scale))
@@ -203,9 +208,9 @@ def strip(plan, seconds):
     label = labels[stage]
     if stage == 'result':
         winner = state['left'].get('is_winner')
-        if winner == 1 or state['left'].get('winner_type', 0) in (2, 3):
+        if winner == 1:
             label = 'PK结束 · 我方胜'
-        elif state['right'].get('is_winner') == 1 or state['right'].get('winner_type', 0) in (2, 3):
+        elif state['right'].get('is_winner') == 1:
             label = 'PK结束 · 对方胜'
     if state['remaining'] is not None and not state['hide_clock']:
         n = state['remaining']
@@ -217,20 +222,158 @@ def strip(plan, seconds):
     return image
 
 
+def style_digest(directory):
+    root = Path(directory)
+    digest = hashlib.sha256()
+    for path in sorted(root.iterdir()):
+        if path.suffix in ('.png', '.json'):
+            digest.update(path.name.encode())
+            digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+@lru_cache(maxsize=512)
+def style_image(directory, name, width, height):
+    with Image.open(Path(directory)/f'{name}.png') as source:
+        return source.convert('RGBA').resize((width, height), Image.Resampling.LANCZOS)
+
+
+@lru_cache(maxsize=8)
+def style_manifest(directory):
+    return json.loads((Path(directory)/'manifest.json').read_text())
+
+
+def animated_scores(plan, seconds):
+    """网页的0.5/1/2秒计数，重叠更新从当时显示值继续。"""
+    shown = [0, 0]
+    previous = [0, 0]
+    started = [-100.0, -100.0]
+    duration = [0.5, 0.5]
+    initialized = [False, False]
+    def value(side, at):
+        progress = min(1, max(0, (at-started[side])/duration[side]))
+        return math.floor(previous[side]+progress*(shown[side]-previous[side]))
+    for snapshot in plan['snapshots']:
+        if snapshot['at'] > seconds:
+            break
+        members = snapshot.get('members', [])
+        for side in (0, 1):
+            member = next((m for m in members if (str(m['room_id']) == plan['room']) == (side == 0)), {})
+            target = member.get('votes', 0)
+            if member and not initialized[side]:
+                previous[side] = shown[side] = target
+                initialized[side] = True
+            if target != shown[side]:
+                previous[side] = value(side, snapshot['at'])
+                shown[side] = target
+                started[side] = snapshot['at']
+                delta = target-previous[side]
+                duration[side] = .5 if delta < 100 else 1 if delta < 1000 else 2
+    return [value(side, seconds) for side in (0, 1)]
+
+
+def styled_strip(plan, seconds):
+    """使用离线缓存的网页纹理及SVGA逐帧素材，不在渲染时联网。"""
+    width = plan['width']
+    scale = width/1067
+    height = round(58*scale)
+    image = Image.new('RGBA', (width, height))
+    state = display_state(plan, seconds)
+    stage = state['stage']
+    if stage == 'hidden':
+        return image
+    assets = plan['style_assets']
+    font = load_font(plan.get('score_font', plan['font']), round(16*scale))
+    small = load_font(plan['font'], round(12*scale))
+    bar_height = round(24*scale)
+    draw = ImageDraw.Draw(image)
+    if stage == 'connected':
+        draw.rounded_rectangle((width/2-50*scale, 0, width/2+50*scale, 22*scale),
+                               radius=5*scale, fill=(25, 30, 45, 220))
+        draw.text((width/2, 11*scale), '连线中', font=small, anchor='mm', fill='white')
+        return image
+    left, right = state['left'].get('votes', 0), state['right'].get('votes', 0)
+    edge = round(width*bar_ratio(left, right))
+    gradient(draw, 0, edge, bar_height-1, (195, 0, 70), (255, 83, 135))
+    gradient(draw, edge, width, bar_height-1, (36, 203, 255), (0, 102, 222))
+    active = stage in ('preparing', 'battle', 'sprint', 'final', 'settling')
+    if active:
+        tile_size = bar_height
+        for name, start, end, direction in [('left', 0, edge, 1), ('right', edge, width, -1)]:
+            tile = style_image(assets, name, tile_size, tile_size)
+            layer = Image.new('RGBA', (end-start, bar_height))
+            offset = round(direction*187*scale*seconds/5) % tile_size
+            for x in range(offset-tile_size, end-start, tile_size):
+                layer.alpha_composite(tile, (x, 0))
+            # 网页的渐变遮罩在外侧不透明，向比分交界处渐隐。
+            alpha = Image.new('L', layer.size)
+            ad = ImageDraw.Draw(alpha)
+            for x in range(layer.width):
+                amount = x/max(1, layer.width-1) if name == 'left' else 1-x/max(1, layer.width-1)
+                ad.line((x, 0, x, bar_height), fill=round(255*min(1, amount/.8)))
+            layer.putalpha(ImageChops.multiply(layer.getchannel('A'), alpha))
+            image.alpha_composite(layer, (start, 0))
+    scores = animated_scores(plan, seconds)
+    draw = ImageDraw.Draw(image)
+    draw.text((10*scale, bar_height/2), str(scores[0]), font=font, anchor='lm', fill='white', stroke_width=0)
+    draw.text((width-10*scale, bar_height/2), str(scores[1]), font=font, anchor='rm', fill='white', stroke_width=0)
+    manifest = style_manifest(assets)
+    if active:
+        animation = 'light'
+        elapsed = seconds
+    else:
+        winner = state['left'].get('is_winner')
+        animation = 'win' if winner == 1 else 'lose' if winner == 0 else 'draw'
+        result_start = next((s['at'] for s in plan['snapshots'] if s['at'] <= seconds
+                             and s['status'] in (304, 401, 404, 501, 601, 602)), seconds)
+        elapsed = seconds-result_start
+    meta = manifest[animation]
+    frame = int(elapsed*meta['fps']) % meta['frames']
+    aw, ah = (round(n*scale) for n in meta['size'])
+    sprite = style_image(assets, f'{animation}_{frame:03d}', aw, ah)
+    image.alpha_composite(sprite, (edge-aw//2, (bar_height-ah)//2))
+    background = 'sprint' if stage in ('sprint', 'final') else 'chaos' if state['hide_clock'] else 'normal'
+    bw, bh = round(110*scale), round(22*scale)
+    image.alpha_composite(style_image(assets, background, bw, bh), ((width-bw)//2, bar_height))
+    labels = {'preparing': '准备', 'battle': 'PK', 'sprint': '最后冲刺', 'final': '决胜时刻',
+              'settling': '结算中', 'result': 'PK结束', 'punishment': '惩罚'}
+    label = '巅峰赛' if state['hide_clock'] else labels[stage]
+    clock = ''
+    if state['remaining'] is not None and not state['hide_clock']:
+        remaining = state['remaining']
+        clock = f'{remaining//60:02d}:{remaining%60:02d}'
+    timer_font = load_font(plan.get('timer_font', plan['font']), round((16 if stage == 'sprint' else 14)*scale))
+    label_font = timer_font if label == 'PK' else small
+    draw = ImageDraw.Draw(image)
+    gap = 4*scale if clock else 0
+    label_width = draw.textlength(label, font=label_font)
+    clock_width = draw.textlength(clock, font=timer_font)
+    x = (width-label_width-gap-clock_width)/2
+    draw.text((x, bar_height+bh/2), label, font=label_font, anchor='lm', fill='white')
+    draw.text((x+label_width+gap, bar_height+bh/2), clock, font=timer_font, anchor='lm', fill='white')
+    return image
+
+
 def render(plan, output):
     if plan.get('schema_version') != 1:
         raise ValueError('未知计划格式')
     if sha_file(plan['video']) != plan['video_sha256'] or sha_file(plan['font']) != plan['font_sha256']:
         raise ValueError('录像或字体已改变')
+    if plan.get('style_assets') and style_digest(plan['style_assets']) != plan.get('style_sha256'):
+        raise ValueError('样式素材已改变')
+    for name in ('score_font', 'timer_font'):
+        if plan.get(name) and sha_file(plan[name]) != plan.get(name+'_sha256'):
+            raise ValueError('字体素材已改变')
     output = Path(output).resolve()
     output.mkdir(parents=True, exist_ok=False)
     write_json(output/'plan.json', plan)
     first = strip(plan, 0)
     width, height = first.size
     destination = output/'video.mp4'
+    fps = 30 if plan.get('style_assets') else 10
     command = ['ffmpeg', '-nostdin', '-v', 'error', '-n', '-threads', '4', '-i', plan['video'],
                '-f', 'rawvideo', '-pixel_format', 'rgba', '-video_size', f'{width}x{height}',
-               '-framerate', '10', '-i', 'pipe:0', '-filter_complex_threads', '2',
+               '-framerate', str(fps), '-i', 'pipe:0', '-filter_complex_threads', '2',
                '-filter_complex', '[0:v][1:v]overlay=0:0:shortest=1:format=auto,format=yuv420p[v]',
                '-map', '[v]', '-map', '0:a:0', '-c:v', 'libx265', '-preset', 'veryfast', '-crf', '22',
                '-x265-params', 'pools=8:frame-threads=3:log-level=error', '-tag:v', 'hvc1',
@@ -238,8 +381,8 @@ def render(plan, output):
     with (output/'render.log').open('wb') as log:
         process = subprocess.Popen(command, stdin=subprocess.PIPE, stderr=log)
         try:
-            for frame in range(math.ceil(plan['duration']*10)):
-                process.stdin.write(strip(plan, frame/10).tobytes())
+            for frame in range(math.ceil(plan['duration']*fps)):
+                process.stdin.write(strip(plan, frame/fps).tobytes())
             process.stdin.close()
             if process.wait(timeout=180):
                 raise ValueError('视频渲染失败，见render.log')
@@ -285,6 +428,9 @@ def configure_parser(commands):
         plan.add_argument('--'+name, required=True)
     plan.add_argument('--connection-start', type=float)
     plan.add_argument('--connection-end', type=float)
+    plan.add_argument('--style-assets', help='离线网页纹理、SVGA帧与manifest.json目录')
+    plan.add_argument('--score-font')
+    plan.add_argument('--timer-font')
     rendering = actions.add_parser('render')
     rendering.add_argument('--plan', required=True)
     rendering.add_argument('--output', required=True)
@@ -299,7 +445,14 @@ def main(args):
             if (values[0] is None) != (values[1] is None):
                 raise ValueError('连线起止必须同时提供')
             plan = make_plan(args.database, args.room, args.pk_id, args.video, args.video_start,
-                             args.font, connection=list(values) if values[0] is not None else None)
+                              args.font, connection=list(values) if values[0] is not None else None)
+            if args.style_assets:
+                plan['style_assets'] = str(Path(args.style_assets).resolve(strict=True))
+                plan['style_sha256'] = style_digest(plan['style_assets'])
+            for name in ('score_font', 'timer_font'):
+                if getattr(args, name):
+                    plan[name] = str(Path(getattr(args, name)).resolve(strict=True))
+                    plan[name+'_sha256'] = sha_file(plan[name])
             path = Path(args.output)
             if path.exists():
                 raise ValueError('计划文件已存在')

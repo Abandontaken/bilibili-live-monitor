@@ -45,6 +45,30 @@ def test_final_disabled_expired_and_result():
     assert pk_bar.display_state(plan, 20)['remaining'] is None
 
 
+def test_score_animation_retargets_without_jumping():
+    def snapshot(at, votes):
+        return {'at': at, 'members': [{'room_id': 123, 'votes': votes},
+                                      {'room_id': 456, 'votes': 0}]}
+    plan = {'room': '123', 'snapshots': [snapshot(-1, 0), snapshot(0, 1000), snapshot(1, 2000)]}
+    assert pk_bar.animated_scores(plan, -.1) == [0, 0]
+    assert pk_bar.animated_scores(plan, .5) == [250, 0]
+    assert pk_bar.animated_scores(plan, 1) == [500, 0]
+    assert pk_bar.animated_scores(plan, 2) == [1250, 0]
+    assert pk_bar.animated_scores(plan, 3) == [2000, 0]
+    plan['snapshots'] = [snapshot(0, 50000)]
+    assert pk_bar.animated_scores(plan, 0) == [50000, 0]
+
+
+def test_style_digest_tracks_content_and_names(tmp_path):
+    (tmp_path/'a.png').write_bytes(b'first')
+    first = pk_bar.style_digest(tmp_path)
+    (tmp_path/'a.png').write_bytes(b'second')
+    assert pk_bar.style_digest(tmp_path) != first
+    second = pk_bar.style_digest(tmp_path)
+    (tmp_path/'a.png').rename(tmp_path/'b.png')
+    assert pk_bar.style_digest(tmp_path) != second
+
+
 def test_snapshot_ownership_and_no_future_score(tmp_path, monkeypatch):
     db = tmp_path/'source.sqlite3'
     video = tmp_path/'source.mp4'
@@ -70,5 +94,13 @@ def test_snapshot_ownership_and_no_future_score(tmp_path, monkeypatch):
     assert pk_bar.display_state(plan, 4.9)['left']['votes'] == 1
     assert pk_bar.display_state(plan, 5)['left']['votes'] == 100
     assert pk_bar.display_state(plan, 5)['right']['votes'] == 200
+    for kind, expected in ((2, 1), (-1, 0), (3, 2), (0, 2)):
+        packet['data']['members'][0]['is_winner'] = 2
+        update['data']['match_info']['winner_type'] = kind
+        with sqlite3.connect(db) as conn:
+            conn.execute('UPDATE raw_events SET data=? WHERE id=1', (json.dumps(packet),))
+            conn.execute('UPDATE raw_events SET data=? WHERE id=2', (json.dumps(update),))
+        checked = pk_bar.make_plan(db, '123', '77', video, '2030-01-01T00:00:00Z', font)
+        assert pk_bar.display_state(checked, 5)['left']['is_winner'] == expected
     with pytest.raises(ValueError, match='找不到'):
         pk_bar.make_plan(db, '123', '78', video, '2030-01-01T00:00:00Z', font)
