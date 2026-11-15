@@ -212,6 +212,7 @@ def create_gateway(config, *, transport=None):
     archive_cache = {}
     archive_locks = {}
     session_cache = {}
+    reconciliation_cache = {}
 
     def instance(ident):
         if ident not in instances:
@@ -360,6 +361,25 @@ def create_gateway(config, *, transport=None):
                         snapshot = read_object(root, root / key / 'public/snapshot.json')
                     except (OSError, ValueError, TypeError):
                         snapshot = {}
+                    if (snapshot and snapshot.get('content_mode') != 'talk'
+                            and not snapshot.get('activity_reconciliation')
+                            and row['archive'].get('database')
+                            and snapshot.get('session_start') and snapshot.get('updated_at')):
+                        from .activity_reconciliation import reconcile_activity
+                        from .live_share import epoch, read_source, scope_source
+                        cache_key = (ident, key)
+                        version = snapshot.get('updated_at')
+                        cached = reconciliation_cache.get(cache_key)
+                        if cached and cached[0] == version:
+                            snapshot['activity_reconciliation'] = cached[1]
+                        else:
+                            def calculate():
+                                source = scope_source(read_source(Path(row['archive']['database']), rid,
+                                                                  snapshot['session_start']),
+                                                      snapshot['session_start'], epoch(version))
+                                return reconcile_activity(source, snapshot.get('activity_summary', []))
+                            snapshot['activity_reconciliation'] = await asyncio.to_thread(calculate)
+                            reconciliation_cache[cache_key] = (version, snapshot['activity_reconciliation'])
                     try:
                         navigation = read_object(root, root / key / 'navigation.json')
                     except (OSError, ValueError, TypeError):

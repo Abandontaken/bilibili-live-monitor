@@ -203,7 +203,10 @@ def test_final_publish_rechecks_reviews_after_stopping_writers(tmp_path, monkeyp
     final.merge(config)
     final.finish(config)
     state = {'stage': 'finalizing', 'final_session': 'parent'}
-    atomic_json(Path(config['workspace']) / 'annotations.json', {'reviews': []})
+    annotations = json.loads((Path(config['workspace']) / 'annotations.json').read_text())
+    for review in annotations['reviews']:
+        review['fingerprint'] = 'invalidated-after-finish'
+    atomic_json(Path(config['workspace']) / 'annotations.json', annotations)
     monkeypatch.setattr(runner, 'stop_ai', lambda *a, **k: True)
     monkeypatch.setattr(runner.watch, 'publish', lambda *a: pytest.fail('must not publish'))
     with pytest.raises(ValueError):

@@ -79,7 +79,7 @@ def process(item, locks, *, trash_originals):
     return result
 
 
-def run(roots, *, execute=False, workers=2, trash_originals=False, report_dir=None, max_files=None):
+def run(roots, *, execute=False, workers=5, trash_originals=False, report_dir=None, max_files=None):
     if workers not in range(1, 6) or max_files is not None and max_files < 1:
         raise ValueError('workers只支持1至5；max-files须为正数')
     roots = sorted({Path(root).resolve(strict=True) for root in roots})
@@ -118,6 +118,7 @@ def run(roots, *, execute=False, workers=2, trash_originals=False, report_dir=No
             state = {**summary, 'read_only': False, 'run_dir': str(run_dir),
                      'updated_utc': datetime.now(timezone.utc).isoformat(), 'complete': complete,
                      'done': len(results), 'counts': dict(Counter(r['status'] for r in results)),
+                     'new_warnings': sum(bool(r.get('warning')) for r in results),
                      'results': results}
             atomic_json(run_dir / 'progress.json', state)
             atomic_json(report_dir / 'latest.json', state)
@@ -130,14 +131,15 @@ def run(roots, *, execute=False, workers=2, trash_originals=False, report_dir=No
                 result = future.result()
                 results.append(result)
                 checkpoint()
-                print(json.dumps(result, ensure_ascii=False), flush=True)
+                prefix = 'WARNING ' if result.get('warning') else ''
+                print(prefix + json.dumps(result, ensure_ascii=False), flush=True)
         return checkpoint(complete=True)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--sessions-root', type=Path, action='append', required=True)
-    parser.add_argument('--workers', type=int, choices=range(1, 6), default=2)
+    parser.add_argument('--workers', type=int, choices=range(1, 6), default=5)
     parser.add_argument('--trash-originals', action='store_true')
     parser.add_argument('--execute', action='store_true')
     parser.add_argument('--report-dir', type=Path)

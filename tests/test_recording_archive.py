@@ -2,12 +2,13 @@ import argparse
 import hashlib
 import json
 import os
+import subprocess
 import time
 
 import pytest
 
+from bilibili_live_monitor import archive_daily, offline_asr, session_backfill, session_offline
 from bilibili_live_monitor import archive_media as media
-from bilibili_live_monitor import offline_asr, session_backfill, session_offline
 from bilibili_live_monitor import recording_archive as archive
 from bilibili_live_monitor.live_share import epoch
 
@@ -250,3 +251,155 @@ def test_archive_rejects_wrong_old_source_identity(tmp_path):
         media.resolve_media(source, expected_sha='0' * 64)
     with pytest.raises(ValueError, match='旧来源不一致'):
         offline_asr._verify_identity({**row, 'sha256': '0' * 64})
+
+
+def media_info(*, bitrate=6_000_000, colors=True, rate='228/7'):
+    video = {'codec_type': 'video', 'codec_name': 'h264', 'width': 1920, 'height': 1080,
+             'pix_fmt': 'yuv420p', 'avg_frame_rate': rate, 'nb_read_frames': '1800'}
+    if colors:
+        video.update(color_space='bt709', color_transfer='bt709', color_primaries='bt709')
+    return {'streams': [video, {'codec_type': 'audio', 'codec_name': 'aac',
+                               'channels': 2, 'sample_rate': '48000', 'bit_rate': '128000'}],
+            'format': {'duration': '60', 'bit_rate': str(bitrate)}, 'timestamp_max_adjustment_us': 0}
+
+
+@pytest.mark.parametrize('colors', [True, False])
+def test_variable_rate_and_missing_color_are_accepted_without_assuming_hdr(colors):
+    archive.check_profile(media_info(colors=colors))
+
+
+def test_low_bitrate_skips_before_frame_scan_or_transcode(tmp_path, monkeypatch):
+    root, source, _ = fixture(tmp_path)
+    item = archive.inventory(root)[0]
+    probes = []
+    monkeypatch.setattr(archive, 'no_writer', lambda _: None)
+    def probe(_source, *, frames=False):
+        probes.append(frames)
+        assert not frames
+        return media_info()
+    monkeypatch.setattr(archive, 'probe', probe)
+    monkeypatch.setattr(archive, 'command', lambda *_a, **_k: pytest.fail('low bitrate encoded'))
+    result = archive_daily.process(item, (), trash_originals=True)
+    assert result['status'] == 'skipped'
+    assert result['reason'] == 'low_bitrate'
+    assert probes == [False]
+    assert source.exists() and not media.receipt_path(source).exists()
+    assert not media.archive_path(source).exists()
+    assert archive.inventory(root)[0]['reason'] == 'low_bitrate'
+
+
+def test_skip_cache_is_bound_to_policy_and_source(tmp_path, monkeypatch):
+    root, source, row = fixture(tmp_path)
+    item = archive.inventory(root)[0]
+    monkeypatch.setattr(archive, 'no_writer', lambda _: None)
+    archive.retain_original(item, archive.ArchiveSkip('source_decode_error', 'bad frame', warning=True))
+    assert archive.inventory(root)[0]['warning'] is True
+    monkeypatch.setattr(archive.archive_policy, 'ARCHIVE_POLICY', 'new-policy')
+    assert archive.inventory(root)[0]['action'] == 'encode'
+    monkeypatch.setattr(archive.archive_policy, 'ARCHIVE_POLICY', 'hevc-2800k-v2')
+    source.write_bytes(b'changed and rematerialized original')
+    row.update(media.file_stat(source))
+    (root / 'one/offline/manifest.json').write_text(json.dumps({'rows': [row]}))
+    assert archive.inventory(root)[0]['action'] == 'encode'
+
+
+def test_corrupt_skip_warns_once_and_is_not_requeued(tmp_path, monkeypatch, capsys):
+    root, source, _ = fixture(tmp_path)
+    monkeypatch.setattr(archive, 'no_writer', lambda _: None)
+    calls = []
+    def encode(*_args):
+        calls.append(True)
+        raise archive.ArchiveSkip('source_decode_error', 'corrupt decoded frame', warning=True)
+    monkeypatch.setattr(archive, 'encode', encode)
+    first = archive_daily.run([root], execute=True, trash_originals=True, report_dir=tmp_path / 'reports')
+    assert first['counts'] == {'skipped': 1} and first['new_warnings'] == 1
+    assert 'WARNING ' in capsys.readouterr().out
+    second = archive_daily.run([root], execute=True, trash_originals=True, report_dir=tmp_path / 'reports')
+    assert second['planned'] == 0 and second['retained_warnings'] == 1
+    assert len(calls) == 1 and source.exists()
+
+
+@pytest.mark.parametrize('stderr,expected', [(b'corrupt decoded frame', 'skipped'),
+                                          (b'corrupt decoded frame\nNo space left on device', 'failed'),
+                                          (b'VideoToolbox encoder unavailable', 'failed')])
+def test_decode_damage_is_warning_but_encoder_failure_stays_failed(tmp_path, monkeypatch, stderr, expected):
+    root, source, _ = fixture(tmp_path)
+    item = archive.inventory(root)[0]
+    monkeypatch.setattr(archive, 'no_writer', lambda _: None)
+    def probe(*_a, **_k):
+        raise subprocess.CalledProcessError(183, ['ffprobe'], stderr=stderr)
+    monkeypatch.setattr(archive, 'probe', probe)
+    result = archive_daily.process(item, (), trash_originals=True)
+    assert result['status'] == expected and source.exists()
+    assert archive.skip_path(source).exists() == (expected == 'skipped')
+
+
+def test_no_savings_after_real_encoding_retains_original(tmp_path, monkeypatch):
+    from test_archive_validation import command_packets, frame, packet
+
+    root, source, _ = fixture(tmp_path)
+    item = archive.inventory(root)[0]
+    monkeypatch.setattr(archive, 'no_writer', lambda _: None)
+    monkeypatch.setattr(archive, 'preflight', lambda *_: None)
+    info = media_info(colors=False)
+    frames = [{k: v for k, v in frame('0').items() if not k.startswith('color_')}]
+    info['video_evidence'] = archive.validation.video_evidence(frames)
+    monkeypatch.setattr(archive, 'probe', lambda *_a, **_k: info)
+    audio = archive.validation.audio_evidence('synthetic', command_packets([packet('0')]))
+    monkeypatch.setattr(archive.validation, 'audio_evidence', lambda *_: audio)
+    monkeypatch.setattr(archive, 'verify_output', lambda *_: {})
+    def command(argv, **_kwargs):
+        assert argv[argv.index('-colorspace') + 1] == 'unknown'
+        assert argv[argv.index('-color_trc') + 1] == 'unknown'
+        Path = type(source)
+        Path(argv[-1]).write_bytes(b'x' * 100)
+    monkeypatch.setattr(archive, 'command', command)
+    result = archive_daily.process(item, (), trash_originals=True)
+    assert result['reason'] == 'no_size_saving'
+    assert source.exists() and not media.archive_path(source).exists()
+    assert list(media.archive_path(source).parent.glob('*.partial.mp4')) == []
+
+
+def test_unknown_source_color_does_not_require_invented_output_tags(tmp_path, monkeypatch):
+    source = media_info(colors=False)
+    output = media_info(colors=True)
+    output['streams'][0]['codec_name'] = 'hevc'
+    monkeypatch.setattr(archive, 'probe', lambda *_a, **_k: output)
+    monkeypatch.setattr(archive, 'command', lambda *_a, **_k: None)
+    archive.verify_output(source, tmp_path / 'hevc.mp4')
+
+
+def test_shared_source_with_live_reference_is_not_transcoded(tmp_path):
+    root, source, row = fixture(tmp_path)
+    other = root / 'two'
+    (other / 'offline').mkdir(parents=True)
+    (other / 'config.json').write_text(json.dumps({'recording_root': str(source.parent)}))
+    (other / 'workflow.json').write_text('{"stage":"live"}')
+    (other / 'offline/manifest.json').write_text(json.dumps({'rows': [row]}))
+    item = archive_daily.plan([root])[0]
+    assert item['reason'] == 'referenced_by_unfinished_session'
+    assert archive.inventory(root, ['one'])[0]['reason'] == 'referenced_by_unfinished_session'
+
+
+@pytest.mark.parametrize('failure', ['decode', 'streams'])
+def test_corrupt_output_is_failure_not_a_persistent_source_skip(tmp_path, monkeypatch, failure):
+    from test_archive_validation import command_packets, frame, packet
+
+    root, source, _ = fixture(tmp_path)
+    monkeypatch.setattr(archive, 'no_writer', lambda _: None)
+    monkeypatch.setattr(archive, 'preflight', lambda *_: None)
+    def probe(path, **_kwargs):
+        if path == source:
+            info = media_info()
+            info['video_evidence'] = archive.validation.video_evidence([frame('0')])
+            return info
+        if failure == 'decode':
+            raise subprocess.CalledProcessError(183, ['ffprobe'], stderr=b'corrupt decoded frame')
+        return {'streams': []}
+    monkeypatch.setattr(archive, 'probe', probe)
+    audio = archive.validation.audio_evidence('synthetic', command_packets([packet('0')]))
+    monkeypatch.setattr(archive.validation, 'audio_evidence', lambda *_: audio)
+    monkeypatch.setattr(archive, 'command', lambda *_a, **_k: None)
+    result = archive_daily.process(archive.inventory(root)[0], (), trash_originals=True)
+    assert result['status'] == 'failed'
+    assert source.exists() and not archive.skip_path(source).exists()

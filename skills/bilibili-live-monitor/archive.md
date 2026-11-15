@@ -26,6 +26,7 @@ python -m bilibili_live_monitor archive verify --sessions-root /PRIVATE/live_ses
 稳定且全程unknown的输入保留未知色彩/SAR声明与YUV数值语义。混合声明或需要归一像素比例的输入采用`sdr-reference-render-v1`：逐帧按已声明矩阵转换，未声明矩阵沿用swscale的BT.601默认解释，实际转换到BT.709矩阵、limited范围及方形显示像素。该默认值是可复核的参考渲染选择，不是对主播源色彩的事实推断；不使用未来声明倒填早段。原始声明epoch保存在`pre_normalization_source_info`，输出不把未知原色或传递函数认证为BT.709。回执`rendering`明确记录模式与默认解释，输出逐帧参数/范围必须匹配该参考。HDR、其他已知色彩、full-range及非方形已声明SAR仍保留，不仅删除校验或强行套标签。
 
 音轨copy并显式保留开头非关键AAC包。正起点且原本没有裁剪的AAC使用保留edit-list的分片MP4时间轴，避免普通MP4尾部误裁；其他输入沿用普通MP4。两种都是单一`.mp4`和既有读取接口，必须通过相同样本/裁剪/PTS验收。不会通过关闭edit-list平移音轨或重编码AAC绕过失败。
+转码前用原片大小、时长及目标总码率估计收益，预计节省不足5%时直接保留原片，不进行全帧扫描或编码；这只是保守预判，实际成品没有变小也保留原片。已确认源解码损坏、超限时间戳或不支持规格输出 warning 并跳过。跳过记录为原片旁的 `NAME.mkv.archive-skip.json`，绑定来源大小/mtime和配方版本；来源或配方改变时重新检查，不冒充成功归档凭证、不授权清理原片。输出验收失败、磁盘/权限/编码器等运行故障仍保持 failed。
 
 原录制流偶有重复视频时间戳。编码用微秒时间基准，将不递增时间戳推进到前帧后一微秒；事先遍历全部解码帧，只允许任一帧累计修正不超过1毫秒，超限保留原片，不把大幅时间倒退悄悄抹平。不通过固定帧率同步丢帧或插帧。容器猜测的平均帧率可能变化，验收仍要求实际解码帧数相同、时长误差不超过0.25秒。
 
@@ -59,14 +60,14 @@ python -m bilibili_live_monitor archive cleanup --sessions-root /PRIVATE/live_se
 # 默认只读盘点；sessions-root 可重复指定，跨目录同源只处理一次。
 python -m bilibili_live_monitor.archive_daily \
   --sessions-root /PRIVATE/live_sessions --sessions-root /PRIVATE/guest_sessions \
-  --workers 2 --trash-originals
+  --workers 5 --trash-originals
 # 每日调度与一次性历史回填使用同一个命令；先取得明确执行授权。
 python -m bilibili_live_monitor.archive_daily \
   --sessions-root /PRIVATE/live_sessions --sessions-root /PRIVATE/guest_sessions \
-  --workers 2 --trash-originals --execute --report-dir /PRIVATE/archive_reports
+  --workers 5 --trash-originals --execute --report-dir /PRIVATE/archive_reports
 ```
 
-`--workers` 支持1至5，默认2；增加并发前同时核查CPU解码/验收负载、VideoToolbox编码吞吐和实时采集健康，普通GPU利用率不能代表硬件编码器利用率。`--max-files` 可限制一次验收的数量。执行前按固定顺序取得所有根目录的既有归档锁，编码子进程继承全部锁；与手动归档及重叠周期互斥。CLI遇到已有归档持锁时返回 `skipped=true, reason=archive_writer_busy`，不重开一批；其他IO失败照常报错。同源身份冲突或仍有未完成场次引用时跳过。仅处理清单内的 completed 视频，不修改直播收尾、ASR、发布或通知状态。
+`--workers` 支持1至5，默认5；增加并发前同时核查CPU解码/验收负载、VideoToolbox编码吞吐和实时采集健康，普通GPU利用率不能代表硬件编码器利用率。`--max-files` 可限制一次验收的数量。执行前按固定顺序取得所有根目录的既有归档锁，编码子进程继承全部锁；与手动归档及重叠周期互斥。CLI遇到已有归档持锁时返回 `skipped=true, reason=archive_writer_busy`，不重开一批；其他IO失败照常报错。同源身份冲突或仍有未完成场次引用时跳过。仅处理清单内的 completed 视频，不修改直播收尾、ASR、发布或通知状态。
 
 每份成品先完成原有完整解码与规格验收，再检查旧清单身份和归档读取入口。仅显式 `--trash-originals` 才执行重验后Trash，不支持永久删除或清空废纸篓。失败逐文件记录并保留原片，其他作业继续；退出码1表示有失败，`complete=true`仅表示本轮结束，不代表全部成功。重复执行跳过已移走原片的归档，继续新录像或尚未成功的文件。每轮计划与进度保存在 `report-dir/<UTC时间>/`，`latest.json` 指向本轮状态。周期频率、真实路径及启用状态留在本机私有配置，新增调度须取得授权。
 ## 显式保留原片
@@ -74,3 +75,4 @@ python -m bilibili_live_monitor.archive_daily \
 在原片路径后追加 `.archive-retain` 的标记存在时，归档仍可生成并验证单 MP4，但周期任务不清理该原片，也不会反复安排已归档原片的清理。手动 cleanup 同样拒绝永久删除和 Trash；空文件、无效内容、目录或悬空链接都按保留处理。该标记只影响对应原片，未标记素材继续遵循既有授权和完整验收。
 
 升级或恢复运行版本时，恢复入口也必须支持此保护。只保存旧配置不代表可以绕过保留标记切回旧实现；解除保留需要明确授权。
+独立周期入口 `python -m bilibili_live_monitor.archive_daily --sessions-root /PRIVATE/live_sessions --report-dir /PRIVATE/archive_reports --execute` 支持多个 root、跨场来源身份检查和共锁，默认五路并发（`--workers 5`）；加 `--trash-originals` 才对已验收成品执行Trash。读回 `latest.json` 的 counts、new_warnings、retained_warnings、skip_reasons，区分新增warning、已记忆跳过与真正failed。共享源仍被未完成场次引用时，手动和周期入口都拒绝处理。不要把存储维护插进原 finalization，也不调用 CRM、发布或通知。启用周期任务与自动永久清理需要用户明确授权，不以硬件编码推断零资源影响。

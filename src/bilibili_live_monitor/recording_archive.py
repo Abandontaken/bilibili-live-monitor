@@ -157,6 +157,7 @@ def inventory(root, session_ids=()):
     wanted = set(session_ids)
     found, items = set(), {}
     references = {}
+    # 即使指定单场，也先收集同root的全部引用；未完成场次不能被清理入口忽略。
     for directory in sorted(root.iterdir()):
         workflow, manifest = directory / 'workflow.json', directory / 'offline/manifest.json'
         if workflow.is_file() and manifest.is_file():
@@ -212,7 +213,7 @@ def inventory(root, session_ids=()):
             elif skip_path(source).is_file():
                 try:
                     saved = json.loads(skip_path(source).read_text())
-                except (ValueError, KeyError):
+                except (OSError, ValueError, KeyError):
                     saved = {}
                 if archive_policy.reusable_skip(saved, item):
                     item.update(action='skip', reason=saved['reason'], warning=saved.get('warning', False))

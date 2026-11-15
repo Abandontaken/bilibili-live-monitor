@@ -6,6 +6,7 @@ import shlex
 import subprocess
 from pathlib import Path
 
+from .annotation_history import read_annotations
 from .finalize_context import danmaku_context
 from .live_share import atomic_json, epoch, fingerprint, followup_evidence
 from .live_share_control import export_snapshot, load_config, source_at_cutoff, verify_snapshot
@@ -35,7 +36,7 @@ def corrections(config):
     """终审总会话使用的当前校正版与待重审窗口，不修改冻结原稿。"""
     _, source, segments, _ = frozen_source(config)
     _, info = correction_context(Path(config['workspace']), source)
-    annotations = json.loads((Path(config['workspace']) / 'annotations.json').read_text())
+    annotations = read_annotations(config['workspace'])
     rows = {r.get('seq'): r for r in annotations.get('reviews', []) if isinstance(r, dict)}
     active = [review_window(s, {s['seq']: {k: s[k] for k in
               ('corrected_text', 'correction_id', 'correction_reason', 'correction_evidence')}})
@@ -60,7 +61,7 @@ def prepare(config):
     if path.exists():
         return json.loads(path.read_text())
     ident, source, segments, windows = frozen_source(config)
-    previous = json.loads((root.parent / 'annotations.json').read_text())
+    previous = read_annotations(root.parent)
     reviews = {r.get('seq'): r for r in previous.get('reviews', []) if isinstance(r, dict)}
     buckets = {}
     for s in segments:
@@ -114,7 +115,7 @@ def merge(config):
             if row.get('correction_id'):
                 merged[seq]['correction_id'] = row['correction_id']
     path = root.parent / 'annotations.json'
-    annotations = json.loads(path.read_text())
+    annotations = read_annotations(root.parent)
     old = {r['seq']: r for r in annotations.get('reviews', [])}
     old.update(merged)
     annotations['reviews'] = list(old.values())
@@ -128,7 +129,7 @@ def finish(config):
     root = Path(config['workspace']) / 'finalize'
     plan = json.loads((root / 'plan.json').read_text())
     assert_frozen(config, plan)
-    annotations = json.loads((root.parent / 'annotations.json').read_text())
+    annotations = read_annotations(root.parent)
     reviews = {r.get('seq'): r for r in annotations.get('reviews', [])}
     segments = frozen_source(config)[2]
     remaining = [s['seq'] for s in segments if not reviewed(reviews.get(s['seq']), s)]
