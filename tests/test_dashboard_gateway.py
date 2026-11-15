@@ -206,6 +206,53 @@ def test_metrics_are_routed_to_the_correct_instance():
         assert client.get('/instances/guest/assets/private.json').status_code == 404
 
 
+def test_results_outside_recent_twenty_are_still_linked_without_mutation(tmp_path):
+    older, latest = 'd' * 24, 'e' * 24
+    files = []
+    for key, start in [(older, '2026-01-01T12:00:00+00:00'), (latest, '2026-01-02T12:00:00+00:00')]:
+        directory = tmp_path / key
+        (directory / 'public').mkdir(parents=True)
+        for name, value in [('config.json', {'room_id': '1', 'start_utc': start, 'private': 'SECRET'}),
+                            ('workflow.json', {'stage': 'completed'})]:
+            path = directory / name
+            path.write_text(json.dumps(value))
+            files.append(path)
+        (directory / 'public/index.html').write_text('result')
+    before = {path: path.read_bytes() for path in files}
+
+    def upstream(request):
+        data = {'session_workflows': [{'room_id': str(i + 2), 'key': f'{i:024x}', 'stage': 'live',
+                                      'start': '2026-01-03T12:00:00+00:00'} for i in range(20)]}
+        if request.url.path == '/api/state':
+            data = {'rooms': [{'room_id': '1', 'status': 'waiting'}]}
+        return httpx.Response(200, json=data)
+
+    config = {'instances': [{'id': 'guest', 'label': '匿名', 'url': 'http://127.0.0.1:8766',
+                            'session_root': str(tmp_path)}]}
+    with TestClient(create_gateway(config, transport=httpx.MockTransport(upstream))) as client:
+        response = client.get('/instances/guest/api/state')
+        room = response.json()['rooms'][0]
+        assert room['result_url'] == f'sessions/{latest}/' and room['workflow_stage'] == 'completed'
+        assert 'SECRET' not in response.text
+        assert client.get('/instances/guest/' + room['result_url']).status_code == 200
+        assert client.get('/instances/guest/' + room['result_url'] + 'config.json').status_code == 404
+    assert before == {path: path.read_bytes() for path in files}
+
+
+def test_broken_or_escaping_session_configs_do_not_break_state(tmp_path, tmp_path_factory):
+    from bilibili_live_monitor.dashboard_gateway import presentation_sessions
+    for char, content in [('a', 'null'), ('b', '{bad'), ('c', '{"room_id":"1","start_utc":23}')]:
+        directory = tmp_path / (char * 24)
+        directory.mkdir()
+        (directory / 'config.json').write_text(content)
+    outside = tmp_path_factory.mktemp('outside') / 'config.json'
+    outside.write_text('{"room_id":"1","start_utc":"2026-01-01T00:00:00Z"}')
+    escape = tmp_path / ('d' * 24)
+    escape.mkdir()
+    (escape / 'config.json').symlink_to(outside)
+    assert presentation_sessions({'session_root': str(tmp_path)}) == []
+
+
 def test_archive_allowlist_and_session_backlink(tmp_path):
     key = 'd' * 24
     directory = tmp_path / key

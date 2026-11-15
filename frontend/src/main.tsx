@@ -12,6 +12,7 @@ import {RoomArchive} from './RoomArchive';
 import {RoomLinks} from './RoomLinks';
 import {RoomTrend} from './RoomTrend';
 import {RoomPeriodMetrics} from './RoomPeriodMetrics';
+import {SystemResources} from './SystemResources';
 
 type Segment = {seq:number; start_utc:string; end_utc:string; text:string; status:string;
   queue_wait_ms:number; infer_ms:number; rms_dbfs:number; error:string|null; coverage_ratio?:number|null};
@@ -134,7 +135,7 @@ const RoomCard = React.memo(function RoomCard({room,status,onError}:{room:Room;s
     {room.stale&&<p role="status">实例暂不可用 · 以下为上次结果 · {room.last_success?new Date(room.last_success).toLocaleString('zh-CN'):'尚未取得快照'}</p>}
     <RoomLinks liveUrl={room.url} archiveUrl={room.home_url?base+room.home_url:undefined}/>
     <div className="room-sub"><span>房间 {room.room_id}{room.instance_label?` · ${room.instance_label}`:''}</span><button className="text-button" disabled={room.status==='stopped'||room.status==='waiting'} onClick={()=>api(`rooms/${room.room_id}/stop`,{method:'POST'}).catch(e=>onError(e.message))}>停止监控</button></div>
-    {room.result_url&&<p className="room-sub"><a href={base+room.result_url} target="_blank" rel="noreferrer">{room.workflow_stage==='completed'?'查看本场最终结果':'查看本场结果（处理中）'}</a></p>}
+    {room.result_url&&<p className="room-sub"><a href={base+room.result_url} target="_blank" rel="noreferrer">{resultLabel(room)}</a></p>}
     {!room.stale&&<RoomIssue status={room.status} error={room.error} updatedAt={room.updated_at}/>}
     {!room.stale&&room.audio_error&&room.status==='capturing'&&<p className="error">音频质量或媒体进度异常：{room.audio_error}</p>}
     {room.capture_health&&<p className="room-sub">近一小时（当前采集任务）：整页重载 {room.capture_health.last_hour.page_reloads} 次 · 采音重建 {room.capture_health.last_hour.local_restarts} 次 · 异常音频 {Math.round(room.capture_health.last_hour.invalid_seconds)} 秒 · 采集缺口 {Math.round(room.capture_health.last_hour.gap_seconds)} 秒</p>}
@@ -238,6 +239,9 @@ function SnapshotApp({onState}:{onState?:Report}){
     <details className="technical-details"><summary>数据说明</summary><p className="footnote">每房间显示最近80条消息。完整时间线保存在本地，可导出快照。历史统计与金额口径见按日汇总。</p></details>
   </main>;
 }
+function resultLabel(room:Room){
+  return room.workflow_stage==='live'?'查看本场直播结果':room.workflow_stage==='completed'||room.workflow_stage==='completed_talk'?'查看最近已结束场次结果':'查看最近场次结果（处理中）';
+}
 function CompactRoom({room}:{room:Room}){
  const {base}=useInstance();
  return <article className="card compact-room"><div className="card-body">
@@ -247,7 +251,7 @@ function CompactRoom({room}:{room:Room}){
   {!room.stale&&room.current_issue&&<RoomIssue status="error" error={room.error||room.audio_error||'需要人工处理'}/>}
   {room.home_url?<RoomPeriodMetrics base={base} roomId={room.room_id}/>:<p>归档暂时无法读取</p>}
   <RoomLinks liveUrl={room.url} archiveUrl={room.home_url?base+room.home_url:undefined}/>
-  {room.result_url&&<a href={base+room.result_url}>查看本场结果</a>}
+   {room.result_url&&<a href={base+room.result_url}>{resultLabel(room)}</a>}
  </div></article>;
 }
 function SingleApp({onState}:{onState?:Report}){
@@ -272,7 +276,7 @@ function SystemHealth({instances,reports}:{instances:Instance[];reports:Record<s
  <div><span>当前异常</span><strong>{value(rooms.filter(r=>r.current_issue).length)}</strong></div>
  <div><span>ASR 队列</span><strong>{value(sum('queue_depth'))}<small> / {value(sum('queue_capacity'))}</small></strong><small>处理中 {value(known.filter(r=>r.state.inflight).length)}</small></div>
  </div><details><summary>诊断信息</summary>{instances.map(i=>{const r=reports[i.id];return <p key={i.id}>{i.label} · {r?.connected?'实时连接正常':'暂不可用'} · 配置 {r?.state.fixed_task_count??'—'} / 原始 {r?.state.raw_fixed_count??'—'} · ASR {r?.connected?(!r.state.asr_enabled?'禁用':r.state.asr_error?'等待恢复':r.state.asr_ready?'已就绪':'正在加载'):'—'}</p>})}</details>
- <InstanceProvider instance={instances[0]}><ResourceMetrics/></InstanceProvider></section>;
+  <SystemResources/></section>;
 }
 export function App(){
   const [instances,setInstances]=useState<Instance[]|null>(null);
