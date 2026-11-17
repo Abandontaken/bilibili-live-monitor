@@ -116,12 +116,15 @@ def test_new_talk_waits_for_committed_refinement_and_stops_writers_before_publis
         monkeypatch.setattr(runner, name, lambda *a: None)
     runner.advance(config, state, 105)
     assert state['stage'] == 'finalizing' and not published
+    runner.stop_ai.assert_not_called()
+    runner.advance(config, state, 225)
+    assert state['stage'] == 'finalizing' and not published
     committed = False
     with pytest.raises(ValueError, match='尚未完整入库'):
-        runner.advance(config, state, 106)
+        runner.advance(config, state, 226)
     assert not published
     committed = True
-    runner.advance(config, state, 107)
+    runner.advance(config, state, 227)
     assert state['stage'] == 'completed' and len(published) == len(archived) == 1
 
 

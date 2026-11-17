@@ -2,6 +2,7 @@
 import hashlib
 import json
 import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,6 +11,35 @@ from . import offline_asr
 from .live_share import atomic_json, epoch, iso
 
 NAME = re.compile(r'^[a-f0-9]+-(\d{8}T\d{6}Z)-([a-f0-9]+)-(\d{5})\.(?:mkv|mka|wav)$')
+
+
+class NoMediaError(ValueError):
+    """已封口但没有有效媒体，保留异常记录而非伪造完成。"""
+
+
+def exclude_empty(manifest, config):
+    """只排除已稳定的零字节源；保留原文件、身份及估计缺口，不压缩时间轴。"""
+    rows = manifest['rows']
+    excluded = manifest.setdefault('excluded_empty_sources', [])
+    for old in excluded:
+        offline_asr._verify_identity(old)
+    for row in list(rows):
+        if row.get('size') != 0:
+            continue
+        offline_asr._verify_identity(row)
+        if time.time() - Path(row['path']).stat().st_mtime < config.get('seal_seconds', 300):
+            raise RuntimeError('零字节素材尚未稳定')
+        if any((Path(config['workspace']) / name / 'plan.json').exists()
+               for name in ('finalize', 'talk_finalize')):
+            raise ValueError('终审已冻结，不能变更媒体清单')
+        excluded.append({**row, 'reason': 'verified_zero_byte_no_media',
+                         'gap_start_utc': iso(row['wall_start']),
+                         'gap_end_utc': iso(min(manifest['cutoff'],
+                             row['wall_start'] + config['recording_segment_seconds'],
+                             min((r['wall_start'] for r in rows if r['wall_start'] > row['wall_start']),
+                                 default=manifest['cutoff']))),
+                         'gap_mapping': 'estimated; no audio was recovered'})
+        rows.remove(row)
 
 
 def recording_files(config, cutoff):
@@ -46,8 +76,11 @@ def run_offline(config, state):
         manifest = {'cutoff': cutoff, 'rows': rows, 'mapping': 'filename UTC + preceding media durations (estimated)'}
     rows = manifest['rows']
     if not rows:
-        raise RuntimeError('本场没有已识别命名的录制文件')
+        atomic_json(manifest_path, manifest)
+        raise NoMediaError('本场没有有效录制媒体')
     for row in rows:
+        if row.get('size') == 0:
+            continue
         if row.get('recovery_original_identity'):
             offline_asr._verify_identity(row['recovery_original_identity'])
         offline_asr._verify_identity(row)
@@ -65,7 +98,10 @@ def run_offline(config, state):
         cursor += max(0, row['segment_index'] - previous - 1) * config['recording_segment_seconds']
         row['wall_start'] = cursor
         cursors[key] = (cursor + (row.get('duration_sec') or config['recording_segment_seconds']), row['segment_index'])
+    exclude_empty(manifest, config)
     atomic_json(manifest_path, manifest)
+    if not rows:
+        raise NoMediaError('本场只有零字节录制文件，没有可恢复媒体')
     unavailable = sum(row.get('sealed') != 'sealed_readable' for row in rows)
     if unavailable:
         raise RuntimeError(f'{unavailable}个本场文件尚不可读取，保留清单并重试，不将部分稿当作全场完成')
@@ -115,6 +151,8 @@ def verify_offline(config, cutoff):
         raise ValueError('离线转写尚未接入本场')
     marker = json.loads(marker_path.read_text())
     manifest = json.loads(manifest_path.read_text())
+    for row in manifest.get('excluded_empty_sources', []):
+        offline_asr._verify_identity(row)
     segments = json.loads(destination.read_text())
     status = json.loads((workspace / 'offline/status.json').read_text())
     if (marker.get('room_id') != config['room_id'] or marker.get('start_utc') != config['start_utc']

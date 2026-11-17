@@ -85,9 +85,14 @@ def tick(settings):
         session.update(audience_crm_config=active['config'], audience_state_path=str(state_path),
                        deployment_pin=str(marker))
         try:
+            if not state.get('automation_paused') and time.time() >= state['finish_deadline']:
+                from .audience_finalize import accepted_ready
+                if accepted_ready(session):
+                    state.setdefault('publication_deadline', time.time() + 600)
+                    atomic_json(state_path, state)
             if active.get('last_error'):
                 raise ValueError(active['last_error'])
-            check_budget(session, state)
+            check_budget(session, state, publication=True)
             complete = advance(session, state)
             atomic_json(state_path, state)
             if complete:

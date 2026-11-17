@@ -218,6 +218,7 @@ def test_finalize_dispatch_once_then_builds_only_accepted_state(tmp_path, monkey
     scene = tmp_path / 'scene'
     scene.mkdir()
     conf = {'room_id': cfg['room_id'], 'workspace': str(scene), 'audience_crm_config': str(config_path),
+            'model': 'synthetic/original-crm', 'final_model': 'synthetic/music-final',
             '_config_path': str(scene / 'config.json')}
     material = collect(cfg, [session()])
     monkeypatch.setattr('bilibili_live_monitor.audience_crm.load_material', lambda _: material)
@@ -231,20 +232,32 @@ def test_finalize_dispatch_once_then_builds_only_accepted_state(tmp_path, monkey
         args[-1]()
 
     monkeypatch.setattr(session_finalize, 'dispatch', dispatch)
+    supervision_models = []
+    monkeypatch.setattr('bilibili_live_monitor.finalize_lifecycle.supervise',
+                        lambda c, *a, **kw: supervision_models.append(c['final_model']))
     state = {}
     assert not audience_finalize.advance(conf, state)
     assert not audience_finalize.advance(conf, state)
     assert len(calls) == 1
+    assert supervision_models == [calls[0][0]['model']] * 2
     assert f"使用task的{author_agent or 'ollama_glm_5_3_flash'}子代理" in calls[0][2]
     if author_agent:
         assert calls[0][0]['model'] == 'openai/gpt-6.1-sol'
-        assert 'model' not in conf
+        assert conf['model'] == 'synthetic/original-crm'
     saved = json.loads((scene / 'audience_finalize/plan.json').read_text())
     directory = Path(saved['run'])
     plan = json.loads((directory / 'plan.json').read_text())
     for task in plan['tasks']:
         Path(task['result']).write_text(json.dumps(state_for(material['people'][task['person_id']])))
     finish(cfg, directory)
+    from bilibili_live_monitor.audience_crm import verify_accepted
+    current = (Path(cfg['workspace']) / 'current.json').read_text()
+    (Path(cfg['workspace']) / 'current.json').write_text('{"plan_id":"old"}')
+    with pytest.raises(ValueError, match='凭证'):
+        verify_accepted(cfg, directory, plan['id'])
+    (Path(cfg['workspace']) / 'current.json').write_text(current)
+    assert not audience_finalize.advance(conf, state)
+    state['audience_cleanup']['observed_complete_at'] -= 120
     assert audience_finalize.advance(conf, state)
     assert state['audience_crm']['people'] == 2
 
