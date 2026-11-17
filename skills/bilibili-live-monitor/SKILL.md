@@ -51,6 +51,8 @@ PK录屏花屏、视频剪辑读取及压缩前的参数检查见[PK编码参数
 
 编写 SQL 或 Python 脚本查询 `live_warehouse.sqlite3` 与 `monitor.sqlite3`、解读弹幕/盲盒/荣耀等级/粉丝牌/在线人数/PK 连麦字段时，先读[数据库解析与口径防坑指南](data-interpretation.md)，避免外房勋章剥离、短长房号不一致、盲盒双账本与成对广播重复记账等口径误判。
 
+需要基于数仓大中小 R 观众做分层滚雪球扩房、免登录核验候选主播近 14 天活跃度与舰长规模档位，并生成跨赛道均衡抽样方案时，见[扩房发现与分层采样](room-discovery.md)：使用 `bili-live room-discovery pull-followings/screen-candidates/sample-plan`，对数仓严格只读，带登录态拉取默认 `--dry-run`。
+
 需要从整场直播制作2–3分钟引流预告时，见[直播引流预告片](trailer.md)：事件选择、源时间映射、隐私裁剪、`trailer render/verify`、剪点与独立审阅。真实精剪表和媒体留在私有输出目录。
 
 ## 环境与安装
