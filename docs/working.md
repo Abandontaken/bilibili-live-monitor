@@ -1,5 +1,13 @@
 # 工作记录
 
+## 数仓 v2 弹幕头像线索、房间状态/PK连麦表与数据库口径防坑指南（2026-11-17）
+
+- `warehouse_protocol.py` 与 `warehouse.py` 升级至 `EXTRACTOR_VERSION = 2`，执行 `bili-live warehouse sync` 时对已有 v1 数仓平滑建表、升级源库游标补扫历史弹幕头像、替换视图并自动重入旧版已完成场次，`warehouse stats` 新增 `room_metric_rows`、`cohost_intervals`、`cohost_intervals_by_kind`、`danmaku_resolution_basis` 与 `danmaku_with_face_clue` 统计。
+- 补齐 `DANMU_MSG` 中 `info[0][15]`（兼容扩展字典、JSON 字符串及 `extra` 嵌套 `user`）自定义头像 SHA1 提取并严格排除 `noface` 与 `/bfs/garb/`：实名弹幕同步纳入全局 `dim_user_faces` 观测；匿名弹幕写入 `fact_events.clue_face_sha1`，`v_resolved_events` 对弹幕按 `raw_uid` → `resolved_crc32_uid`（CRC32+首字）→ `v_unique_face_uid`（携带 `clue_crc32` 时要求 CRC32 一致以兼顾改名老观众与防撞图，缺失 `clue_crc32` 时要求首字无冲突，且不把匿名弹幕头像污染进同场 CRC32 碰撞消歧集合）顺序消解，未解出时保留 `clue_face_sha1` 供盲盒与弹幕关联。
+- 新增 `fact_room_metrics`（按整分钟桶提取 `ONLINE_RANK_COUNT` 同屏高能在线、`WATCHED_CHANGE` 累计看过、`ROOM_REAL_TIME_MESSAGE_UPDATE` 关注与粉丝团最新观测）与 `fact_cohost_intervals`（归并 `PK_*` 与 `VOICE_JOIN_*` 为 `pk`、`pk_punish`、`voice_join`、`voice_join_queue` 场内状态区间，兼容短房号与规范长房号识别对手并记录读秒冲刺起点、票数与惩罚信息）。
+- 新增公开子 skill `skills/bilibili-live-monitor/data-interpretation.md`，并在 `SKILL.md` 与 `warehouse.md` 补充入口路由，梳理双库职责边界、核心表与原始报文路径、八类常见口径误判及三组标准只读 SQL 范式。
+- 验证：Python 全套 1392 passed、1 skipped，Ruff `src/tests/scripts` 通过，前端 TypeScript / Vite 构建通过，独立 Chrome 音频隔离脚本 `verify_isolation.py` 通过；本机真实采集库只读 v1→v2 平滑升级烟测与独立 GPT-6.1 SOL Fast 代码/口径/隐私审阅通过，证据保存在私有 `.local/` 目录。
+
 ## 跨房全局身份消解数仓与本地匿名看板差量回填（2026-11-17）
 
 - 新增 `bili-live warehouse sync / backfill-pages / stats` 子命令及 `warehouse.py`、`warehouse_protocol.py`、`warehouse_backfill.py` 模块，配套公开使用说明 `skills/bilibili-live-monitor/warehouse.md`；不改动或重启常驻采集进程。

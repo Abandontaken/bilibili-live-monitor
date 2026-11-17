@@ -153,9 +153,25 @@ def _danmaku_packet(
     wealth_level: int = 0,
     guard_level: int = 0,
     medal: list | None = None,
+    face_url: str | None = None,
+    u15_mode: str = 'dict',
+    is_mystery: bool = False,
 ) -> dict:
     info = [None] * 17
     info[0] = [0, 1, 25, 16777215, ts_sec * 1000, 0, 0, crc32_hex]
+    if face_url is not None or is_mystery:
+        info[0].extend([None] * 7)
+        user_obj = {
+            'uid': uid,
+            'base': {'name': uname, 'face': face_url or '', 'is_mystery': is_mystery},
+            'wealth': {'level': wealth_level},
+        }
+        if u15_mode == 'json_str':
+            info[0].append(json.dumps({'user': user_obj}, ensure_ascii=False))
+        elif u15_mode == 'extra_json':
+            info[0].append({'extra': json.dumps({'user': user_obj}, ensure_ascii=False)})
+        else:
+            info[0].append({'user': user_obj, 'extra': '{}'})
     info[1] = text
     info[2] = [uid, uname, 0, 0, 0, 10000, 1, '']
     info[3] = medal or []
@@ -1125,6 +1141,627 @@ def test_legacy_session_ingest_uname_ts_order_and_missing_prev_rank(tmp_path: Pa
         t_text = wh.execute("SELECT text FROM fact_transcripts WHERE session_key = 'sess_talk_fin' AND seq = 1").fetchone()[0]
         assert basis == 'finalized_talk'
         assert t_text == '原语音转写已修正'
+
+
+def test_danmaku_u15_face_resolution_priority_and_guardrails(tmp_path: Path):
+    """验证匿名/实名弹幕 info[0][15] 头像提取、CRC32->唯一头像优先级、首字/CRC32护栏及未解名盲盒关联。"""
+    db_path = tmp_path / 'dm_face_monitor.sqlite3'
+    wh_path = tmp_path / 'dm_face_wh.sqlite3'
+    sessions_dir = tmp_path / 'sessions'
+    sessions_dir.mkdir()
+    _create_source_db(db_path)
+
+    start_ts = 1798000000.0
+    cutoff_ts = start_ts + 600.0
+
+    uid_realname_dm = 890001
+    face_realname = 'a1' * 20
+
+    uid_noname_entry = 890002
+    face_noname = 'b2' * 20
+
+    face_collide_a = 'c3' * 20
+    face_unseen_blind = 'd4' * 20
+    face_garb = 'e5' * 20
+
+    uid_stranger = 899999  # 未进入字典的同姓路人，撞了 uid_realname_dm 的网图头像
+
+    with sqlite3.connect(db_path) as db:
+        # 1. 外房 654321：uid_realname_dm 发了一条实名明文弹幕（info[0][15] 为 extra JSON 形态）-> 纳入字典
+        _insert_raw(
+            db, '654321', start_ts - 200,
+            _danmaku_packet(
+                '实名外房弹幕', int(start_ts - 200),
+                uid=uid_realname_dm, uname='云端旅人', crc32_hex=uid_crc32(uid_realname_dm),
+                face_url=f'https://i1.hdslb.com/bfs/face/{face_realname}.jpg',
+                u15_mode='extra_json',
+            ),
+        )
+        # 2. 外房 654321：uid_noname_entry 仅通过无昵称飘屏曝光 uid + face（first_char 为 NULL）
+        _insert_raw(
+            db, '654321', start_ts - 180,
+            {
+                'cmd': 'ENTRY_EFFECT',
+                'data': {
+                    'uid': uid_noname_entry,
+                    'copy_writing': '欢迎贵宾进入直播间',
+                    'face': f'https://i2.hdslb.com/bfs/face/{face_noname}.webp',
+                },
+            },
+        )
+        # 3. 外房 654321：CRC32 碰撞同姓双用户，其中 COLLIDING_UID_A 拥有唯一自定义头像
+        _insert_raw(
+            db, '654321', start_ts - 150,
+            _pb_rank_packet([
+                (COLLIDING_UID_A, '林海雪原', f'https://i0.hdslb.com/bfs/face/{face_collide_a}.jpg', 10, 20),
+                (COLLIDING_UID_B, '林间牧歌', 'https://i0.hdslb.com/bfs/face/member/noface.jpg', 20, 20),
+            ]),
+        )
+
+        # 本场 123456 测试弹幕集合：
+        # (a) CRC32+首字 与 唯一头像同时命中 -> 必须优先走 crc32_first_char
+        _insert_raw(
+            db, '123456', start_ts + 10,
+            _danmaku_packet(
+                '优先级测试弹幕', int(start_ts + 10),
+                uname='云***', crc32_hex=uid_crc32(uid_realname_dm),
+                face_url=f'https://i1.hdslb.com/bfs/face/{face_realname}.jpg',
+            ),
+        )
+        # (b) 字典 first_char 为 NULL 导致 CRC32 未命中 -> 通过唯一头像认领 (json_str 形态)
+        _insert_raw(
+            db, '123456', start_ts + 20,
+            _danmaku_packet(
+                '无昵称字典头像认领', int(start_ts + 20),
+                uname='月***', crc32_hex=uid_crc32(uid_noname_entry),
+                face_url=f'https://i2.hdslb.com/bfs/face/{face_noname}.webp',
+                u15_mode='json_str',
+            ),
+        )
+        # (c) CRC32 同姓碰撞 ambiguous_crc32 -> 带唯一头像那条消歧给 COLLIDING_UID_A，同场灰头那条保持 ambiguous_crc32
+        _insert_raw(
+            db, '123456', start_ts + 30,
+            _danmaku_packet(
+                '碰撞靠唯一头像消歧', int(start_ts + 30),
+                uname='林***', crc32_hex=uid_crc32(COLLIDING_UID_A),
+                face_url=f'https://i0.hdslb.com/bfs/face/{face_collide_a}.jpg',
+            ),
+        )
+        _insert_raw(
+            db, '123456', start_ts + 32,
+            _danmaku_packet(
+                '碰撞灰头保持未消解', int(start_ts + 32),
+                uname='林***', crc32_hex=uid_crc32(COLLIDING_UID_B),
+                face_url='https://i0.hdslb.com/bfs/face/member/noface.jpg',
+            ),
+        )
+        # (d) 护栏1：首字不一致（字典为“云”，弹幕为“赵***”，crc32 缺失）-> 严禁误认
+        _insert_raw(
+            db, '123456', start_ts + 40,
+            _danmaku_packet(
+                '首字冲突拦截', int(start_ts + 40),
+                uname='赵***', crc32_hex='00000000',
+                face_url=f'https://i1.hdslb.com/bfs/face/{face_realname}.jpg',
+            ),
+        )
+        # (e) 护栏2：同首字“云***”但 CRC32 属于未入库路人 uid_stranger -> 严禁因撞网图误认给 uid_realname_dm
+        _insert_raw(
+            db, '123456', start_ts + 50,
+            _danmaku_packet(
+                '同姓撞网图CRC32矛盾拦截', int(start_ts + 50),
+                uname='云***', crc32_hex=uid_crc32(uid_stranger),
+                face_url=f'https://i1.hdslb.com/bfs/face/{face_realname}.jpg',
+            ),
+        )
+        # (e2) 改名老观众：首字从“海”改为“云”，但 CRC32 与唯一头像双哈希同时匹配 -> 安全认领
+        _insert_raw(
+            db, '123456', start_ts + 55,
+            _danmaku_packet(
+                '改名老粉双哈希认领', int(start_ts + 55),
+                uname='海***', crc32_hex=uid_crc32(uid_realname_dm),
+                face_url=f'https://i1.hdslb.com/bfs/face/{face_realname}.jpg',
+            ),
+        )
+        # (f) 未露真身观众：发弹幕 + 抽盲盒携带同一非装扮头像 face_unseen_blind，外加装扮头像过滤
+        _insert_raw(
+            db, '123456', start_ts + 60,
+            _danmaku_packet(
+                '未解名盲盒前弹幕', int(start_ts + 60),
+                uname='风***', crc32_hex='abcdef01',
+                face_url=f'https://i0.hdslb.com/bfs/face/{face_unseen_blind}.jpg',
+            ),
+        )
+        _insert_raw(
+            db, '123456', start_ts + 70,
+            _pb_gift_packet(
+                uid=0, uname='风***',
+                face=f'https://i0.hdslb.com/bfs/face/{face_unseen_blind}.jpg',
+                combo_seg=None, gift_id=32099, gift_name='梦幻盲盒礼',
+                price=50000, total_coin=15000, blind_orig_name='星光盲盒', blind_orig_price=15000,
+                tid='tid_unseen_face_blind', timestamp=int(start_ts + 70),
+            ),
+        )
+        _insert_raw(
+            db, '123456', start_ts + 80,
+            _danmaku_packet(
+                '装扮头像过滤弹幕', int(start_ts + 80),
+                uname='雨***', crc32_hex='12345678',
+                face_url=f'https://i0.hdslb.com/bfs/garb/{face_garb}.png',
+            ),
+        )
+
+    _create_completed_session(sessions_dir, 'sess_dm_face', db_path, '123456', start_ts, cutoff_ts)
+    sync_warehouse(wh_path, sources=[('anon', db_path)], session_roots=[sessions_dir])
+
+    with sqlite3.connect(wh_path) as wh:
+        dm_rows = wh.execute(
+            "SELECT content_text, resolved_uid, resolution_basis, clue_face_sha1 "
+            "FROM v_resolved_events WHERE kind = 'danmaku' ORDER BY event_seq"
+        ).fetchall()
+        by_text = {r[0]: (r[1], r[2], r[3]) for r in dm_rows}
+
+        assert by_text['优先级测试弹幕'] == (uid_realname_dm, 'crc32_first_char', face_realname)
+        assert by_text['无昵称字典头像认领'] == (uid_noname_entry, 'unique_face', face_noname)
+        assert by_text['碰撞靠唯一头像消歧'] == (COLLIDING_UID_A, 'unique_face', face_collide_a)
+        assert by_text['碰撞灰头保持未消解'] == (None, 'ambiguous_crc32', None)
+        assert by_text['首字冲突拦截'] == (None, 'unresolved', face_realname)
+        assert by_text['同姓撞网图CRC32矛盾拦截'] == (None, 'unresolved', face_realname)
+        assert by_text['改名老粉双哈希认领'] == (uid_realname_dm, 'unique_face', face_realname)
+        assert by_text['未解名盲盒前弹幕'] == (None, 'unresolved', face_unseen_blind)
+        assert by_text['装扮头像过滤弹幕'] == (None, 'unresolved', None)
+
+        # 未解出时可通过保留的 clue_face_sha1 精确关联同场盲盒与本人弹幕
+        linked_dm = wh.execute(
+            """
+            SELECT d.content_text
+            FROM v_resolved_events g
+            JOIN v_resolved_events d
+              ON d.session_key = g.session_key
+             AND d.kind = 'danmaku'
+             AND d.clue_face_sha1 = g.clue_face_sha1
+            WHERE g.kind = 'gift' AND g.gift_name = '梦幻盲盒礼'
+            """
+        ).fetchall()
+        assert linked_dm == [('未解名盲盒前弹幕',)]
+
+        # presence 同步包含通过 unique_face 解出的弹幕用户
+        pres_noname = wh.execute(
+            'SELECT danmaku_count FROM fact_session_presence WHERE resolved_uid = ?',
+            (uid_noname_entry,),
+        ).fetchone()
+        assert pres_noname == (1,)
+
+
+def test_room_metrics_minute_bucketing_and_cohost_intervals(tmp_path: Path):
+    """验证 fact_room_metrics 分钟最新桶聚合与 fact_cohost_intervals PK/惩罚/连麦区间提取。"""
+    db_path = tmp_path / 'ctx_monitor.sqlite3'
+    wh_path = tmp_path / 'ctx_wh.sqlite3'
+    sessions_dir = tmp_path / 'sessions'
+    sessions_dir.mkdir()
+    _create_source_db(db_path)
+
+    # 起点对齐整分：1800000000 为 60 的整数倍
+    start_ts = 1800000000.0
+    cutoff_ts = start_ts + 900.0
+
+    ws = _create_completed_session(sessions_dir, 'sess_room_ctx', db_path, '123456', start_ts, cutoff_ts)
+    # 模拟短房号 123456 映射规范长房号 12345600
+    cfg = json.loads((ws / 'config.json').read_text())
+    cfg['platform_room_id'] = '12345600'
+    atomic_json(ws / 'config.json', cfg)
+
+    with sqlite3.connect(db_path) as db:
+        # 场外噪声观测（不应进入 fact_room_metrics）
+        _insert_raw(db, '123456', start_ts - 10, {'cmd': 'ONLINE_RANK_COUNT', 'data': {'online_count': 9999}})
+
+        # 第 0 分钟桶 [start_ts, start_ts+60)：多条观测取桶内最新，fans_club 显式 0 保留 0
+        _insert_raw(db, '123456', start_ts + 5, {'cmd': 'ONLINE_RANK_COUNT', 'data': {'online_count': 120}})
+        _insert_raw(db, '123456', start_ts + 45, {'cmd': 'ONLINE_RANK_COUNT', 'data': {'online_count': 155}})
+        _insert_raw(db, '123456', start_ts + 20, {'cmd': 'WATCHED_CHANGE', 'data': {'num': 1024}})
+        _insert_raw(
+            db, '123456', start_ts + 50,
+            {'cmd': 'ROOM_REAL_TIME_MESSAGE_UPDATE', 'data': {'roomid': 12345600, 'fans': 5000, 'fans_club': 0}},
+        )
+
+        # 第 1 分钟桶 [start_ts+60, start_ts+120)：仅有 online_count，其余列缺测为 NULL
+        _insert_raw(db, '123456', start_ts + 75, {'cmd': 'ONLINE_RANK_COUNT', 'data': {'online_count': 180}})
+
+        # PK 第 1 局 (pk_id=5001)：含准备(t+60) -> 正式对战(t+70..t+370) -> 惩罚(t+372..t+432)
+        _insert_raw(
+            db, '123456', start_ts + 60,
+            {
+                'cmd': 'PK_BATTLE_PRE_NEW',
+                'pk_id': 5001,
+                'timestamp': int(start_ts + 60),
+                'data': {'uid': 660101, 'room_id': 654321, 'uname': '虚构对手主播甲', 'pre_timer': 10},
+            },
+        )
+        _insert_raw(
+            db, '123456', start_ts + 70,
+            {
+                'cmd': 'PK_BATTLE_START_NEW',
+                'pk_id': 5001,
+                'timestamp': int(start_ts + 70),
+                'data': {
+                    'pk_start_time': int(start_ts + 70),
+                    'pk_frozen_time': int(start_ts + 370),
+                    'pk_end_time': int(start_ts + 370),
+                    'init_info': {'room_id': 12345600},
+                    'match_info': {'room_id': 654321},
+                },
+            },
+        )
+        _insert_raw(
+            db, '123456', start_ts + 120,
+            {
+                'cmd': 'PK_INFO',
+                'data': {
+                    'pk_basic': {
+                        'pk_id': 5001,
+                        'status': 201,
+                        'start_time': int(start_ts + 60),
+                        'end_time': int(start_ts + 370),
+                        'punish_end_time': int(start_ts + 430),
+                        'sprint_duration': 15,
+                    },
+                    'members': [
+                        {'uid': 550101, 'room_id': 12345600, 'uname': '虚构主播123456', 'votes': 800, 'is_winner': 0},
+                        {'uid': 660101, 'room_id': 654321, 'uname': '虚构对手主播甲', 'votes': 1200, 'is_winner': 0},
+                    ],
+                },
+            },
+        )
+        _insert_raw(
+            db, '123456', start_ts + 370,
+            {
+                'cmd': 'PK_BATTLE_SETTLE_NEW',
+                'pk_id': 5001,
+                'timestamp': int(start_ts + 370),
+                'data': {
+                    'pk_id': 5001,
+                    'punish_end_time': int(start_ts + 432),
+                    'punish_name': '贴纸条',
+                    'init_info': {'room_id': 12345600, 'votes': 900, 'result_type': -1},
+                    'match_info': {'room_id': 654321, 'votes': 1500, 'result_type': 2},
+                },
+            },
+        )
+        _insert_raw(
+            db, '123456', start_ts + 372,
+            {
+                'cmd': 'PK_BATTLE_VIDEO_PUNISH_BEGIN',
+                'pk_id': 5001,
+                'timestamp': int(start_ts + 372),
+                'data': {
+                    'video_punish': {'duration': 60, 'punish_name': '贴纸条'},
+                    'init_info': {'room_id': 12345600, 'votes': 900, 'winner_type': -1},
+                    'match_info': {'room_id': 654321, 'votes': 1500, 'winner_type': 2},
+                },
+            },
+        )
+        _insert_raw(
+            db, '123456', start_ts + 425,
+            {
+                'cmd': 'PK_BATTLE_PUNISH_END',
+                'pk_id': 5001,
+                'timestamp': int(start_ts + 425),
+                'data': {},
+            },
+        )
+
+        # PK 第 2 局 (pk_id=5002)：平局无惩罚，结束同秒发 PUNISH_END -> 只出 pk，不出 pk_punish
+        _insert_raw(
+            db, '123456', start_ts + 450,
+            {
+                'cmd': 'PK_BATTLE_START',
+                'pk_id': 5002,
+                'timestamp': int(start_ts + 450),
+                'data': {
+                    'pk_start_time': int(start_ts + 450),
+                    'pk_frozen_time': int(start_ts + 510),
+                    'init_info': {'room_id': 12345600},
+                    'match_info': {'room_id': 654322},
+                },
+            },
+        )
+        _insert_raw(
+            db, '123456', start_ts + 510,
+            {
+                'cmd': 'PK_BATTLE_END',
+                'pk_id': 5002,
+                'timestamp': int(start_ts + 510),
+                'data': {
+                    'init_info': {'room_id': 12345600, 'votes': 0, 'winner_type': 3},
+                    'match_info': {'room_id': 654322, 'votes': 0, 'winner_type': 3},
+                },
+            },
+        )
+        _insert_raw(
+            db, '123456', start_ts + 510,
+            {'cmd': 'PK_BATTLE_PUNISH_END', 'pk_id': 5002, 'timestamp': int(start_ts + 510), 'data': {}},
+        )
+
+        # 语音连麦：排麦队列 (t+600..t+610) -> 接通上麦连发2条重复 status=1 (t+610) -> 挂断连发2条 status=0 (t+720)
+        _insert_raw(
+            db, '123456', start_ts + 600,
+            {'cmd': 'VOICE_JOIN_ROOM_COUNT_INFO', 'data': {'apply_count': 1, 'notify_count': 0, 'room_status': 1}},
+        )
+        _insert_raw(
+            db, '123456', start_ts + 602,
+            {'cmd': 'VOICE_JOIN_LIST', 'data': {'apply_count': 2, 'category': 1, 'refresh': 1}},
+        )
+        for dup_offset in (610, 611):
+            _insert_raw(
+                db, '123456', start_ts + dup_offset,
+                {
+                    'cmd': 'VOICE_JOIN_STATUS',
+                    'data': {
+                        'status': 1,
+                        'channel': 'ch_voice_01',
+                        'channel_type': 'voice',
+                        'start_at': int(start_ts + 610),
+                        'current_time': int(start_ts + dup_offset),
+                        'uid': 770201,
+                        'user_name': '虚构连麦舰长',
+                        'room_id': 12345600,
+                        'is_mystery': False,
+                    },
+                },
+            )
+        for dup_off_end in (720, 720.2):
+            _insert_raw(
+                db, '123456', start_ts + dup_off_end,
+                {
+                    'cmd': 'VOICE_JOIN_STATUS',
+                    'data': {
+                        'status': 0,
+                        'channel': 'ch_voice_01',
+                        'channel_type': 'voice',
+                        'start_at': 0,
+                        'current_time': int(start_ts + 720),
+                        'uid': 0,
+                        'user_name': '',
+                        'is_mystery': False,
+                    },
+                },
+            )
+
+    sync_res = sync_warehouse(wh_path, sources=[('anon', db_path)], session_roots=[sessions_dir])
+    assert sync_res['room_metric_rows'] == 2
+    assert sync_res['cohost_intervals'] == 5
+
+    with sqlite3.connect(wh_path) as wh:
+        metrics = wh.execute(
+            'SELECT minute_ts, online_count, watched_count, fans_count, fans_club_count '
+            'FROM fact_room_metrics ORDER BY minute_ts'
+        ).fetchall()
+        assert metrics == [
+            (int(start_ts), 155, 1024, 5000, 0),
+            (int(start_ts + 60), 180, None, None, None),
+        ]
+
+        cohosts = wh.execute(
+            'SELECT kind, start_ts, end_ts, battle_id, opponent_uid, opponent_room_id, opponent_uname, raw_summary_json '
+            'FROM fact_cohost_intervals ORDER BY interval_seq'
+        ).fetchall()
+        assert [(r[0], r[1], r[2], r[3], r[4], r[5], r[6]) for r in cohosts] == [
+            ('pk', start_ts + 60, start_ts + 370, '5001', 660101, '654321', '虚构对手主播甲'),
+            ('pk_punish', start_ts + 372, start_ts + 425, '5001', 660101, '654321', '虚构对手主播甲'),
+            ('pk', start_ts + 450, start_ts + 510, '5002', None, '654322', None),
+            ('voice_join_queue', start_ts + 600, start_ts + 610, None, None, None, None),
+            ('voice_join', start_ts + 610, start_ts + 720, 'ch_voice_01', 770201, None, '虚构连麦舰长'),
+        ]
+        pk1_meta = json.loads(cohosts[0][7])
+        assert pk1_meta['sprint_start_ts'] == start_ts + 355
+        assert pk1_meta['self_votes'] == 900
+        assert pk1_meta['opponent_votes'] == 1500
+        assert pk1_meta['self_winner'] == 0
+
+    st = warehouse_stats(wh_path)
+    assert st['room_metric_rows'] == 2
+    assert st['cohost_intervals'] == 5
+    assert st['cohost_intervals_by_kind'] == {
+        'pk': 2,
+        'pk_punish': 1,
+        'voice_join_queue': 1,
+        'voice_join': 1,
+    }
+
+    # 回归：旧配置无 platform_room_id（仅有短房号 123456 与 rooms 表 anchor_uid），先收到 START 后收到 PK_INFO 再收到本房获胜 END
+    s2_start = start_ts + 2000.0
+    s2_cutoff = s2_start + 300.0
+    with sqlite3.connect(db_path) as db:
+        db.execute(
+            'INSERT OR REPLACE INTO rooms(room_id, data) VALUES (?, ?)',
+            ('123456', json.dumps({'room_id': '123456', 'uid': 550101, 'updated_at': iso(s2_start)})),
+        )
+        _insert_raw(
+            db, '123456', s2_start + 10,
+            {
+                'cmd': 'PK_BATTLE_START_NEW',
+                'pk_id': 5009,
+                'timestamp': int(s2_start + 10),
+                'data': {
+                    'pk_start_time': int(s2_start + 10),
+                    'pk_frozen_time': int(s2_start + 190),
+                    'init_info': {'room_id': 12345600},
+                    'match_info': {'room_id': 654399},
+                },
+            },
+        )
+        _insert_raw(
+            db, '123456', s2_start + 12,
+            {
+                'cmd': 'PK_INFO',
+                'data': {
+                    'pk_basic': {'pk_id': 5009, 'status': 201, 'start_time': int(s2_start + 10), 'end_time': int(s2_start + 190)},
+                    'members': [
+                        {'uid': 550101, 'room_id': 12345600, 'uname': '虚构主播123456', 'votes': 2000, 'is_winner': 0},
+                        {'uid': 660999, 'room_id': 654399, 'uname': '虚构对手乙', 'votes': 500, 'is_winner': 0},
+                    ],
+                },
+            },
+        )
+        _insert_raw(
+            db, '123456', s2_start + 190,
+            {
+                'cmd': 'PK_BATTLE_END',
+                'pk_id': 5009,
+                'timestamp': int(s2_start + 190),
+                'data': {
+                    'init_info': {'room_id': 12345600, 'votes': 3000, 'winner_type': 2},
+                    'match_info': {'room_id': 654399, 'votes': 600, 'winner_type': -1},
+                },
+            },
+        )
+    _create_completed_session(sessions_dir, 'sess_short_no_plat', db_path, '123456', s2_start, s2_cutoff)
+    sync_warehouse(wh_path, sources=[('anon', db_path)], session_roots=[sessions_dir])
+    with sqlite3.connect(wh_path) as wh:
+        short_pk = wh.execute(
+            "SELECT opponent_uid, opponent_room_id, opponent_uname, raw_summary_json "
+            "FROM fact_cohost_intervals WHERE session_key = 'sess_short_no_plat' AND kind = 'pk'"
+        ).fetchone()
+        assert short_pk[:3] == (660999, '654399', '虚构对手乙')
+        short_meta = json.loads(short_pk[3])
+        assert short_meta['self_winner'] == 1
+        assert short_meta['self_votes'] == 3000
+        assert short_meta['opponent_votes'] == 600
+
+
+def test_v1_to_v2_schema_migration_and_auto_reingest(tmp_path: Path):
+    """验证旧版 v1 数仓（缺新表、旧游标、旧视图、extractor_version=1）在 sync 时自动平滑升级并与全新 v2 一致。"""
+    db_path = tmp_path / 'v1_src.sqlite3'
+    wh_path = tmp_path / 'v1_warehouse.sqlite3'
+    fresh_wh_path = tmp_path / 'fresh_v2_warehouse.sqlite3'
+    sessions_dir = tmp_path / 'sessions'
+    sessions_dir.mkdir()
+    _create_source_db(db_path)
+
+    start_ts = 1801000000.0
+    cutoff_ts = start_ts + 180.0
+    face_hash = 'f6' * 20
+    shared_extra_face = 'e7' * 20
+
+    with sqlite3.connect(db_path) as db:
+        _insert_raw(db, '123456', start_ts + 15, {'cmd': 'ONLINE_RANK_COUNT', 'data': {'online_count': 88}})
+        _insert_raw(
+            db, '123456', start_ts + 30,
+            {
+                'cmd': 'VOICE_JOIN_STATUS',
+                'data': {
+                    'status': 1, 'channel': 'ch_mig', 'channel_type': 'voice',
+                    'start_at': int(start_ts + 30), 'current_time': int(start_ts + 30),
+                    'uid': 810001, 'user_name': '虚构连麦观众', 'is_mystery': False,
+                },
+            },
+        )
+        # 故意测 v1 视图曾存在的缺陷：路人撞了同图但首字不同（字典“张”，弹幕“李***”）
+        _insert_raw(
+            db, '654321', start_ts - 50,
+            _pb_rank_packet([
+                (810002, '张山风', f'https://i0.hdslb.com/bfs/face/{face_hash}.jpg', 10, 15),
+                (810010, '共享图用户甲', f'https://i0.hdslb.com/bfs/face/{shared_extra_face}.jpg', 10, 15),
+            ]),
+        )
+        # 外房历史：用户乙仅通过 v2 新支持的 extra JSON 形态实名弹幕暴露同一头像 shared_extra_face
+        _insert_raw(
+            db, '654321', start_ts - 40,
+            _danmaku_packet(
+                '外房extra头像弹幕', int(start_ts - 40),
+                uid=810011, uname='共享图用户乙', crc32_hex=uid_crc32(810011),
+                face_url=f'https://i0.hdslb.com/bfs/face/{shared_extra_face}.jpg',
+                u15_mode='extra_json',
+            ),
+        )
+        _insert_raw(
+            db, '123456', start_ts + 40,
+            _danmaku_packet(
+                '升级前误认测试弹幕', int(start_ts + 40),
+                uname='李***', crc32_hex='00000000',
+                face_url=f'https://i0.hdslb.com/bfs/face/{face_hash}.jpg',
+            ),
+        )
+        _insert_raw(
+            db, '123456', start_ts + 50,
+            _pb_gift_packet(
+                uid=0, uname='共***',
+                face=f'https://i0.hdslb.com/bfs/face/{shared_extra_face}.jpg',
+                combo_seg=None, gift_id=31001, gift_name='测试共享图盲盒',
+                price=2000, total_coin=2000, tid='tid_v1_mig_shared', timestamp=int(start_ts + 50),
+            ),
+        )
+
+    _create_completed_session(sessions_dir, 'sess_mig_v1', db_path, '123456', start_ts, cutoff_ts)
+
+    # 先初始化再降级模拟真实 v1 状态（删掉两张 v2 新表、删掉游标新列与 extra 头像记录、还原 v1 旧视图、降 extractor_version=1）
+    sync_warehouse(wh_path, sources=[('s', db_path)], session_roots=[sessions_dir])
+    with sqlite3.connect(wh_path) as wh:
+        wh.executescript(
+            f"""
+            DROP TABLE fact_room_metrics;
+            DROP TABLE fact_cohost_intervals;
+            DELETE FROM dim_user_faces WHERE uid = 810011 AND face_sha1 = '{shared_extra_face}';
+            CREATE TABLE meta_source_cursors_v1 (
+                source_name TEXT PRIMARY KEY,
+                db_path TEXT NOT NULL,
+                last_raw_event_id INTEGER NOT NULL DEFAULT 0,
+                last_guard_snapshot_id INTEGER NOT NULL DEFAULT 0,
+                last_timeline_id INTEGER NOT NULL DEFAULT 0,
+                updated_at_utc TEXT NOT NULL
+            );
+            INSERT INTO meta_source_cursors_v1
+            SELECT source_name, db_path, last_raw_event_id, last_guard_snapshot_id, last_timeline_id, updated_at_utc
+            FROM meta_source_cursors;
+            DROP TABLE meta_source_cursors;
+            ALTER TABLE meta_source_cursors_v1 RENAME TO meta_source_cursors;
+            DROP VIEW v_resolved_events;
+            CREATE VIEW v_resolved_events AS
+            SELECT
+                e.*,
+                COALESCE(e.raw_uid, e.resolved_crc32_uid, e.inferred_uid) AS resolved_uid,
+                'legacy' AS actor_key,
+                'legacy' AS resolution_basis
+            FROM fact_events e;
+            UPDATE dim_sessions SET extractor_version = 1;
+            """
+        )
+
+    # 未执行 v2 sync 前，只读 stats 兼容旧 v1 库不报错
+    pre_stats = warehouse_stats(wh_path)
+    assert pre_stats['room_metric_rows'] == 0
+    assert pre_stats['cohost_intervals'] == 0
+
+    # 执行 v2 sync：自动升级游标补扫历史弹幕头像、建新表、替换视图、重入 extractor_version=1 的旧场次
+    mig_res = sync_warehouse(wh_path, sources=[('s', db_path)], session_roots=[sessions_dir])
+    assert mig_res['sessions']['ingested'] == 1
+    assert mig_res['room_metric_rows'] == 1
+    assert mig_res['cohost_intervals'] == 1
+
+    # 全新建仓 v2 对照：升级后的 v2 数仓与全新建仓 v2 的事件消解结果完全一致
+    sync_warehouse(fresh_wh_path, sources=[('s', db_path)], session_roots=[sessions_dir])
+    with sqlite3.connect(wh_path) as wh, sqlite3.connect(fresh_wh_path) as fresh_wh:
+        ver = wh.execute("SELECT extractor_version FROM dim_sessions WHERE session_key = 'sess_mig_v1'").fetchone()[0]
+        assert ver == 2
+        dm_check = wh.execute(
+            "SELECT resolved_uid, resolution_basis FROM v_resolved_events WHERE content_text = '升级前误认测试弹幕'"
+        ).fetchone()
+        assert dm_check == (None, 'unresolved')
+        gift_check = wh.execute(
+            "SELECT resolved_uid, resolution_basis FROM v_resolved_events WHERE gift_name = '测试共享图盲盒'"
+        ).fetchone()
+        assert gift_check == (None, 'unresolved')
+        migrated_resolved = wh.execute(
+            'SELECT event_seq, kind, resolved_uid, actor_key, resolution_basis FROM v_resolved_events ORDER BY event_seq'
+        ).fetchall()
+        fresh_resolved = fresh_wh.execute(
+            'SELECT event_seq, kind, resolved_uid, actor_key, resolution_basis FROM v_resolved_events ORDER BY event_seq'
+        ).fetchall()
+        assert migrated_resolved == fresh_resolved
+
+    # 再次执行 sync：场次与游标均已是 v2，直接幂等跳过
+    again = sync_warehouse(wh_path, sources=[('s', db_path)], session_roots=[sessions_dir])
+    assert again['sessions']['ingested'] == 0
+    assert again['sessions']['skipped_already_ingested'] == 1
 
 
 def cli_main_helper(argv: list[str]) -> int:

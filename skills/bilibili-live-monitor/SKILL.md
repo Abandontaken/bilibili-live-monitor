@@ -49,6 +49,8 @@ PK录屏花屏、视频剪辑读取及压缩前的参数检查见[PK编码参数
 
 需要跨多个实名/匿名采集库离线消解观众身份、构建标准化付费与转写数仓，或差量回填本地已完成匿名看板的送礼汇总与单曲去重人数时，见[跨房全局身份消解数仓](warehouse.md)：使用 `bili-live warehouse sync/stats/backfill-pages`，对源库严格只读，回填默认 `--dry-run`。
 
+编写 SQL 或 Python 脚本查询 `live_warehouse.sqlite3` 与 `monitor.sqlite3`、解读弹幕/盲盒/荣耀等级/粉丝牌/在线人数/PK 连麦字段时，先读[数据库解析与口径防坑指南](data-interpretation.md)，避免外房勋章剥离、短长房号不一致、盲盒双账本与成对广播重复记账等口径误判。
+
 需要从整场直播制作2–3分钟引流预告时，见[直播引流预告片](trailer.md)：事件选择、源时间映射、隐私裁剪、`trailer render/verify`、剪点与独立审阅。真实精剪表和媒体留在私有输出目录。
 
 ## 环境与安装

@@ -20,8 +20,10 @@ from .time_utils import epoch, iso
 from .transcript_corrections import correction_context
 from .warehouse_protocol import (
     clean_uname,
+    extract_cohost_intervals,
     extract_guard_snapshot_identities,
     extract_raw_identities,
+    extract_room_metrics,
     extract_session_events,
     extract_timeline_identity,
     first_char,
@@ -31,7 +33,7 @@ from .warehouse_protocol import (
     uid_md5,
 )
 
-EXTRACTOR_VERSION = 1
+EXTRACTOR_VERSION = 2
 
 WAREHOUSE_DDL = """
 PRAGMA journal_mode = WAL;
@@ -44,6 +46,7 @@ CREATE TABLE IF NOT EXISTS meta_source_cursors (
     last_raw_event_id      INTEGER NOT NULL DEFAULT 0,
     last_guard_snapshot_id INTEGER NOT NULL DEFAULT 0,
     last_timeline_id       INTEGER NOT NULL DEFAULT 0,
+    extractor_version      INTEGER NOT NULL DEFAULT 1,
     updated_at_utc         TEXT NOT NULL
 );
 
@@ -154,19 +157,21 @@ CREATE TABLE IF NOT EXISTS fact_events (
 CREATE INDEX IF NOT EXISTS idx_events_room_time ON fact_events(room_id, event_ts);
 CREATE INDEX IF NOT EXISTS idx_events_paid ON fact_events(paid_milli_yuan, event_ts) WHERE paid_milli_yuan > 0;
 CREATE INDEX IF NOT EXISTS idx_events_md5 ON fact_events(clue_md5) WHERE clue_md5 IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_events_face ON fact_events(clue_face_sha1) WHERE clue_face_sha1 IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_events_crc32 ON fact_events(room_id, clue_crc32) WHERE clue_crc32 IS NOT NULL;
 
-CREATE VIEW IF NOT EXISTS v_resolved_events AS
+DROP VIEW IF EXISTS v_resolved_events;
+CREATE VIEW v_resolved_events AS
 SELECT
     e.*,
     CASE
         WHEN e.is_mystery = 1 THEN NULL
-        ELSE COALESCE(e.raw_uid, u_md5.uid, u_face.uid, e.resolved_crc32_uid, e.inferred_uid)
+        ELSE COALESCE(e.raw_uid, u_md5.uid, e.resolved_crc32_uid, u_face_user.uid, e.inferred_uid)
     END AS resolved_uid,
     CASE
         WHEN e.is_mystery = 1 THEN 'mystery:' || e.session_key || ':' || e.event_seq
-        WHEN COALESCE(e.raw_uid, u_md5.uid, u_face.uid, e.resolved_crc32_uid, e.inferred_uid) IS NOT NULL
-            THEN 'uid:' || COALESCE(e.raw_uid, u_md5.uid, u_face.uid, e.resolved_crc32_uid, e.inferred_uid)
+        WHEN COALESCE(e.raw_uid, u_md5.uid, e.resolved_crc32_uid, u_face_user.uid, e.inferred_uid) IS NOT NULL
+            THEN 'uid:' || COALESCE(e.raw_uid, u_md5.uid, e.resolved_crc32_uid, u_face_user.uid, e.inferred_uid)
         WHEN e.clue_md5 IS NOT NULL THEN 'md5:' || e.clue_md5
         WHEN e.clue_crc32 IS NOT NULL
             THEN 'crc32:' || e.room_id || ':' || e.clue_crc32 || COALESCE(':' || e.clue_first_char, '')
@@ -176,16 +181,61 @@ SELECT
         WHEN e.is_mystery = 1 THEN 'mystery'
         WHEN e.raw_uid IS NOT NULL THEN 'native_uid'
         WHEN u_md5.uid IS NOT NULL THEN 'global_md5'
-        WHEN u_face.uid IS NOT NULL THEN 'unique_face'
         WHEN e.resolved_crc32_uid IS NOT NULL THEN 'crc32_first_char'
+        WHEN u_face_user.uid IS NOT NULL THEN 'unique_face'
         WHEN e.inferred_uid IS NOT NULL THEN COALESCE(e.inference_method, 'inferred')
         WHEN e.crc32_status = 'ambiguous_crc32' THEN 'ambiguous_crc32'
         WHEN e.clue_md5 IS NOT NULL THEN 'unresolved_md5_pseudonym'
         ELSE 'unresolved'
     END AS resolution_basis
 FROM fact_events e
-LEFT JOIN dim_users u_md5 ON e.is_mystery = 0 AND e.raw_uid IS NULL AND e.clue_md5 = u_md5.uid_md5
-LEFT JOIN v_unique_face_uid u_face ON e.is_mystery = 0 AND e.raw_uid IS NULL AND u_md5.uid IS NULL AND e.clue_face_sha1 = u_face.face_sha1;
+LEFT JOIN dim_users u_md5
+    ON e.is_mystery = 0 AND e.raw_uid IS NULL AND e.clue_md5 = u_md5.uid_md5
+LEFT JOIN v_unique_face_uid u_face
+    ON e.is_mystery = 0
+   AND e.raw_uid IS NULL
+   AND u_md5.uid IS NULL
+   AND (e.kind != 'danmaku' OR e.resolved_crc32_uid IS NULL)
+   AND e.clue_face_sha1 = u_face.face_sha1
+LEFT JOIN dim_users u_face_user
+    ON u_face.uid = u_face_user.uid
+   AND (
+       e.kind != 'danmaku'
+       OR (e.clue_crc32 IS NOT NULL AND e.clue_crc32 = u_face_user.uid_crc32)
+       OR (
+           e.clue_crc32 IS NULL
+           AND (e.clue_first_char IS NULL OR u_face_user.first_char IS NULL OR e.clue_first_char = u_face_user.first_char)
+       )
+   );
+
+CREATE TABLE IF NOT EXISTS fact_room_metrics (
+    session_key       TEXT NOT NULL REFERENCES dim_sessions(session_key) ON DELETE CASCADE,
+    minute_ts         INTEGER NOT NULL,
+    room_id           TEXT NOT NULL,
+    online_count      INTEGER,
+    watched_count     INTEGER,
+    fans_count        INTEGER,
+    fans_club_count   INTEGER,
+    PRIMARY KEY (session_key, minute_ts)
+);
+CREATE INDEX IF NOT EXISTS idx_room_metrics_room_time ON fact_room_metrics(room_id, minute_ts);
+
+CREATE TABLE IF NOT EXISTS fact_cohost_intervals (
+    session_key       TEXT NOT NULL REFERENCES dim_sessions(session_key) ON DELETE CASCADE,
+    interval_seq      INTEGER NOT NULL,
+    room_id           TEXT NOT NULL,
+    kind              TEXT NOT NULL,
+    start_ts          REAL NOT NULL,
+    end_ts            REAL NOT NULL,
+    battle_id         TEXT,
+    opponent_uid      INTEGER,
+    opponent_room_id  TEXT,
+    opponent_uname    TEXT,
+    raw_summary_json  TEXT NOT NULL,
+    PRIMARY KEY (session_key, interval_seq)
+);
+CREATE INDEX IF NOT EXISTS idx_cohost_session_time ON fact_cohost_intervals(session_key, start_ts, end_ts);
+CREATE INDEX IF NOT EXISTS idx_cohost_room_time ON fact_cohost_intervals(room_id, start_ts, end_ts);
 
 CREATE TABLE IF NOT EXISTS fact_session_presence (
     session_key        TEXT NOT NULL REFERENCES dim_sessions(session_key) ON DELETE CASCADE,
@@ -313,6 +363,9 @@ def open_warehouse(path: Path) -> sqlite3.Connection:
     cols = {row[1] for row in conn.execute('PRAGMA table_info(dim_users)')}
     if 'latest_uname_ts' not in cols:
         conn.execute('ALTER TABLE dim_users ADD COLUMN latest_uname_ts REAL')
+    cur_cols = {row[1] for row in conn.execute('PRAGMA table_info(meta_source_cursors)')}
+    if 'extractor_version' not in cur_cols:
+        conn.execute('ALTER TABLE meta_source_cursors ADD COLUMN extractor_version INTEGER NOT NULL DEFAULT 1')
     conn.execute('PRAGMA foreign_keys = ON')
     return conn
 
@@ -448,13 +501,15 @@ def _source_tables(src: sqlite3.Connection) -> set[str]:
 def _scan_single_source(wh: sqlite3.Connection, source_name: str, db_path: Path) -> dict[str, Any]:
     resolved_db = db_path.resolve()
     cur_row = wh.execute(
-        'SELECT db_path, last_raw_event_id, last_guard_snapshot_id, last_timeline_id '
+        'SELECT db_path, last_raw_event_id, last_guard_snapshot_id, last_timeline_id, extractor_version '
         'FROM meta_source_cursors WHERE source_name = ?',
         (source_name,),
     ).fetchone()
     if cur_row is not None and Path(cur_row[0]).resolve() != resolved_db:
         raise ValueError(f'数据源 {source_name} 已绑定到其他数据库路径，禁止混用游标')
-    last_raw_id, last_guard_id, last_tl_id = (cur_row[1], cur_row[2], cur_row[3]) if cur_row else (0, 0, 0)
+    last_raw_id, last_guard_id, last_tl_id, cur_ver = (
+        (cur_row[1], cur_row[2], cur_row[3], int(cur_row[4] or 1)) if cur_row else (0, 0, 0, 0)
+    )
 
     batch = _IdentityBatch()
     scanned_raw = 0
@@ -479,6 +534,29 @@ def _scan_single_source(wh: sqlite3.Connection, source_name: str, db_path: Path)
                     continue
 
         if 'raw_events' in tables:
+            if last_raw_id > 0 and cur_ver < EXTRACTOR_VERSION:
+                # 游标升级：对已扫描区间的 DANMU_MSG 增量补扫新版扩展 u15 实名头像观测
+                rescan_cur = src.execute(
+                    "SELECT room_id, received_utc, command, data FROM raw_events "
+                    "WHERE id <= ? AND command LIKE 'DANMU_MSG%' ORDER BY id",
+                    (last_raw_id,),
+                )
+                while r_rows := rescan_cur.fetchmany(5000):
+                    for room_id, rec_utc, command, data_s in r_rows:
+                        scanned_raw += 1
+                        try:
+                            ts = epoch(rec_utc)
+                            packet = json.loads(data_s)
+                        except Exception:
+                            continue
+                        if not isinstance(packet, dict):
+                            continue
+                        identities, anchor_uid = extract_raw_identities(str(command or ''), packet)
+                        if anchor_uid or identities:
+                            batch.add_room_touch(room_id, ts, anchor_uid)
+                        for uid, uname, face, wealth in identities:
+                            batch.add(uid, uname, face, wealth, ts)
+
             max_raw_id = src.execute('SELECT COALESCE(MAX(id), 0) FROM raw_events').fetchone()[0]
             if max_raw_id > last_raw_id:
                 placeholders = ','.join('?' for _ in _IDENTITY_COMMANDS)
@@ -559,16 +637,18 @@ def _scan_single_source(wh: sqlite3.Connection, source_name: str, db_path: Path)
         wh.execute(
             """
             INSERT INTO meta_source_cursors (
-                source_name, db_path, last_raw_event_id, last_guard_snapshot_id, last_timeline_id, updated_at_utc
-            ) VALUES (?, ?, ?, ?, ?, ?)
+                source_name, db_path, last_raw_event_id, last_guard_snapshot_id,
+                last_timeline_id, extractor_version, updated_at_utc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(source_name) DO UPDATE SET
                 db_path = excluded.db_path,
                 last_raw_event_id = excluded.last_raw_event_id,
                 last_guard_snapshot_id = excluded.last_guard_snapshot_id,
                 last_timeline_id = excluded.last_timeline_id,
+                extractor_version = excluded.extractor_version,
                 updated_at_utc = excluded.updated_at_utc
             """,
-            (source_name, str(resolved_db), last_raw_id, last_guard_id, last_tl_id, utc_now_iso()),
+            (source_name, str(resolved_db), last_raw_id, last_guard_id, last_tl_id, EXTRACTOR_VERSION, utc_now_iso()),
         )
 
     return {
@@ -736,9 +816,18 @@ def _ingest_completed_session(
                         batch.add(extracted[0], extracted[1], None, 0, epoch(at_utc))
 
     norm_events = extract_session_events(room_id, start_ts, cutoff_ts, raw_rows, tl_rows)
+    metric_rows = extract_room_metrics(room_id, start_ts, cutoff_ts, raw_rows)
 
     room_row = wh.execute('SELECT anchor_uid FROM dim_rooms WHERE room_id = ?', (room_id,)).fetchone()
     known_anchor = batch.room_anchors.get(room_id) or (room_row[0] if room_row and room_row[0] else None)
+    cohost_rows = extract_cohost_intervals(
+        room_id,
+        start_ts,
+        cutoff_ts,
+        raw_rows,
+        platform_room_id=platform_room_id,
+        anchor_uid=known_anchor,
+    )
     observed_medal_ruids = {ev['medal_ruid'] for ev in norm_events if ev.get('medal_ruid')}
     allows_ext = 0
     if known_anchor and any(ruid != known_anchor for ruid in observed_medal_ruids):
@@ -771,6 +860,8 @@ def _ingest_completed_session(
             """,
             (room_id, known_anchor, config.get('label'), track_cat, allows_ext, start_ts, cutoff_ts),
         )
+        wh.execute('DELETE FROM fact_cohost_intervals WHERE session_key = ?', (skey,))
+        wh.execute('DELETE FROM fact_room_metrics WHERE session_key = ?', (skey,))
         wh.execute('DELETE FROM fact_session_presence WHERE session_key = ?', (skey,))
         wh.execute('DELETE FROM fact_events WHERE session_key = ?', (skey,))
         wh.execute('DELETE FROM fact_transcripts WHERE session_key = ?', (skey,))
@@ -830,12 +921,46 @@ def _ingest_completed_session(
                     for idx, ev in enumerate(norm_events)
                 ],
             )
+        if metric_rows:
+            wh.executemany(
+                """
+                INSERT INTO fact_room_metrics (
+                    session_key, minute_ts, room_id, online_count, watched_count, fans_count, fans_club_count
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        skey, m['minute_ts'], m['room_id'],
+                        m['online_count'], m['watched_count'], m['fans_count'], m['fans_club_count'],
+                    )
+                    for m in metric_rows
+                ],
+            )
+        if cohost_rows:
+            wh.executemany(
+                """
+                INSERT INTO fact_cohost_intervals (
+                    session_key, interval_seq, room_id, kind, start_ts, end_ts,
+                    battle_id, opponent_uid, opponent_room_id, opponent_uname, raw_summary_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        skey, idx + 1, row['room_id'], row['kind'], row['start_ts'], row['end_ts'],
+                        row['battle_id'], row['opponent_uid'], row['opponent_room_id'],
+                        row['opponent_uname'], row['raw_summary_json'],
+                    )
+                    for idx, row in enumerate(cohost_rows)
+                ],
+            )
 
     return {
         'status': 'ingested',
         'session_key': skey,
         'transcripts': len(transcript_rows),
         'events': len(norm_events),
+        'room_metric_rows': len(metric_rows),
+        'cohost_intervals': len(cohost_rows),
     }
 
 
@@ -858,7 +983,11 @@ def _resolve_danmaku_crc32_and_presence(wh: sqlite3.Connection) -> dict[str, int
         FROM fact_events e
         LEFT JOIN dim_users u_md5 ON e.is_mystery = 0 AND e.raw_uid IS NULL AND e.clue_md5 = u_md5.uid_md5
         LEFT JOIN v_unique_face_uid u_face
-            ON e.is_mystery = 0 AND e.raw_uid IS NULL AND u_md5.uid IS NULL AND e.clue_face_sha1 = u_face.face_sha1
+            ON e.is_mystery = 0
+           AND e.kind != 'danmaku'
+           AND e.raw_uid IS NULL
+           AND u_md5.uid IS NULL
+           AND e.clue_face_sha1 = u_face.face_sha1
         WHERE e.is_mystery = 0
           AND COALESCE(e.raw_uid, u_md5.uid, u_face.uid, e.inferred_uid) IS NOT NULL
         GROUP BY e.session_key, e.room_id, firm_uid
@@ -1020,6 +1149,8 @@ def sync_warehouse(
             'skipped_incomplete': 0,
             'ingested_transcripts': 0,
             'ingested_events': 0,
+            'ingested_room_metric_rows': 0,
+            'ingested_cohost_intervals': 0,
         }
         for root in session_roots or []:
             root_path = Path(root)
@@ -1042,14 +1173,23 @@ def sync_warehouse(
                 if status == 'ingested':
                     session_stats['ingested_transcripts'] += res['transcripts']
                     session_stats['ingested_events'] += res['events']
+                    session_stats['ingested_room_metric_rows'] += res['room_metric_rows']
+                    session_stats['ingested_cohost_intervals'] += res['cohost_intervals']
 
         any_growth = any(r['touched_users'] > 0 or r['touched_faces'] > 0 for r in source_reports)
         presence_stale = wh.execute(
-            'SELECT EXISTS('
-            '  SELECT 1 FROM v_resolved_events r '
-            '  LEFT JOIN fact_session_presence p '
-            '    ON r.session_key = p.session_key AND r.actor_key = p.actor_key '
-            '  WHERE p.actor_key IS NULL LIMIT 1'
+            'SELECT ('
+            '  EXISTS('
+            '    SELECT 1 FROM v_resolved_events r '
+            '    LEFT JOIN fact_session_presence p '
+            '      ON r.session_key = p.session_key AND r.actor_key = p.actor_key '
+            '    WHERE p.actor_key IS NULL LIMIT 1'
+            '  ) OR EXISTS('
+            '    SELECT 1 FROM fact_session_presence p '
+            '    LEFT JOIN v_resolved_events r '
+            '      ON p.session_key = r.session_key AND p.actor_key = r.actor_key '
+            '    WHERE r.actor_key IS NULL LIMIT 1'
+            '  )'
             ')'
         ).fetchone()[0]
         unindexed_danmaku = wh.execute(
@@ -1074,6 +1214,8 @@ def sync_warehouse(
         known_uids = wh.execute('SELECT COUNT(*) FROM dim_users').fetchone()[0]
         unique_faces = wh.execute('SELECT COUNT(*) FROM v_unique_face_uid').fetchone()[0]
         total_sessions = wh.execute('SELECT COUNT(*) FROM dim_sessions').fetchone()[0]
+        room_metric_rows = wh.execute('SELECT COUNT(*) FROM fact_room_metrics').fetchone()[0]
+        cohost_intervals = wh.execute('SELECT COUNT(*) FROM fact_cohost_intervals').fetchone()[0]
 
     return {
         'warehouse': str(Path(warehouse_path).resolve()),
@@ -1081,6 +1223,8 @@ def sync_warehouse(
         'known_uids': known_uids,
         'unique_faces': unique_faces,
         'total_sessions': total_sessions,
+        'room_metric_rows': room_metric_rows,
+        'cohost_intervals': cohost_intervals,
         'sources': source_reports,
         'sessions': session_stats,
         'resolution': resolution,
@@ -1094,8 +1238,9 @@ def _rate(numerator: int | float, denominator: int | float) -> float | None:
 
 
 def warehouse_stats(warehouse_path: Path) -> dict[str, Any]:
-    """只读输出全局身份字典规模、付费礼物金额分档还原率与弹幕荣耀等级分档消解率。"""
+    """只读输出全局身份字典规模、房间状态/连麦行数、付费礼物与弹幕分档消解率。"""
     with open_readonly_sqlite(warehouse_path) as wh:
+        tables = _source_tables(wh)
         known_uids = wh.execute('SELECT COUNT(*) FROM dim_users').fetchone()[0]
         unique_faces = wh.execute('SELECT COUNT(*) FROM v_unique_face_uid').fetchone()[0]
         shared_faces = wh.execute(
@@ -1103,6 +1248,18 @@ def warehouse_stats(warehouse_path: Path) -> dict[str, Any]:
         ).fetchone()[0]
         ingested_sessions = wh.execute('SELECT COUNT(*) FROM dim_sessions').fetchone()[0]
         known_rooms = wh.execute('SELECT COUNT(*) FROM dim_rooms').fetchone()[0]
+        room_metric_rows = (
+            wh.execute('SELECT COUNT(*) FROM fact_room_metrics').fetchone()[0]
+            if 'fact_room_metrics' in tables else 0
+        )
+        cohost_intervals = (
+            wh.execute('SELECT COUNT(*) FROM fact_cohost_intervals').fetchone()[0]
+            if 'fact_cohost_intervals' in tables else 0
+        )
+        cohost_by_kind = (
+            dict(wh.execute('SELECT kind, COUNT(*) FROM fact_cohost_intervals GROUP BY kind').fetchall())
+            if 'fact_cohost_intervals' in tables else {}
+        )
 
         def gift_tier_summary(extra_where: str = '') -> dict[str, Any]:
             tiers = ('<10元', '10-200元', '>=200元')
@@ -1196,6 +1353,19 @@ def warehouse_stats(warehouse_path: Path) -> dict[str, Any]:
                 """
             ).fetchall()
         )
+        danmaku_basis = dict(
+            wh.execute(
+                """
+                SELECT resolution_basis, COUNT(*)
+                FROM v_resolved_events
+                WHERE kind = 'danmaku'
+                GROUP BY resolution_basis
+                """
+            ).fetchall()
+        )
+        danmaku_with_face_clue = wh.execute(
+            "SELECT COUNT(*) FROM fact_events WHERE kind = 'danmaku' AND clue_face_sha1 IS NOT NULL"
+        ).fetchone()[0]
 
         anonymous_sessions_filter = (
             "AND session_key IN (SELECT session_key FROM dim_sessions WHERE source_instance = 'anonymous')"
@@ -1206,11 +1376,16 @@ def warehouse_stats(warehouse_path: Path) -> dict[str, Any]:
             'shared_faces': shared_faces,
             'known_rooms': known_rooms,
             'ingested_sessions': ingested_sessions,
+            'room_metric_rows': room_metric_rows,
+            'cohost_intervals': cohost_intervals,
+            'cohost_intervals_by_kind': cohost_by_kind,
             'paid_gifts': gift_tier_summary(),
             'paid_gifts_anonymous_sessions': gift_tier_summary(anonymous_sessions_filter),
             'paid_gift_resolution_basis': basis_breakdown,
             'danmaku': danmaku_tier_summary(),
             'danmaku_anonymous_sessions': danmaku_tier_summary(anonymous_sessions_filter),
+            'danmaku_resolution_basis': danmaku_basis,
+            'danmaku_with_face_clue': danmaku_with_face_clue,
         }
 
 

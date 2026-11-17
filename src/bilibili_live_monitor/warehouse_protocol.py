@@ -222,6 +222,39 @@ def _extract_uinfo_dict(uinfo: Any) -> tuple[int | None, str | None, str | None,
     return uid, uname, face, wealth, mystery
 
 
+def _extract_danmaku_u15_user(info: Any) -> dict[str, Any] | None:
+    """从 DANMU_MSG 的 info[0][15]（dict 或 JSON 字符串，含 extra 同层或嵌套 user）提取 user 对象。"""
+    if not isinstance(info, list) or not info or not isinstance(info[0], list) or len(info[0]) <= 15:
+        return None
+    raw_meta = info[0][15]
+    meta: dict[str, Any] | None = None
+    if isinstance(raw_meta, dict):
+        meta = raw_meta
+    elif isinstance(raw_meta, str) and raw_meta.strip().startswith('{'):
+        try:
+            parsed = json.loads(raw_meta)
+            if isinstance(parsed, dict):
+                meta = parsed
+        except Exception:
+            meta = None
+    if meta is None:
+        return None
+    user = meta.get('user')
+    if isinstance(user, dict):
+        return user
+    extra = meta.get('extra')
+    if isinstance(extra, str) and extra.strip().startswith('{'):
+        try:
+            extra_dict = json.loads(extra)
+            if isinstance(extra_dict, dict) and isinstance(extra_dict.get('user'), dict):
+                return extra_dict['user']
+        except Exception:
+            pass
+    elif isinstance(extra, dict) and isinstance(extra.get('user'), dict):
+        return extra['user']
+    return None
+
+
 def _extract_medal_from_uinfo_and_fans(uinfo: Any, fans_medal: Any = None) -> dict[str, Any]:
     u_medal = (uinfo.get('medal') if isinstance(uinfo, dict) and isinstance(uinfo.get('medal'), dict) else {})
     f_medal = fans_medal if isinstance(fans_medal, dict) else {}
@@ -431,9 +464,7 @@ def extract_raw_identities(command: str, packet: dict[str, Any]) -> tuple[list[t
         if cmd.startswith('DANMU_MSG'):
             info = packet.get('info')
             if isinstance(info, list) and len(info) > 2 and isinstance(info[2], list) and len(info[2]) >= 2:
-                u15_user = (info[0][15].get('user')
-                            if isinstance(info[0], list) and len(info[0]) > 15 and isinstance(info[0][15], dict)
-                            else None)
+                u15_user = _extract_danmaku_u15_user(info)
                 u_uid, u_name, u_face, u_wealth, mystery = _extract_uinfo_dict(u15_user)
                 if not mystery:
                     uid = pos_int(info[2][0]) or u_uid
@@ -1005,8 +1036,7 @@ def extract_session_events(
                 continue
             seen_keys.add(fp_key)
             user_arr = info[2] if isinstance(info[2], list) else []
-            u15_user = (info[0][15].get('user')
-                        if len(info[0]) > 15 and isinstance(info[0][15], dict) else None)
+            u15_user = _extract_danmaku_u15_user(info)
             u_uid, u_name, u_face, u_wealth, u_mys = _extract_uinfo_dict(u15_user)
             uid = None if u_mys else (pos_int(user_arr[0] if user_arr else 0) or u_uid)
             uname = '神秘人' if u_mys else (clean_uname(user_arr[1] if len(user_arr) > 1 else None) or u_name)
@@ -1352,3 +1382,630 @@ def _extract_from_timeline_fallback(
             'source_ref': f'timeline:{tl_id}',
         })
     return events
+
+
+_PK_INTERVAL_COMMANDS = frozenset({
+    'PK_BATTLE_PRE_NEW',
+    'PK_BATTLE_PRE',
+    'PK_BATTLE_START_NEW',
+    'PK_BATTLE_START',
+    'PK_BATTLE_PROCESS_NEW',
+    'PK_BATTLE_PROCESS',
+    'PK_BATTLE_END',
+    'PK_BATTLE_SETTLE_NEW',
+    'PK_BATTLE_VIDEO_PUNISH_BEGIN',
+    'PK_BATTLE_PUNISH_END',
+    'PK_BATTLE_ABNORMAL',
+    'PK_INFO',
+})
+
+_VOICE_JOIN_COMMANDS = frozenset({
+    'VOICE_JOIN_STATUS',
+    'VOICE_JOIN_LIST',
+    'VOICE_JOIN_ROOM_COUNT_INFO',
+})
+
+
+def extract_room_metrics(
+    room_id: str,
+    start_ts: float,
+    cutoff_ts: float,
+    raw_rows: list[tuple[int, str, str, dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """提取场次 [start_ts, cutoff_ts] 按分钟桶聚合的房间状态时间序列（桶内取最新观测）。"""
+    buckets: dict[int, dict[str, tuple[float, int, int]]] = {}
+    rid = str(room_id)
+
+    for raw_id, received_utc, command, packet in raw_rows:
+        if not isinstance(packet, dict):
+            continue
+        cmd = str(command or packet.get('cmd') or '')
+        if cmd not in ('ONLINE_RANK_COUNT', 'WATCHED_CHANGE', 'ROOM_REAL_TIME_MESSAGE_UPDATE'):
+            continue
+        data = packet.get('data')
+        if not isinstance(data, dict):
+            continue
+        try:
+            rec_ts = epoch(received_utc)
+        except Exception:
+            continue
+        if not (start_ts <= rec_ts <= cutoff_ts):
+            continue
+        minute_ts = int(rec_ts // 60) * 60
+        bucket = buckets.setdefault(minute_ts, {})
+        order_key = (rec_ts, int(raw_id or 0))
+
+        def _put(col: str, val: int | None) -> None:
+            if val is None:
+                return
+            prev = bucket.get(col)
+            if prev is None or order_key >= (prev[0], prev[1]):
+                bucket[col] = (order_key[0], order_key[1], val)
+
+        if cmd == 'ONLINE_RANK_COUNT':
+            _put('online_count', nonneg_int(data.get('online_count')))
+        elif cmd == 'WATCHED_CHANGE':
+            _put('watched_count', nonneg_int(data.get('num')))
+        elif cmd == 'ROOM_REAL_TIME_MESSAGE_UPDATE':
+            _put('fans_count', nonneg_int(data.get('fans')))
+            _put('fans_club_count', nonneg_int(data.get('fans_club')))
+
+    out: list[dict[str, Any]] = []
+    for minute_ts in sorted(buckets):
+        b = buckets[minute_ts]
+        if not b:
+            continue
+        out.append({
+            'minute_ts': minute_ts,
+            'room_id': rid,
+            'online_count': b['online_count'][2] if 'online_count' in b else None,
+            'watched_count': b['watched_count'][2] if 'watched_count' in b else None,
+            'fans_count': b['fans_count'][2] if 'fans_count' in b else None,
+            'fans_club_count': b['fans_club_count'][2] if 'fans_club_count' in b else None,
+        })
+    return out
+
+
+def _clamp_session_interval(iv_start: float, iv_end: float, start_ts: float, cutoff_ts: float) -> tuple[float, float] | None:
+    if iv_end < start_ts or iv_start > cutoff_ts:
+        return None
+    cs = max(start_ts, iv_start)
+    ce = min(cutoff_ts, max(cs, iv_end))
+    return cs, ce
+
+
+def extract_cohost_intervals(
+    room_id: str,
+    start_ts: float,
+    cutoff_ts: float,
+    raw_rows: list[tuple[int, str, str, dict[str, Any]]],
+    *,
+    platform_room_id: str | None = None,
+    anchor_uid: int | None = None,
+) -> list[dict[str, Any]]:
+    """从单场 raw_events 归并 PK 对战、PK 惩罚与语音连麦状态区间。"""
+    rid = str(room_id)
+    self_rooms = {rid}
+    if platform_room_id:
+        self_rooms.add(str(platform_room_id))
+
+    def _is_self(cand_room: str | None, cand_uid: int | None) -> bool:
+        if cand_room and cand_room in self_rooms:
+            return True
+        if anchor_uid and cand_uid and cand_uid == anchor_uid:
+            return True
+        return False
+
+    ordered_rows: list[tuple[float, int, str, dict[str, Any]]] = []
+    for raw_id, received_utc, command, packet in raw_rows:
+        if not isinstance(packet, dict):
+            continue
+        cmd = str(command or packet.get('cmd') or '')
+        data_top = packet.get('data') if isinstance(packet.get('data'), dict) else {}
+        if cmd == 'ROOM_REAL_TIME_MESSAGE_UPDATE':
+            canon_rid = pos_int(data_top.get('roomid'))
+            if canon_rid:
+                self_rooms.add(str(canon_rid))
+            continue
+        if cmd == 'PK_INFO' and anchor_uid and isinstance(data_top.get('members'), list):
+            for mem in data_top['members']:
+                if isinstance(mem, dict) and pos_int(mem.get('uid')) == anchor_uid:
+                    m_rid = pos_int(mem.get('room_id'))
+                    if m_rid:
+                        self_rooms.add(str(m_rid))
+        if cmd not in _PK_INTERVAL_COMMANDS and cmd not in _VOICE_JOIN_COMMANDS:
+            continue
+        try:
+            rec_ts = epoch(received_utc)
+        except Exception:
+            continue
+        ordered_rows.append((rec_ts, int(raw_id or 0), cmd, packet))
+    ordered_rows.sort(key=lambda item: (item[0], item[1]))
+
+    battles: dict[str, dict[str, Any]] = {}
+    intervals: list[dict[str, Any]] = []
+
+    def _purge_self_from_opponents(b: dict[str, Any], newly_self_room: str) -> None:
+        self_rooms.add(newly_self_room)
+        b['opponents'].pop(newly_self_room, None)
+        if b['opponent_room_id'] == newly_self_room:
+            b['opponent_room_id'] = next(
+                (v['room_id'] for v in b['opponents'].values() if v.get('room_id') and v['room_id'] not in self_rooms),
+                None,
+            )
+
+    def _record_opponent(b: dict[str, Any], opp_uid: int | None, opp_room: str | None, opp_uname: str | None,
+                         votes: int | None = None) -> None:
+        if _is_self(opp_room, opp_uid):
+            if opp_room and opp_room not in self_rooms:
+                _purge_self_from_opponents(b, opp_room)
+            return
+        if not opp_uid and not opp_room and not opp_uname:
+            return
+        if opp_uid and b['opponent_uid'] is None:
+            b['opponent_uid'] = opp_uid
+        if opp_room and b['opponent_room_id'] is None:
+            b['opponent_room_id'] = opp_room
+        if opp_uname and not is_masked_name(opp_uname):
+            b['opponent_uname'] = opp_uname
+        elif opp_uname and b['opponent_uname'] is None:
+            b['opponent_uname'] = opp_uname
+        if votes is not None:
+            b['opponent_votes'] = votes
+        key = opp_room or (f'uid:{opp_uid}' if opp_uid else f'name:{opp_uname}')
+        entry = b['opponents'].setdefault(key, {'uid': None, 'room_id': None, 'uname': None, 'votes': None})
+        if opp_uid:
+            entry['uid'] = opp_uid
+        if opp_room:
+            entry['room_id'] = opp_room
+        if opp_uname:
+            entry['uname'] = opp_uname
+        if votes is not None:
+            entry['votes'] = votes
+
+    def _update_side_pair(b: dict[str, Any], data: dict[str, Any]) -> None:
+        sides: list[tuple[str | None, int | None, Any]] = []
+        for side_key in ('init_info', 'match_info'):
+            side = data.get(side_key)
+            if not isinstance(side, dict):
+                continue
+            s_room_int = pos_int(side.get('room_id'))
+            s_room = str(s_room_int) if s_room_int else None
+            s_votes = nonneg_int(side.get('votes'))
+            w_type = side.get('winner_type') if side.get('winner_type') is not None else side.get('result_type')
+            sides.append((s_room, s_votes, w_type))
+
+        if len(sides) == 2 and b['opponent_room_id']:
+            r0, r1 = sides[0][0], sides[1][0]
+            if r0 == b['opponent_room_id'] and r1 and r1 != r0:
+                _purge_self_from_opponents(b, r1)
+            elif r1 == b['opponent_room_id'] and r0 and r0 != r1:
+                _purge_self_from_opponents(b, r0)
+
+        has_confirmed_self = any(_is_self(sr, None) for sr, _, _ in sides)
+        for s_room, s_votes, w_type in sides:
+            if _is_self(s_room, None):
+                if s_votes is not None:
+                    b['self_votes'] = s_votes
+                if w_type in (2, -1):
+                    b['self_winner'] = 1 if w_type == 2 else 0
+                elif w_type in (1, 3) and b['self_winner'] is None:
+                    b['self_winner'] = 0
+            elif s_room and (has_confirmed_self or s_room == b['opponent_room_id']):
+                _record_opponent(b, None, s_room, None, votes=s_votes)
+                if w_type in (2, -1) and b['self_winner'] is None:
+                    b['self_winner'] = 0 if w_type == 2 else 1
+
+    active_voice: dict[str, Any] | None = None
+    active_queue: dict[str, Any] | None = None
+    recent_queue_end_ts: float | None = None
+
+    def _flush_voice(close_ts: float, closed_by: str) -> None:
+        nonlocal active_voice
+        if active_voice is None:
+            return
+        v = active_voice
+        active_voice = None
+        clamped = _clamp_session_interval(v['start_ts'], max(v['start_ts'], close_ts), start_ts, cutoff_ts)
+        if clamped is None:
+            return
+        summary = {
+            'channel': v['channel'],
+            'channel_type': v['channel_type'],
+            'event_count': v['event_count'],
+            'had_queue_before': v['had_queue_before'],
+            'closed_by': closed_by,
+            'commands_seen': v['commands_seen'],
+        }
+        intervals.append({
+            'room_id': rid,
+            'kind': 'voice_join',
+            'start_ts': clamped[0],
+            'end_ts': clamped[1],
+            'battle_id': v['channel'],
+            'opponent_uid': v['opponent_uid'],
+            'opponent_room_id': v['opponent_room_id'],
+            'opponent_uname': v['opponent_uname'],
+            'raw_summary_json': json.dumps(summary, ensure_ascii=False, sort_keys=True),
+        })
+
+    def _flush_queue(close_ts: float, closed_by: str) -> None:
+        nonlocal active_queue, recent_queue_end_ts
+        if active_queue is None:
+            return
+        q = active_queue
+        active_queue = None
+        recent_queue_end_ts = close_ts
+        clamped = _clamp_session_interval(q['start_ts'], max(q['start_ts'], close_ts), start_ts, cutoff_ts)
+        if clamped is None:
+            return
+        summary = {
+            'max_apply_count': q['max_apply_count'],
+            'max_notify_count': q['max_notify_count'],
+            'event_count': q['event_count'],
+            'closed_by': closed_by,
+            'commands_seen': q['commands_seen'],
+        }
+        intervals.append({
+            'room_id': rid,
+            'kind': 'voice_join_queue',
+            'start_ts': clamped[0],
+            'end_ts': clamped[1],
+            'battle_id': None,
+            'opponent_uid': None,
+            'opponent_room_id': None,
+            'opponent_uname': None,
+            'raw_summary_json': json.dumps(summary, ensure_ascii=False, sort_keys=True),
+        })
+
+    for rec_ts, _, cmd, packet in ordered_rows:
+        data = packet.get('data') if isinstance(packet.get('data'), dict) else {}
+
+        if cmd in _PK_INTERVAL_COMMANDS:
+            basic = data.get('pk_basic') if isinstance(data.get('pk_basic'), dict) else {}
+            pk_id_int = pos_int(packet.get('pk_id')) or pos_int(data.get('pk_id')) or pos_int(basic.get('pk_id'))
+            if pk_id_int is None:
+                continue
+            bid = str(pk_id_int)
+            b = battles.get(bid)
+            if b is None:
+                b = {
+                    'battle_id': bid,
+                    'first_obs_ts': rec_ts,
+                    'last_obs_ts': rec_ts,
+                    'pre_ts': None,
+                    'estimated_battle_start': None,
+                    'battle_start_ts': None,
+                    'planned_end_ts': None,
+                    'explicit_battle_end_ts': None,
+                    'info_settle_ts': None,
+                    'sprint_duration': 10,
+                    'saw_active_battle': False,
+                    'punish_seen': False,
+                    'punish_start_ts': None,
+                    'planned_punish_end_ts': None,
+                    'actual_punish_end_ts': None,
+                    'punish_text': None,
+                    'muti_pk_type': None,
+                    'opponent_uid': None,
+                    'opponent_room_id': None,
+                    'opponent_uname': None,
+                    'opponents': {},
+                    'self_votes': None,
+                    'opponent_votes': None,
+                    'self_winner': None,
+                    'commands_seen': [],
+                }
+                battles[bid] = b
+            b['last_obs_ts'] = max(b['last_obs_ts'], rec_ts)
+            if cmd not in b['commands_seen']:
+                b['commands_seen'].append(cmd)
+
+            pkt_ts = _ts_from_proto_or_json(packet.get('timestamp') or data.get('timestamp'), rec_ts)[0]
+
+            if cmd in ('PK_BATTLE_PRE_NEW', 'PK_BATTLE_PRE'):
+                b['saw_active_battle'] = True
+                b['pre_ts'] = pkt_ts if b['pre_ts'] is None else min(b['pre_ts'], pkt_ts)
+                pre_timer = pos_int(data.get('pre_timer'))
+                if pre_timer and b['estimated_battle_start'] is None:
+                    b['estimated_battle_start'] = pkt_ts + pre_timer
+                opp_room_int = pos_int(data.get('room_id'))
+                _record_opponent(
+                    b,
+                    pos_int(data.get('uid')),
+                    str(opp_room_int) if opp_room_int else None,
+                    clean_uname(data.get('uname')),
+                )
+
+            elif cmd in ('PK_BATTLE_START_NEW', 'PK_BATTLE_START'):
+                b['saw_active_battle'] = True
+                s_ts = _ts_from_proto_or_json(data.get('pk_start_time'), pkt_ts)[0]
+                b['battle_start_ts'] = s_ts if b['battle_start_ts'] is None else min(b['battle_start_ts'], s_ts)
+                e_raw = pos_int(data.get('pk_frozen_time')) or pos_int(data.get('pk_end_time'))
+                if e_raw:
+                    b['planned_end_ts'] = float(e_raw)
+                _update_side_pair(b, data)
+
+            elif cmd in ('PK_BATTLE_PROCESS_NEW', 'PK_BATTLE_PROCESS'):
+                b['saw_active_battle'] = True
+                _update_side_pair(b, data)
+
+            elif cmd in ('PK_BATTLE_END', 'PK_BATTLE_SETTLE_NEW'):
+                b['saw_active_battle'] = True
+                if b['explicit_battle_end_ts'] is None or pkt_ts < b['explicit_battle_end_ts']:
+                    b['explicit_battle_end_ts'] = pkt_ts
+                _update_side_pair(b, data)
+                if cmd == 'PK_BATTLE_SETTLE_NEW':
+                    p_end_plan = pos_int(data.get('punish_end_time'))
+                    if p_end_plan:
+                        b['planned_punish_end_ts'] = float(p_end_plan)
+                    pname = clean_uname(data.get('punish_name'))
+                    if pname:
+                        b['punish_text'] = pname
+
+            elif cmd == 'PK_BATTLE_ABNORMAL':
+                b['saw_active_battle'] = True
+                if b['explicit_battle_end_ts'] is None or pkt_ts < b['explicit_battle_end_ts']:
+                    b['explicit_battle_end_ts'] = pkt_ts
+
+            elif cmd == 'PK_BATTLE_VIDEO_PUNISH_BEGIN':
+                b['punish_seen'] = True
+                b['punish_start_ts'] = pkt_ts if b['punish_start_ts'] is None else min(b['punish_start_ts'], pkt_ts)
+                if b['explicit_battle_end_ts'] is None:
+                    b['explicit_battle_end_ts'] = pkt_ts
+                vp = data.get('video_punish') if isinstance(data.get('video_punish'), dict) else {}
+                dur = pos_int(vp.get('duration'))
+                if dur:
+                    b['planned_punish_end_ts'] = pkt_ts + dur
+                pname = clean_uname(vp.get('punish_name'))
+                if pname:
+                    b['punish_text'] = pname
+                _update_side_pair(b, data)
+
+            elif cmd == 'PK_BATTLE_PUNISH_END':
+                b['actual_punish_end_ts'] = pkt_ts
+
+            elif cmd == 'PK_INFO':
+                st_code = nonneg_int(basic.get('status'))
+                b_start = pos_int(basic.get('start_time'))
+                b_end = pos_int(basic.get('end_time'))
+                b_pend = pos_int(basic.get('punish_end_time'))
+                sprint = pos_int(basic.get('sprint_duration'))
+                if sprint:
+                    b['sprint_duration'] = sprint
+                mtype = nonneg_int(basic.get('muti_pk_type'))
+                if mtype is not None:
+                    b['muti_pk_type'] = mtype
+                ptext = clean_uname(basic.get('punish_text'))
+                if ptext and b['punish_text'] is None:
+                    b['punish_text'] = ptext
+                pk_play = data.get('pk_play') if isinstance(data.get('pk_play'), dict) else {}
+                pre_dur = nonneg_int(pk_play.get('pre_duration'))
+                if b_start:
+                    if b['pre_ts'] is None:
+                        b['pre_ts'] = float(b_start)
+                    if pre_dur is not None and b['estimated_battle_start'] is None:
+                        b['estimated_battle_start'] = float(b_start + pre_dur)
+                if b_end:
+                    b['planned_end_ts'] = float(b_end)
+                if b_pend:
+                    b['planned_punish_end_ts'] = float(b_pend)
+
+                members = data.get('members')
+                if isinstance(members, list):
+                    for mem in members:
+                        if not isinstance(mem, dict):
+                            continue
+                        m_uid = pos_int(mem.get('uid'))
+                        m_room_int = pos_int(mem.get('room_id'))
+                        m_room = str(m_room_int) if m_room_int else None
+                        m_uname = clean_uname(mem.get('uname'))
+                        m_votes = nonneg_int(mem.get('votes'))
+                        m_win = nonneg_int(mem.get('is_winner'))
+                        if _is_self(m_room, m_uid):
+                            if m_room and m_room not in self_rooms:
+                                _purge_self_from_opponents(b, m_room)
+                            if m_votes is not None:
+                                b['self_votes'] = m_votes
+                            if m_win in (0, 1) and st_code is not None and st_code >= 304:
+                                b['self_winner'] = m_win
+                        else:
+                            _record_opponent(b, m_uid, m_room, m_uname, votes=m_votes)
+
+                if st_code in (101, 201, 301, 304, 401, 404, 501):
+                    b['saw_active_battle'] = True
+                if st_code in (304, 401, 404, 501) and b['info_settle_ts'] is None:
+                    b['info_settle_ts'] = rec_ts
+                elif st_code in (601, 602, 610):
+                    b['punish_seen'] = True
+                    if b['punish_start_ts'] is None:
+                        b['punish_start_ts'] = rec_ts
+                    if b['info_settle_ts'] is None:
+                        b['info_settle_ts'] = rec_ts
+                elif st_code == 1001:
+                    if b['punish_seen'] and b['actual_punish_end_ts'] is None:
+                        b['actual_punish_end_ts'] = rec_ts
+                    if b['info_settle_ts'] is None:
+                        b['info_settle_ts'] = rec_ts
+
+        elif cmd == 'VOICE_JOIN_STATUS':
+            st = nonneg_int(data.get('status'))
+            cur_ts = _ts_from_proto_or_json(data.get('current_time'), rec_ts)[0]
+            if st == 1:
+                if active_queue is not None:
+                    _flush_queue(cur_ts, 'voice_connected')
+                s_at = pos_int(data.get('start_at'))
+                v_start = float(s_at) if s_at else cur_ts
+                mystery = bool(data.get('is_mystery'))
+                opp_uid = None if mystery else pos_int(data.get('uid'))
+                opp_uname = '神秘人' if mystery else clean_uname(data.get('user_name') or data.get('uname'))
+                opp_room_int = pos_int(data.get('room_id'))
+                opp_room = (
+                    str(opp_room_int)
+                    if opp_room_int and not _is_self(str(opp_room_int), opp_uid)
+                    else None
+                )
+                channel = clean_uname(data.get('channel'))
+                ctype = clean_uname(data.get('channel_type')) or 'voice'
+                if active_voice is not None:
+                    same_peer = (
+                        (channel and active_voice['channel'] == channel)
+                        or (opp_uid and active_voice['opponent_uid'] == opp_uid)
+                    )
+                    if same_peer:
+                        active_voice['event_count'] += 1
+                        if opp_uid and active_voice['opponent_uid'] is None:
+                            active_voice['opponent_uid'] = opp_uid
+                        if opp_uname and active_voice['opponent_uname'] is None:
+                            active_voice['opponent_uname'] = opp_uname
+                        continue
+                    _flush_voice(cur_ts, 'switched_speaker')
+                had_q = bool(recent_queue_end_ts is not None and abs(cur_ts - recent_queue_end_ts) <= 60.0)
+                active_voice = {
+                    'start_ts': v_start,
+                    'channel': channel,
+                    'channel_type': ctype,
+                    'opponent_uid': opp_uid,
+                    'opponent_room_id': opp_room,
+                    'opponent_uname': opp_uname,
+                    'event_count': 1,
+                    'had_queue_before': had_q,
+                    'commands_seen': [cmd],
+                }
+            elif st == 0:
+                _flush_voice(cur_ts, 'status_off')
+
+        elif cmd in ('VOICE_JOIN_LIST', 'VOICE_JOIN_ROOM_COUNT_INFO'):
+            joined_list = data.get('list')
+            if isinstance(joined_list, list) and joined_list and active_voice is None:
+                first_j = next((item for item in joined_list if isinstance(item, dict)), None)
+                if first_j is not None:
+                    mystery = bool(first_j.get('is_mystery'))
+                    j_uid = None if mystery else pos_int(first_j.get('uid'))
+                    j_name = '神秘人' if mystery else clean_uname(first_j.get('user_name') or first_j.get('uname'))
+                    active_voice = {
+                        'start_ts': rec_ts,
+                        'channel': clean_uname(first_j.get('channel')),
+                        'channel_type': 'voice',
+                        'opponent_uid': j_uid,
+                        'opponent_room_id': None,
+                        'opponent_uname': j_name,
+                        'event_count': 1,
+                        'had_queue_before': active_queue is not None,
+                        'commands_seen': [cmd],
+                    }
+            apply_cnt = nonneg_int(data.get('apply_count')) or 0
+            notify_cnt = nonneg_int(data.get('notify_count')) or 0
+            if apply_cnt > 0 or notify_cnt > 0:
+                if active_voice is None:
+                    if active_queue is None:
+                        active_queue = {
+                            'start_ts': rec_ts,
+                            'max_apply_count': apply_cnt,
+                            'max_notify_count': notify_cnt,
+                            'event_count': 1,
+                            'commands_seen': [cmd],
+                        }
+                    else:
+                        active_queue['max_apply_count'] = max(active_queue['max_apply_count'], apply_cnt)
+                        active_queue['max_notify_count'] = max(active_queue['max_notify_count'], notify_cnt)
+                        active_queue['event_count'] += 1
+                        if cmd not in active_queue['commands_seen']:
+                            active_queue['commands_seen'].append(cmd)
+            elif active_queue is not None:
+                _flush_queue(rec_ts, 'queue_cleared')
+
+    if active_voice is not None:
+        _flush_voice(cutoff_ts, 'session_cutoff')
+    if active_queue is not None:
+        _flush_queue(cutoff_ts, 'session_cutoff')
+
+    for b in battles.values():
+        eff_b_start = b['battle_start_ts'] or b['estimated_battle_start']
+        pk_candidates = [x for x in (b['pre_ts'], eff_b_start) if x is not None]
+        pk_start = min(pk_candidates) if pk_candidates else b['first_obs_ts']
+
+        if b['explicit_battle_end_ts'] is not None:
+            pk_end = b['explicit_battle_end_ts']
+        elif b['info_settle_ts'] is not None:
+            if b['planned_end_ts'] is not None and b['info_settle_ts'] > b['planned_end_ts'] + 15.0:
+                pk_end = b['planned_end_ts']
+            else:
+                pk_end = b['info_settle_ts']
+        elif b['planned_end_ts'] is not None:
+            pk_end = b['planned_end_ts']
+        else:
+            pk_end = b['last_obs_ts']
+
+        emit_pk = b['saw_active_battle'] or (
+            b['planned_end_ts'] is not None and b['planned_end_ts'] > start_ts and pk_start < pk_end
+        )
+        if emit_pk:
+            clamped_pk = _clamp_session_interval(pk_start, max(pk_start, pk_end), start_ts, cutoff_ts)
+            if clamped_pk is not None:
+                ref_end = b['planned_end_ts'] or clamped_pk[1]
+                ref_start = eff_b_start or clamped_pk[0]
+                sprint_start = (
+                    max(ref_start, ref_end - b['sprint_duration'])
+                    if ref_end > ref_start
+                    else None
+                )
+                pk_summary = {
+                    'pre_start_ts': b['pre_ts'],
+                    'battle_start_ts': eff_b_start,
+                    'planned_end_ts': b['planned_end_ts'],
+                    'sprint_duration': b['sprint_duration'],
+                    'sprint_start_ts': sprint_start,
+                    'self_votes': b['self_votes'],
+                    'opponent_votes': b['opponent_votes'],
+                    'self_winner': b['self_winner'],
+                    'muti_pk_type': b['muti_pk_type'],
+                    'opponents': list(b['opponents'].values()),
+                    'commands_seen': b['commands_seen'],
+                }
+                intervals.append({
+                    'room_id': rid,
+                    'kind': 'pk',
+                    'start_ts': clamped_pk[0],
+                    'end_ts': clamped_pk[1],
+                    'battle_id': b['battle_id'],
+                    'opponent_uid': b['opponent_uid'],
+                    'opponent_room_id': b['opponent_room_id'],
+                    'opponent_uname': b['opponent_uname'],
+                    'raw_summary_json': json.dumps(pk_summary, ensure_ascii=False, sort_keys=True),
+                })
+
+        if b['punish_seen']:
+            p_start = b['punish_start_ts'] or pk_end
+            if b['actual_punish_end_ts'] is not None and b['actual_punish_end_ts'] >= p_start:
+                p_end = b['actual_punish_end_ts']
+            elif b['planned_punish_end_ts'] is not None and b['planned_punish_end_ts'] >= p_start:
+                p_end = b['planned_punish_end_ts']
+            else:
+                p_end = max(p_start, b['last_obs_ts'])
+            clamped_punish = _clamp_session_interval(p_start, p_end, start_ts, cutoff_ts)
+            if clamped_punish is not None:
+                punish_summary = {
+                    'punish_text': b['punish_text'],
+                    'planned_punish_end_ts': b['planned_punish_end_ts'],
+                    'self_votes': b['self_votes'],
+                    'opponent_votes': b['opponent_votes'],
+                    'self_winner': b['self_winner'],
+                    'opponents': list(b['opponents'].values()),
+                    'commands_seen': b['commands_seen'],
+                }
+                intervals.append({
+                    'room_id': rid,
+                    'kind': 'pk_punish',
+                    'start_ts': clamped_punish[0],
+                    'end_ts': clamped_punish[1],
+                    'battle_id': b['battle_id'],
+                    'opponent_uid': b['opponent_uid'],
+                    'opponent_room_id': b['opponent_room_id'],
+                    'opponent_uname': b['opponent_uname'],
+                    'raw_summary_json': json.dumps(punish_summary, ensure_ascii=False, sort_keys=True),
+                })
+
+    kind_rank = {'pk': 0, 'pk_punish': 1, 'voice_join_queue': 2, 'voice_join': 3}
+    intervals.sort(key=lambda item: (item['start_ts'], item['end_ts'], kind_rank.get(item['kind'], 9), item['battle_id'] or ''))
+    return intervals
