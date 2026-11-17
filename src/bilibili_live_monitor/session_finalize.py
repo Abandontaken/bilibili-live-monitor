@@ -26,7 +26,8 @@ def frozen_source(config):
     windows = [review_window(s, {}) for s in segments]
     identity = {'room': config['room_id'], 'start': config['start_utc'], 'cutoff': cutoff, 'windows': windows}
     ident = hashlib.sha256(json.dumps(identity, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
-    corrections, _ = correction_context(Path(config['workspace']), source)
+    corrections, _ = correction_context(Path(config['workspace']), source,
+                                        warehouse_database=config.get('warehouse_database'))
     segments = [{**s, **corrections.get(s['seq'], {})} for s in segments]
     windows = [review_window(s, corrections) for s in segments]
     return ident, source, segments, windows
@@ -35,7 +36,8 @@ def frozen_source(config):
 def corrections(config):
     """终审总会话使用的当前校正版与待重审窗口，不修改冻结原稿。"""
     _, source, segments, _ = frozen_source(config)
-    _, info = correction_context(Path(config['workspace']), source)
+    _, info = correction_context(Path(config['workspace']), source,
+                                 warehouse_database=config.get('warehouse_database'))
     annotations = read_annotations(config['workspace'])
     rows = {r.get('seq'): r for r in annotations.get('reviews', []) if isinstance(r, dict)}
     active = [review_window(s, {s['seq']: {k: s[k] for k in
@@ -76,9 +78,10 @@ def prepare(config):
         input_file, result_file = root / f'{name}.input.json', root / f'{name}.result.json'
         atomic_json(input_file, {'plan_id': ident, 'target_seqs': [s['seq'] for s in targets],
             'windows': [w for w in windows if lower <= epoch(w['end']) and epoch(w['start']) <= upper],
-            'danmaku': danmaku_context(source, lower, upper)})
+            'danmaku': danmaku_context(source, lower, upper,
+                                       warehouse_database=config.get('warehouse_database'))})
         shards.append({'input': str(input_file), 'result': str(result_file), 'targets': len(targets)})
-    _, info = correction_context(root.parent, source)
+    _, info = correction_context(root.parent, source, warehouse_database=config.get('warehouse_database'))
     atomic_json(root / 'context.json', {'windows': windows, 'events': source['items'],
                 'evidence': followup_evidence(source), 'correction_context': info})
     plan = {'id': ident, 'shards': shards, 'concurrency': config.get('final_concurrency', 10),

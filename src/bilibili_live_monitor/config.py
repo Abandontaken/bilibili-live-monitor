@@ -1,5 +1,7 @@
 import json
+import math
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -9,7 +11,11 @@ from dotenv import load_dotenv
 @dataclass
 class Settings:
     automation_config: str = field(default_factory=lambda: os.getenv('AUTOMATION_CONFIG', ''))
+    capture_backend: str = field(default_factory=lambda: os.getenv('CAPTURE_BACKEND', 'cdp').strip().lower() or 'cdp')
     record_mode: str = field(default_factory=lambda: os.getenv('RECORD_MODE', 'audio'))
+    audio_format: str = field(default_factory=lambda: os.getenv('AUDIO_FORMAT', '').strip().lower())
+    audio_bitrate: str = field(default_factory=lambda: os.getenv('AUDIO_BITRATE', '32k').strip().lower() or '32k')
+    direct_handshake_interval: float = field(default_factory=lambda: float(os.getenv('DIRECT_HANDSHAKE_INTERVAL', '2.5')))
     asr_enabled: bool = field(default_factory=lambda: os.getenv('ASR_ENABLED', '0').lower() in ('1', 'true', 'yes'))
     preview_enabled: bool = field(default_factory=lambda: os.getenv('PREVIEW_ENABLED', '0').lower() in ('1', 'true', 'yes'))
     recording_segment_seconds: int = field(default_factory=lambda: int(os.getenv('RECORDING_SEGMENT_SECONDS', '300')))
@@ -37,6 +43,23 @@ class Settings:
     babysitter_timeout_seconds: float = field(default_factory=lambda: float(os.getenv('BABYSITTER_TIMEOUT_SECONDS', '120')))
 
     def __post_init__(self):
+        if self.capture_backend not in ('cdp', 'direct'):
+            raise ValueError('采集后端需为cdp或direct')
+        if not self.audio_format:
+            self.audio_format = 'opus' if self.capture_backend == 'direct' else 'wav'
+        if self.audio_format not in ('wav', 'mka', 'opus'):
+            raise ValueError('音频保存格式需为wav、mka或opus')
+        if not re.fullmatch(r'[1-9]\d{0,3}k', self.audio_bitrate):
+            raise ValueError('音频码率格式无效，例如32k')
+        if not math.isfinite(self.direct_handshake_interval) or self.direct_handshake_interval < 0:
+            raise ValueError('直连建连间隔不得为负数')
+        if self.capture_backend == 'direct':
+            if self.audio_format == 'wav':
+                raise ValueError('direct模式无浏览器页面，音频保存格式需为opus或mka')
+            if self.asr_enabled:
+                raise ValueError('direct模式仅支持下播离线转写，不启用实时ASR')
+            if self.preview_enabled:
+                raise ValueError('direct模式无浏览器页面，不支持缩略图预览')
         if self.record_mode not in ('none', 'audio', 'video') or not 10 <= self.recording_segment_seconds <= 3600:
             raise ValueError('保存模式需为none/audio/video；录制分段需为10～3600秒')
         if not 5 <= self.chunk_seconds <= 60 or self.max_rooms < 1 or self.queue_size < 1:

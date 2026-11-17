@@ -22,7 +22,7 @@ def recover(row, workspace):
     """仅用于单场稳定封口后、AI输入冻结前；非此类失败保持原错误。"""
     source = Path(row['path'])
     if (row.get('sealed') != 'unsealed_or_incomplete' or not row.get('audio_codec')
-            or row.get('duration_sec') is not None or source.suffix not in ('.mkv', '.mka')):
+            or row.get('duration_sec') is not None or source.suffix not in ('.mkv', '.mka', '.opus')):
         return row
     workspace = Path(workspace)
     if (workspace / 'finalize/plan.json').exists() or (workspace / 'talk_finalize/plan.json').exists():

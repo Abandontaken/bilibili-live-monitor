@@ -39,6 +39,10 @@ def validate_settings(config, rooms):
             raise ValueError('cursor_cli_grok须显式设置final_model，禁止继承实时模型')
         if config.get('finalize_parallel', True) is not True:
             raise ValueError('Cursor分片须启用finalize_parallel')
+    if 'warehouse_database' in config and config['warehouse_database'] is not None:
+        wh = config['warehouse_database']
+        if not isinstance(wh, str) or not wh.strip() or not Path(wh).is_absolute():
+            raise ValueError('session_workflow.warehouse_database须为绝对路径')
     if not config.get('enabled'):
         return
     if type(config.get('finalize_parallel', True)) is not bool:
@@ -163,6 +167,8 @@ class SessionWorkflows:
                       final_subagent=cfg.get('final_subagent', 'general'))
         if 'final_model' in cfg:
             config['final_model'] = cfg['final_model']
+        if cfg.get('warehouse_database'):
+            config['warehouse_database'] = cfg['warehouse_database']
         audience = cfg.get('audience_crm', {}).get(rid)
         if audience:
             if not isinstance(audience, str) or not Path(audience).is_absolute():

@@ -7,6 +7,8 @@ from .store import utc_now
 
 
 async def room_statuses(browser, candidates):
+    if hasattr(browser, 'room_statuses'):
+        return await browser.room_statuses(candidates)
     queries = list(candidates) + [{'url': c['room_id']} for c in candidates if c.get('room_id')]
     context = await browser.connect()
     result = await inspect(context, queries)
@@ -33,6 +35,8 @@ async def room_statuses(browser, candidates):
 
 
 async def guard_snapshot(browser, room_id, anchor_uid):
+    if hasattr(browser, 'guard_snapshot'):
+        return await browser.guard_snapshot(room_id, anchor_uid)
     context = await browser.connect()
     members, unresolved, raw_pages, total, pages = {}, [], [], None, 1
     for page in range(1, 101):

@@ -259,7 +259,8 @@ def advance(config, state, now):
         source = read_session_source(config)
         from .session_finalize import reviewed as is_reviewed
         from .transcript_corrections import correction_context
-        corrections, _ = correction_context(workspace, source)
+        corrections, _ = correction_context(workspace, source,
+                                            warehouse_database=config.get('warehouse_database'))
         from .annotation_history import read_annotations
         reviews = read_annotations(workspace).get('reviews', [])
         reviewed = {r.get('seq'): r for r in reviews if isinstance(r, dict)}

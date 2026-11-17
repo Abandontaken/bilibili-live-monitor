@@ -1,5 +1,13 @@
 # 工作记录
 
+## 免 Chrome 匿名直连采集、Opus 32kbps 离线链路与弹幕实名叠加（2026-11-17）
+
+- `config.py` 新增实例级 `CAPTURE_BACKEND`（`'cdp'` | `'direct'`，默认 `'cdp'` 保持实名与网页采音行为不变）、`AUDIO_FORMAT`（`'wav'` | `'mka'` | `'opus'`，`direct` 下默认 `'opus'`，`cdp` 下默认 `'wav'`）、`AUDIO_BITRATE`（默认 `'32k'`）及全局异步建连限速 `DIRECT_HANDSHAKE_INTERVAL`（默认 `2.5` 秒）。`direct` 模式强制仅用于 `anonymous` 未登录只读采集，拒绝 `welcome` / `like` 浏览器互动及实时网页 ASR/预览，`runtime.py`、`accounts.py` 与 `automation.py` 均不启动、不管理或连接 Chrome 进程。
+- 新增 `direct_client.py` 并接入 `room_status.py`、`platform.py`、`monitor.py`：通过 `httpx.AsyncClient` 缓存游客 `buvid3`/`buvid4` 与 WBI 签名（12 小时缓存及遇签名失效自动刷新一次重试），免 CDP 完成开播巡检、老房间长短号映射（采集与媒体保持页面短号契约，拉流与鉴权使用真实长号，兼容 `session_workflow.py`）与大航海榜单快照；纯标准库 `asyncio + ssl + certifi` RFC 6455 客户端在 HTTP 鉴权与每一次实际 WSS 握手（含备用主机回退）处均执行全局限速锁，完成 Op7/Op8 逐包认证、Op2 心跳、分片重组、控制帧穿插与 RFC 6455 帧头校验，外层二进制消息（含 `Op8+Op5` 与 `Op3+Op5` 合包）直接交由 `dispatch_messages(..., include_raw=True)` 写入 `Store.live_message`。
+- 打通 `.opus` 全链路录制与离线转写：`recording.py` 支持 `libopus` 48kHz 单声道 32kbps VBR 按 Ogg 分段输出 `<prefix>-%05d.opus`，并同步更新 `recording.py`、`pcm_recording.py`、`session_offline.py`、`offline_asr.py` 与 `media_recovery.py` 的媒体后缀白名单与时长探测回退。
+- `finalize_context.py`、`talk_finalize.py`、`session_finalize.py`、`transcript_corrections.py`、`session_timeline.py`、`warehouse.py` 与 `audience_crm.py` 支持对打码弹幕昵称（不含 `神秘人`）自动只读构建本场 `raw_events` 明文身份池，并在单场配置可选 `warehouse_database`（由 `session_workflow.py` 透传，以 `?mode=ro` 只读打开）时查询 `dim_users` / `dim_user_faces` 补齐跨场已知真名，贯通终审校验与最终时间线、数仓入库及观众档案消费；`talk_finalize.prepare` 固化数仓命中映射以保证外部数仓增量同步不影响已冻结计划指纹，源数据库零写入。同时解耦 `finalize_lifecycle.py` 续跑提示词，兼容 OpenCode 原生 `final_subagent`（如 `general` + `qwen38/qwen3.8-27b` / `ollama-cloud/glm-5.3-flash`）与既有 `cursor_cli_grok` 双路由闭环。
+- 验证：Python 全套 1404 passed、1 skipped，Ruff `src/tests/scripts` 通过，前端 TypeScript / Vite 构建、Node 8 项与 Vitest 70 项通过，隔离 Chrome 音频隔离脚本 `verify_isolation.py` 通过；本机真实在播公开房间 35 秒免 Chrome `direct` + `.opus` 隔离烟测完成，证据与独立代码/隐私/反过度设计审阅记录保存在私有 `.local/` 目录。
+
 ## 数仓 v2 弹幕头像线索、房间状态/PK连麦表与数据库口径防坑指南（2026-11-17）
 
 - `warehouse_protocol.py` 与 `warehouse.py` 升级至 `EXTRACTOR_VERSION = 2`，执行 `bili-live warehouse sync` 时对已有 v1 数仓平滑建表、升级源库游标补扫历史弹幕头像、替换视图并自动重入旧版已完成场次，`warehouse stats` 新增 `room_metric_rows`、`cohost_intervals`、`cohost_intervals_by_kind`、`danmaku_resolution_basis` 与 `danmaku_with_face_clue` 统计。

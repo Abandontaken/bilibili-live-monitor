@@ -116,9 +116,11 @@ python -m bilibili_live_monitor.audience_crm build --config .local/example-crm.j
 
 `validate` 通过仅代表 JSON 结构与引用字段合法，不代表语义通过。接纳前核对本人归属、ASR 近音、跨场履约、原唱与主播演唱的区别，以及公开引用的必要性。局部召回没有后续记录，不等于承诺未兑现；同一入团送歌与具体点歌按同一履约链处理。
 
-### Cursor CLI 终审分片
+### 终审分片路由与匿名弹幕实名叠加
 
-音乐与杂谈终审可设置 `final_subagent: "cursor_cli_grok"`，通过本机 Launcher 托管 Cursor CLI 分片。分片固定使用 `grok-4.7-high`，总协调由显式 `final_model: "provider/model"` 独立选择，不继承实时 `model`。必须启用 `finalize_parallel`，并发上限为十；总协调审核候选并执行 `accept` 后，继续各自的合并、来源登记与完成验收。`final_model` 只控制 OpenCode 总协调，不改变 Cursor 分片模型。热加载默认值只影响后续初始化的场次，已有场次保留其冻结配置。
+音乐与杂谈终审默认使用 OpenCode 原生 `final_subagent`（如 `"general"`）配合 `final_model`（如 `"qwen38/qwen3.8-27b"` 或 `"ollama-cloud/glm-5.3-flash"`）直接通过 `task` 分片写出 `NNN.result.json` 并执行 `finish`，无需依赖 Cursor CLI。也可设置 `final_subagent: "cursor_cli_grok"`，通过本机 Launcher 托管 Cursor CLI 分片：分片固定使用 `grok-4.7-high`，总协调由显式 `final_model: "provider/model"` 独立选择，不继承实时 `model`；必须启用 `finalize_parallel`，并发上限为十，总协调审核候选并执行 `accept` 后继续合并、来源登记与完成验收。热加载默认值只影响后续初始化的场次，已有场次保留其冻结配置。
+
+`session_workflow` 支持可选配置 `warehouse_database: "/PRIVATE/live_warehouse.sqlite3"`（透传至单场 `config.json`）。生成 `talk_finalize` 与 `session_finalize` 的纠错旁证 `danmaku` 时，若弹幕昵称为匿名打码格式（如 `某***`，不含 `神秘人`），程序自动只读构建本场 `raw_events` 明文身份池并按需只读查询数仓 `dim_users` / `dim_user_faces`，将解出的真实昵称填入分片输入供同音字纠错引用，不修改源库 `monitor.sqlite3`。
 
 ### 整场文件式查证（可选）
 

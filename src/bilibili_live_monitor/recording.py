@@ -1,4 +1,4 @@
-"""原始压缩包分段录制；音频模式不解码视频、不重编码音频。"""
+"""原始压缩包或Opus分段录制；音频模式不解码视频。"""
 import asyncio
 import re
 import signal
@@ -6,6 +6,11 @@ import time
 import uuid
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
+
+DEFAULT_USER_AGENT = (
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+    'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+)
 
 
 def is_media_url(url):
@@ -16,13 +21,22 @@ def is_media_url(url):
             parsed.path.endswith(('.flv', '.m3u8')))
 
 
-def command(url, room_url, mode, destination, seconds):
+def command(url, room_url, mode, destination, seconds, *, audio_format='mka', audio_bitrate='32k',
+            user_agent=DEFAULT_USER_AGENT):
+    use_opus = mode == 'audio' and (audio_format == 'opus' or str(destination).endswith('.opus'))
     maps = ['-map', '0:a:0', '-vn'] if mode == 'audio' else ['-map', '0:v:0', '-map', '0:a:0']
-    network = (['-rw_timeout', '15000000', '-headers', f'Referer: {room_url}\r\n']
+    headers = f'Referer: {room_url}\r\nUser-Agent: {user_agent}\r\n' if user_agent else f'Referer: {room_url}\r\n'
+    network = (['-rw_timeout', '15000000', '-headers', headers]
                if urlsplit(url).scheme in ('http', 'https') else [])
-    return ['ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'warning', *network, '-i', url, *maps, '-c', 'copy',
-            '-f', 'segment', '-segment_time', str(seconds), '-reset_timestamps', '1',
-            '-segment_format', 'matroska', '-progress', 'pipe:1', str(destination)]
+    if use_opus:
+        codec_and_mux = ['-ac', '1', '-c:a', 'libopus', '-b:a', audio_bitrate, '-vbr', 'on',
+                         '-f', 'segment', '-segment_time', str(seconds), '-reset_timestamps', '1',
+                         '-segment_format', 'ogg']
+    else:
+        codec_and_mux = ['-c', 'copy', '-f', 'segment', '-segment_time', str(seconds),
+                         '-reset_timestamps', '1', '-segment_format', 'matroska']
+    return ['ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'warning', *network,
+            '-i', url, *maps, *codec_and_mux, '-progress', 'pipe:1', str(destination)]
 
 
 class Recording:
@@ -43,11 +57,18 @@ class Recording:
 
     async def start(self, url):
         self.directory.mkdir(parents=True, exist_ok=True)
-        extension = 'mka' if self.room['record_mode'] == 'audio' else 'mkv'
+        requested_fmt = self.room.get('audio_format') or getattr(self.settings, 'audio_format', 'mka')
+        if self.room['record_mode'] == 'audio':
+            audio_format = 'opus' if requested_fmt == 'opus' else 'mka'
+            extension = audio_format
+        else:
+            audio_format = 'mka'
+            extension = 'mkv'
         destination = self.directory / f'{self.prefix}-%05d.{extension}'
         self.process = await asyncio.create_subprocess_exec(
             *command(url, self.room['url'], self.room['record_mode'], destination,
-                     self.settings.recording_segment_seconds),
+                     self.settings.recording_segment_seconds, audio_format=audio_format,
+                     audio_bitrate=getattr(self.settings, 'audio_bitrate', '32k')),
             stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         self.tasks = [asyncio.create_task(self.read_progress()), asyncio.create_task(self.read_errors())]
 
@@ -73,7 +94,7 @@ class Recording:
 
     def snapshot(self):
         files = [p for p in self.directory.glob(f'{self.session}-*')
-                 if p.suffix in ('.wav', '.mkv', '.mka') and p.is_file()]
+                 if p.suffix in ('.wav', '.mkv', '.mka', '.opus') and p.is_file()]
         return {'recording_status': 'recording' if self.progress_seconds > 0 else 'starting',
                 'recorded_seconds': round(self.base_seconds + self.progress_seconds, 3),
                 'recording_files': len(files), 'recording_bytes': sum(p.stat().st_size for p in files)}

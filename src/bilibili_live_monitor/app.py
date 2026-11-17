@@ -82,7 +82,7 @@ def create_app(settings=None):
     settings = settings or load_settings()
     config = json.loads(Path(settings.automation_config).read_text()) if settings.automation_config else {}
     validate_rooms(config.get('rooms', {}))
-    paths = [Path(p['path']).expanduser().resolve() for p in config.get('profiles', {}).values()]
+    paths = [Path(p['path']).expanduser().resolve() for p in config.get('profiles', {}).values() if 'path' in p]
     if len(paths) != len(set(paths)):
         raise ValueError('不同账号必须使用不同profile目录')
 
@@ -147,6 +147,8 @@ def create_app(settings=None):
             return await app.state.automation.set_enabled(room_id, body.enabled)
         except KeyError as error:
             raise HTTPException(404, '未配置此房间') from error
+        except ValueError as error:
+            raise HTTPException(409, str(error)) from error
 
     @app.get('/api/automation/rooms/{room_id}/copy', summary='读取本房间当前欢迎文案')
     async def welcome_copy(room_id: str):
@@ -307,7 +309,9 @@ def create_app(settings=None):
         if not 1 <= limit <= 200:
             raise HTTPException(422, 'limit需为1～200')
         try:
-            return await app.state.monitor.browser.discover(limit)
+            monitor = app.state.monitor
+            transport = monitor.direct if monitor.direct is not None else monitor.browser
+            return await transport.discover(limit)
         except Exception as error:
             raise HTTPException(502, f'{type(error).__name__}: {error}') from error
 
