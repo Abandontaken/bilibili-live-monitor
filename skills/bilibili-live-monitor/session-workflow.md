@@ -219,6 +219,8 @@ python -m bilibili_live_monitor.broadcast_email --env-file /PRIVATE/notify.env -
 
 ## 恢复与验收
 
+稳定零字节源只在封口和身份核验后从有效媒体清单排除，原件、身份与估计缺口保留在 `offline/manifest.json` 的 `excluded_empty_sources`；有效分片继续ASR，无有效媒体标为 `attention` / `media_status=no_media`。程序Runner与CRM Watch负责idle协调接续（最多3次、间隔300秒，busy跳过），不让Agent自建临时Timer。`supervision.json` 记录发送意图与同会话marker核验；未知发送状态不自动重投。成功后协调清理有120秒宽限，随后执行原stop和再验收。有效终审完成凭证可取得一次600秒publish-only期限，仅用于收尾发布、不允许新派发或无限延期；人工暂停仍须先核现场再显式恢复。CRM发布前须核对接纳版本与current事务一致。
+
 | 操作 | 命令/文件 | 约束 |
 |---|---|---|
 | 直播中回填预检 | `python -m bilibili_live_monitor.session_backfill --config /PRIVATE/sessions/SESSION/config.json --dry-run` | 只选已封口素材，不推进场次状态 |

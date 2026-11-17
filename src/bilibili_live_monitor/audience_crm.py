@@ -443,6 +443,27 @@ def _prepare(config, material):
     return directory, plan
 
 
+def verify_accepted(config, directory, plan_id):
+    """只读核对接纳版本和current事务，避免accepted落盘后中断却发布旧current。"""
+    directory = Path(directory).resolve()
+    root = Path(config['workspace']).resolve()
+    if directory.parent != root / 'runs' or directory.name != plan_id:
+        raise ValueError('CRM接纳目录身份错误')
+    plan = json.loads((directory / 'plan.json').read_text())
+    material = json.loads((directory / 'material.json').read_text())
+    accepted = json.loads((directory / 'accepted.json').read_text())
+    current = json.loads((root / 'current.json').read_text())
+    if (plan['id'] != plan_id or digest(material) != plan_id or accepted != current
+            or accepted.get('plan_id') != plan_id or accepted.get('room_id') != config['room_id']
+            or accepted.get('scope') != config['scope'] or material['room_id'] != config['room_id']
+            or material['scope'] != config['scope']
+            or accepted.get('material') != str(directory / 'material.json')):
+        raise ValueError('CRM接纳凭证或current指针不匹配')
+    from .audience_sources import verify_sources
+    verify_sources(directory, material)
+    return accepted
+
+
 def finish(config, directory):
     directory = Path(directory).resolve()
     from .cursor_finalize import require_run_stopped

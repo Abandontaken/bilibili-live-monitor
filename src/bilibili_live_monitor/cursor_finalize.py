@@ -492,8 +492,6 @@ def coordinator_prompt(config, prompt, root):
     else:
         prompt = prompt.replace(f"再用task分发给{plan['subagent']}，最多同时{plan['concurrency']}片。", '分片使用Cursor CLI执行。')
         prompt = prompt.replace('所有task实际结束', '所有Cursor进程实际退出')
-    prompt = prompt.replace('不要创建定时任务', '不要创建与本场监督无关的定时任务')
-    prompt = prompt.replace('禁止定时任务、', '禁止与本场监督无关的定时任务、')
     final_steps = ('最终逐条检查纠错候选真实引文、跨片歌名及边界，拒绝官方歌词替代改词/漏听。所有Cursor已退出后继续原合同的merge、来源登记、corrections逐条重审、正常finish。'
                    if kind == 'finalize' else
                    '最终逐条检查校正真实引文、覆盖和跨片用词一致性，保留未确定内容。所有Cursor已退出后仅按原合同执行talk_finalize finish，不执行音乐merge、歌曲来源登记或corrections。')
@@ -504,7 +502,7 @@ def coordinator_prompt(config, prompt, root):
 执行后端为Cursor CLI Grok（不是OpenCode task子代理），模型固定{MODEL}，总协调由OpenCode完成。
 先读plan.json，按片调用 `{command} --shard 000`（000替换实际编号）。此命令通过本机Process Launcher启动拥有wait/超时/日志/退出码的单片适配器，短时返回，不是另一个总协调。
 最多同时{plan['concurrency']}片且不超过10；所有就绪片同批启动，不串行等待单片。已存在结果不重跑，须先按原合同核验；每片只有一个调用者。start发送不明或失败时先查原launch/状态和进程，不删除回执重投。
-进度和回执在{root / 'cursor_workers'}的逐片JSON、stdout.jsonl、stderr.log；stream init含CLI session_id。用短工具读日志/结果并更新可见todo，不把长前台CLI塞进短bash，不用sleep占满工具预算。必要时在本总会话安排唯一有界回访，完成即停链（此处允许仅用于监督本任务的回访，其他定时行为仍禁止）。
+进度和回执在{root / 'cursor_workers'}的逐片JSON、stdout.jsonl、stderr.log；stream init含CLI session_id。用短工具读日志/结果并更新可见todo，不把长前台CLI塞进短bash，不用sleep占满工具预算。程序负责同会话回访，不创建临时脚本或定时任务。
 明确failed/interrupted的片，先确认无前次写入者，可将start改为retry（其他参数不变）；程序锁定分片、拒绝尚存进程组、归档旧证据，最多两次恢复，优先--resume原CLI UUID且模型不变。发送不明不使用retry；已成功但内容有疑点先报告，由你按原证据保守审核，不能把失败文件手工转正。
 每片45分钟，Launcher留清理余量；非零退出、模型/认证错误或无success回执不能当成功。只允许同模型有界人工检查恢复，不自动降级。文件存在、日志增长或进程存活不等于有效进展。
 你必须逐片核对退出码0、最终result/success/is_error=false、目标覆盖、plan_id/fingerprint和内容语义后，调用同一CLI的accept操作（将start改为accept，其他参数不变）验收转正；不能直接复制文件或自行修改回执。worker不直接写生产结果。
