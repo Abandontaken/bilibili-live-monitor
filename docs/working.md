@@ -1,5 +1,12 @@
 # 工作记录
 
+## 跨房全局身份消解数仓与本地匿名看板差量回填（2026-11-17）
+
+- 新增 `bili-live warehouse sync / backfill-pages / stats` 子命令及 `warehouse.py`、`warehouse_protocol.py`、`warehouse_backfill.py` 模块，配套公开使用说明 `skills/bilibili-live-monitor/warehouse.md`；不改动或重启常驻采集进程。
+- 源数据库均以 URI `?mode=ro` 与 `PRAGMA query_only=ON` 只读打开。`sync` 按游标增量提取明文身份字典（覆盖 `ONLINE_RANK_V3`、`ENTRY_EFFECT`、`LIKE_INFO_V3_CLICK`、`USER_TOAST_MSG_V2`、`SUPER_CHAT_MESSAGE`、`PK_BATTLE_SETTLE_NEW`、`GUARD_BUY`、`guard_snapshots` 及无 `raw_events` 历史库的 `timeline` 回退），过滤 `noface` 与 `/bfs/garb/` 装扮图并由 `v_unique_face_uid` 自动隔离多人共用头像；已完成场次保留原始 `clue_md5`、`clue_face_sha1`、`clue_crc32` 与首字线索，支持跨房事后露面双向认领历史送礼与匿名弹幕（含同房共现消歧与碰撞熔断 `ambiguous_crc32`），`COMBO_SEND` 与成对上舰通知不重复记账。
+- 单场 `activity_summary` 增加区间去重送礼人数 `gift_users` 与页面列展示。`backfill-pages` 默认 `--dry-run`，严格仅处理 `stage == 'completed'` 且 `local_only == true` 的纯本地场次：合并已解出同 `uid` 送礼人、拆分独立 `clue_md5` 未解名打码送礼人（`某*** #短码`），保持已封口 `followups` 不变，无变化场次零磁盘写入；`--execute` 持场次双锁写出并通过原生 `verify_snapshot` 校验（失败自动回滚旧字节），追加 `identity_backfill_history.jsonl` 审计摘要并同步 `workflow.json` 的 `final_artifacts`。
+- 验证：Python 全套 1389 passed、1 skipped，Ruff `src/tests/scripts` 通过，前端 TypeScript / Vite 构建、Node 8 项与 Vitest 70 项通过，隔离 Chrome 音频隔离脚本 `verify_isolation.py` 通过；本机多源数据库纯只读烟测与 `backfill-pages --dry-run` 零源库/场次文件改动核验通过，证据保存在私有 `.local/` 目录。
+
 ## 本地累计改动收尾（2026-11-15）
 
 - 整理分类历史累计读取、整场礼物与分段覆盖核对、歌词提案规则，以及归档五路默认并发和warning统计。
