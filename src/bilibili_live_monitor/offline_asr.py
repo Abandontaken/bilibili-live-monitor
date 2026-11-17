@@ -19,7 +19,7 @@ from types import SimpleNamespace
 from .archive_media import archive_receipt, archived_input, resolve_media, source_paths
 from .asr import ASR
 
-MEDIA_SUFFIXES = {'.mka', '.mkv', '.wav', '.flac', '.mp3', '.ogg'}
+MEDIA_SUFFIXES = {'.mka', '.mkv', '.wav', '.opus', '.flac', '.mp3', '.ogg'}
 DEFAULT_MODEL = 'Qwen/Qwen3-ASR-1.7B'
 QUIET_RMS_DBFS = -45.0
 SAMPLE_RATE = 16000
@@ -169,6 +169,8 @@ def probe(root, path):
     payload = json.loads(proc.stdout or '{}')
     audio = [stream for stream in payload.get('streams') or [] if stream.get('codec_type') == 'audio']
     duration = (payload.get('format') or {}).get('duration')
+    if duration is None and audio:
+        duration = audio[0].get('duration')
     try:
         duration_sec = float(duration) if duration is not None else None
     except ValueError:

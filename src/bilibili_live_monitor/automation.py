@@ -49,6 +49,12 @@ class Automation:
         self.workflows = SessionWorkflows(self, config.get('session_workflow', {}))
         self.platform.session_workflow_rooms = set(self.rooms) if self.workflows.enabled else set()
         self.platform.room_capture_overrides = capture_overrides(self.rooms)
+        if self._is_direct():
+            if any(cfg.get('welcome_enabled') for cfg in self.rooms.values()):
+                raise ValueError('direct模式仅支持匿名只读采集，禁止启用浏览器自动欢迎')
+            for saved_room in self.state['rooms'].values():
+                saved_room['enabled'] = False
+                saved_room['pending'] = []
         for row in self.state['likes'].values():
             if row['status'] in ('running', 'queued'):
                 row['status'] = 'interrupted'
@@ -63,6 +69,11 @@ class Automation:
                 self.row(rid).pop('copy_rotation', None)
                 self.row(rid).pop('variant_id', None)
         self.save()
+
+    def _is_direct(self):
+        settings = getattr(self.platform, 'settings', None) or getattr(
+            getattr(self.platform, 'monitor', None), 'settings', None)
+        return getattr(settings, 'capture_backend', 'cdp') == 'direct'
 
     def save(self):
         self.store.save_control('automation', self.state)
@@ -126,6 +137,8 @@ class Automation:
             return self.welcome_copy(room_id)
 
     async def set_enabled(self, room_id, enabled):
+        if enabled and self._is_direct():
+            raise ValueError('direct模式不支持浏览器自动欢迎')
         row = self.row(room_id)
         row.update(enabled=enabled, revision=row['revision']+1, pending=[])
         self.save()  # 撤销立即生效；网络guard会在实际发送前再检查。
@@ -147,6 +160,8 @@ class Automation:
     async def reload_rooms(self, config):
         config = reload_plan(self.config, config)
         rooms = self.prepare_room_configs(config.get('rooms', {}))
+        if self._is_direct() and any(cfg.get('welcome_enabled') for cfg in rooms.values()):
+            raise ValueError('direct模式仅支持匿名只读采集，禁止启用浏览器自动欢迎')
         variants = {rid: load_variants(cfg) for rid, cfg in rooms.items()}
         added = sorted(set(rooms) - set(self.rooms))
         cancelled = []
@@ -185,8 +200,8 @@ class Automation:
                 if self.accounts.switching:
                     await asyncio.sleep(.5)
                     continue
-                if (self.accounts.profiles and (self.accounts.process is None
-                        or self.accounts.process.poll() is not None)):
+                if (not self._is_direct() and self.accounts.profiles
+                        and (self.accounts.process is None or self.accounts.process.poll() is not None)):
                     if time.monotonic() < next_browser_attempt:
                         await asyncio.sleep(1)
                         continue
@@ -413,6 +428,8 @@ class Automation:
             self.save()
 
     def start_likes(self, rid, count, request_id):
+        if self._is_direct():
+            raise ValueError('direct模式不支持浏览器点赞互动')
         self.row(rid)
         key = request_id
         existing = self.state['likes'].get(key)
@@ -462,6 +479,8 @@ class Automation:
     async def switch_account(self, name):
         if name not in self.accounts.profiles:
             raise ValueError('未知账号profile')
+        if self._is_direct() and self.accounts.profiles[name].get('mode', 'account') != 'anonymous':
+            raise ValueError('direct模式仅支持anonymous匿名profile')
         async with self.lock:
             self.accounts.switching = True
             self.accounts.epoch += 1

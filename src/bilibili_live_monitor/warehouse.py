@@ -734,7 +734,11 @@ def _ingest_completed_session(
     # 1. 提取终审语音与歌曲区间 (fact_transcripts)，兼容 talk_finalize 精修文本与无 raw_events 早期库
     session_source = scope_source(read_session_source(config), config['start_utc'], cutoff_ts)
     workspace = Path(config['workspace'])
-    corrections, _ = correction_context(workspace, session_source)
+    corrections, _ = correction_context(
+        workspace,
+        session_source,
+        warehouse_database=config.get('warehouse_database'),
+    )
     annotations = read_annotations(workspace)
     known_songs = set(config.get('approved_songs', [])) | set(verified_titles(workspace))
     reviews_by_seq: dict[int, dict[str, Any]] = {}

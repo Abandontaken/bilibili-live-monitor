@@ -93,6 +93,14 @@ def main():
         run_session(settings, args.until if args.command == 'run' else None)
     else:
         async def run():
+            if getattr(settings, 'capture_backend', 'cdp') == 'direct':
+                from .direct_client import DirectClient
+                client = DirectClient(handshake_interval=settings.direct_handshake_interval)
+                try:
+                    print(json.dumps(await client.discover(args.limit), ensure_ascii=False, indent=2))
+                finally:
+                    await client.close()
+                return
             browser = Browser(settings.cdp_url)
             try:
                 print(json.dumps(await browser.discover(args.limit), ensure_ascii=False, indent=2))

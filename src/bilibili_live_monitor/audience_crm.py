@@ -572,7 +572,11 @@ def session_source(config):
     from .live_share_control import source_at_cutoff
     from .transcript_corrections import correction_context
     state, cutoff, source = source_at_cutoff(config)
-    corrected, _ = correction_context(Path(config['workspace']), source)
+    corrected, _ = correction_context(
+        Path(config['workspace']),
+        source,
+        warehouse_database=config.get('warehouse_database'),
+    )
     source['segments'] = [{**s, **corrected.get(s['seq'], {})} for s in source['segments']]
     return state, cutoff, source
 

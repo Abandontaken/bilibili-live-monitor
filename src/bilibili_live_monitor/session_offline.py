@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from . import offline_asr
 from .live_share import atomic_json, epoch, iso
 
-NAME = re.compile(r'^[a-f0-9]+-(\d{8}T\d{6}Z)-([a-f0-9]+)-(\d{5})\.(?:mkv|mka|wav)$')
+NAME = re.compile(r'^[a-f0-9]+-(\d{8}T\d{6}Z)-([a-f0-9]+)-(\d{5})\.(?:mkv|mka|wav|opus)$')
 
 
 class NoMediaError(ValueError):
@@ -46,7 +46,7 @@ def recording_files(config, cutoff):
     from .archive_media import source_paths
     groups = {}
     lower = epoch(config['start_utc'])
-    for path in source_paths(Path(config['recording_root']), {'.mkv', '.mka', '.wav'}):
+    for path in source_paths(Path(config['recording_root']), {'.mkv', '.mka', '.wav', '.opus'}):
         match = NAME.fullmatch(path.name)
         if not match:
             continue

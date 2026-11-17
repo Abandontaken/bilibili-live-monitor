@@ -41,6 +41,12 @@ def validate_config(config):
     public = Path(config['workspace']).resolve() / 'public'
     if Path(config['database']).resolve().is_relative_to(public):
         raise ValueError('原始数据库不能放在public目录')
+    if config.get('warehouse_database') is not None:
+        wh = config['warehouse_database']
+        if not isinstance(wh, str) or not wh.strip() or not Path(wh).is_absolute():
+            raise ValueError('warehouse_database必须为绝对路径')
+        if Path(wh).resolve().is_relative_to(public):
+            raise ValueError('数仓数据库不能放在public目录')
     if config.get('ai_enabled', bool(config.get('ai_session'))):
         for name in ('ai_session', 'model', 'opencode_cwd', 'opencode_python'):
             if not isinstance(config.get(name), str) or not config[name]:

@@ -136,7 +136,8 @@ def ai_once(config, state, source, now, *, final=False):
                  if isinstance(r, dict) and r.get('investigation_version') == 2 and r.get('music_source') in
                 {'probable_live', 'recording', 'uncertain', 'none'}}
     all_segments = [s for s in source['segments'] if s.get('is_final') and s.get('text')]
-    corrections, correction_info = correction_context(workspace, source)
+    corrections, correction_info = correction_context(workspace, source,
+                                                      warehouse_database=config.get('warehouse_database'))
     known_titles = set(config.get('approved_songs', [])) | set(verified_titles(workspace))
     old_reviews = {r.get('seq'): r for r in previous.get('reviews', []) if isinstance(r, dict)}
     def priority(segment):

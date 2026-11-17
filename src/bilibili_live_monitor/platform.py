@@ -71,6 +71,9 @@ class Platform:
         self.monitor, self.store, self.settings = monitor, monitor.store, monitor.settings
         saved = self.store.control('platform', {})
         self.policy = Policy.model_validate(saved.get('policy', {}))
+        if self._is_direct():
+            self.policy.asr_enabled = False
+            self.policy.preview_enabled = False
         if self.policy.target_rooms > self.settings.max_rooms:
             self.policy.target_rooms = self.settings.max_rooms
         self.revision = saved.get('revision', 0)
@@ -106,6 +109,14 @@ class Platform:
         self.room_capture_overrides = {}
         self.session_asr = saved.get('session_asr', {})
 
+    def _is_direct(self):
+        return getattr(getattr(self, 'settings', None), 'capture_backend', 'cdp') == 'direct'
+
+    def _transport(self):
+        if self._is_direct():
+            return getattr(self.monitor, 'direct', None) or self.monitor.browser
+        return self.monitor.browser
+
     def save(self):
         self.store.save_control('platform', {'policy': self.policy.model_dump(), 'revision': self.revision,
                                             'candidates': self.candidates,
@@ -119,6 +130,8 @@ class Platform:
     def configure(self, policy):
         if policy.target_rooms > self.settings.max_rooms:
             raise ValueError('目标超过MAX_ROOMS容量上限')
+        if self._is_direct() and (policy.asr_enabled or policy.preview_enabled):
+            raise ValueError('direct模式仅支持离线转写且不支持网页缩略图预览')
         if policy.mode == 'fixed':
             if not policy.fixed_rooms:
                 policy.fixed_rooms = (list(self.policy.fixed_rooms) if self.policy.mode == 'fixed'
@@ -237,7 +250,7 @@ class Platform:
                               if c['blocked'] and not c.get('room_id')]
         try:
             # 只读解析停用短号的归属，不重新打开或启动这些来源。
-            statuses = await room_statuses(self.monitor.browser, candidates + unresolved_aliases)
+            statuses = await room_statuses(self._transport(), candidates + unresolved_aliases)
         except Exception as error:
             if self.revision != revision:
                 return
@@ -272,7 +285,8 @@ class Platform:
             candidate.update(room_id=canonical, anchor_uid=str(row.get('uid') or ''),
                              title=row.get('title') or candidate['title'],
                              live_start=str(row.get('live_time') or row.get('live_start_time') or ''))
-            if (state == 1 and canonical in self.session_workflow_rooms and candidate['live_start']
+            if (not self._is_direct() and state == 1 and canonical in self.session_workflow_rooms
+                    and candidate['live_start']
                     and self.session_asr.get(canonical, {}).get('start') != candidate['live_start']):
                 self.session_asr[canonical] = {'start': candidate['live_start'], 'enabled': True}
             candidate['alias_duplicate'] = canonical in seen
@@ -297,7 +311,7 @@ class Platform:
                 continue
             candidate['next_guard_check'] = time.time() + self.settings.guard_poll_seconds
             try:
-                snapshot = await guard_snapshot(self.monitor.browser, candidate['room_id'], candidate['anchor_uid'])
+                snapshot = await guard_snapshot(self._transport(), candidate['room_id'], candidate['anchor_uid'])
                 self.store.guard_snapshot(snapshot)
                 candidate['guard_snapshot'] = {k: snapshot[k] for k in ('observed_utc', 'reported_total', 'complete')}
                 candidate['guard_error'] = None
@@ -399,9 +413,13 @@ class Platform:
         rid = candidate.get('room_id')
         options.update(self.room_capture_overrides.get(rid, {}))
         override = self.session_asr.get(rid, {})
-        if (rid in self.session_workflow_rooms and override.get('enabled') is True
+        if (not self._is_direct() and rid in self.session_workflow_rooms
+                and override.get('enabled') is True
                 and override.get('start') == candidate.get('live_start')):
             options['asr_enabled'] = True
+        if self._is_direct():
+            options['asr_enabled'] = False
+            options['preview_enabled'] = False
         return options
 
     async def launch(self, candidate):
@@ -434,7 +452,7 @@ class Platform:
 
     async def discover(self):
         try:
-            candidates = await self.monitor.browser.discover(200)
+            candidates = await self._transport().discover(200)
             self.import_candidates([Candidate(url=c['url'], title=c.get('title', '')) for c in candidates])
             self.event('discovered', count=len(candidates))
         except asyncio.CancelledError:

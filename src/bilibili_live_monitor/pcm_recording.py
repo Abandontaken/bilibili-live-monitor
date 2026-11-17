@@ -53,7 +53,7 @@ class PCMRecording:
 
     def snapshot(self):
         files = [p for p in self.directory.glob(f'{self.session}-*')
-                 if p.suffix in ('.wav', '.mkv', '.mka') and p.is_file()]
+                 if p.suffix in ('.wav', '.mkv', '.mka', '.opus') and p.is_file()]
         return {'recording_status': 'recording' if self.total_bytes else 'starting',
                 'recorded_seconds': round(self.base_seconds + self.progress_seconds, 3),
                 'recording_files': len(files), 'recording_bytes': sum(p.stat().st_size for p in files)}

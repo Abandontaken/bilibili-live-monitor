@@ -3,6 +3,7 @@ import hashlib
 import json
 from pathlib import Path
 
+from .finalize_context import resolve_danmaku_authors
 from .live_share import fingerprint, followup_evidence
 from .song_sources import source_matches
 
@@ -14,10 +15,37 @@ def _read(path, default):
         return default
 
 
-def correction_context(workspace, source):
+def correction_context(workspace, source, *, warehouse_database=None):
     workspace = Path(workspace)
-    witnesses = {row['id']: ((row.get('name') or '') + '\n' + row['text']
-                            if row['kind'] == 'danmaku' else row['text']) for row in followup_evidence(source)}
+    if warehouse_database is None:
+        cfg_doc = _read(workspace / 'config.json', {})
+        if isinstance(cfg_doc, dict) and isinstance(cfg_doc.get('warehouse_database'), str):
+            warehouse_database = cfg_doc['warehouse_database']
+    plan_doc = _read(workspace / 'talk_finalize' / 'plan.json', {})
+    frozen_overrides = (
+        plan_doc.get('warehouse_danmaku_overrides')
+        if isinstance(plan_doc, dict) and isinstance(plan_doc.get('warehouse_danmaku_overrides'), dict)
+        else {}
+    )
+    resolved_names, _ = resolve_danmaku_authors(source, warehouse_database=warehouse_database)
+    witnesses = {}
+    for row in followup_evidence(source):
+        if row['kind'] == 'danmaku':
+            orig_name = row.get('name') or ''
+            real_name = resolved_names.get(row['id'], '')
+            pair = frozen_overrides.get(row['id'])
+            frozen_name = (
+                pair[1]
+                if isinstance(pair, list) and len(pair) == 2 and pair[0] == orig_name and isinstance(pair[1], str)
+                else ''
+            )
+            names = [orig_name]
+            for extra in (real_name, frozen_name):
+                if extra and extra not in names:
+                    names.append(extra)
+            witnesses[row['id']] = '\n'.join(names) + '\n' + row['text']
+        else:
+            witnesses[row['id']] = row['text']
     catalog = []
     root = (workspace / 'song_sources').resolve()
     entries = _read(workspace / 'verified_songs.json', [])
