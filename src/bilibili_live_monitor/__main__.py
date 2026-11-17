@@ -28,6 +28,8 @@ from .trailer import configure_parser as configure_trailer
 from .trailer import main as trailer_main
 from .trends import configure_parser as configure_trends
 from .trends import main as trends_main
+from .warehouse import configure_parser as configure_warehouse
+from .warehouse import main as warehouse_main
 
 
 def main():
@@ -50,7 +52,10 @@ def main():
     configure_gift_assets(commands)
     configure_gift_render(commands)
     configure_pk_bar(commands)
+    configure_warehouse(commands)
     args = parser.parse_args()
+    if args.command == 'warehouse':
+        return warehouse_main(args)
     if args.command == 'pk-bar':
         return pk_bar_main(args)
     if args.command == 'gift-assets':

@@ -107,6 +107,7 @@ def validated_rows(config):
 
 def database_rows(config, ident):
     with sqlite3.connect(Path(config['database']).resolve().as_uri() + '?mode=ro', uri=True) as db:
+        db.execute('PRAGMA query_only=ON')
         values = db.execute('SELECT data FROM transcript_revisions WHERE workflow_key=? AND plan_id=? ORDER BY position',
                             (config['workflow_key'], ident)).fetchall()
     return [json.loads(raw) for raw, in values]
