@@ -50,7 +50,8 @@ def reload_plan(previous, incoming):
         workflow = result.get('session_workflow', {})
         if not isinstance(workflow, dict):
             raise ValueError('session_workflow必须是对象')
-        for key in ('publish', 'model', 'final_model', 'final_subagent', 'final_concurrency', 'warehouse_database'):
+        for key in ('publish', 'model', 'final_model', 'final_subagent', 'final_concurrency',
+                    'warehouse_database', 'talk_shard_max_windows', 'talk_revert_non_high_edits'):
             workflow.pop(key, None)
         return result
     if fixed(previous) != fixed(incoming):

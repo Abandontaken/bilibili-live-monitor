@@ -132,3 +132,63 @@ def test_invented_danmaku_evidence_is_rejected(setup):
     path.write_text(json.dumps(result))
     with pytest.raises(ValueError, match='真实弹幕'):
         module.finish(config)
+
+
+def test_shard_max_windows_and_non_high_revert_opt_in(tmp_path, monkeypatch):
+    from pathlib import Path
+    database = tmp_path / 'monitor.sqlite3'
+    with sqlite3.connect(database) as db:
+        db.execute('CREATE TABLE original(text TEXT)')
+    segments = [
+        {'seq': i, 'start_utc': f'2030-01-01T00:{i // 2:02d}:{(i % 2) * 30:02d}Z',
+         'end_utc': f'2030-01-01T00:{i // 2:02d}:{(i % 2) * 30 + 20:02d}Z',
+         'text': f'第{i}句今天我们讨论语音识别。', 'is_final': True}
+        for i in range(1, 41)
+    ]
+    monkeypatch.setattr(module, 'source_at_cutoff', lambda cfg: ({}, 1893459000, {'segments': segments}))
+    config = {'workspace': str(tmp_path), 'database': str(database), 'room_id': '123456',
+              'workflow_key': 'split_check', 'start_utc': '2030-01-01T00:00:00Z',
+              'talk_shard_max_windows': 18, 'talk_revert_non_high_edits': True}
+    plan = module.prepare(config)
+    counts = [len(json.loads(Path(s['input']).read_text())['target_seqs']) for s in plan['shards']]
+    assert counts == [18, 18, 4]
+    for idx, shard in enumerate(plan['shards']):
+        inputs = json.loads(Path(shard['input']).read_text())
+        rows = []
+        for w in inputs['windows']:
+            if w['seq'] not in inputs['target_seqs']:
+                continue
+            if w['seq'] == 1:
+                rows.append({**w, 'corrected_text': '第1句今天，我们讨论语音识别。', 'confidence': 'medium', 'reason': '不确定微调'})
+            elif w['seq'] == 2:
+                rows.append({**w, 'corrected_text': '第2句今天，我们讨论语音识别。', 'confidence': 'high', 'reason': '高置信补标点'})
+            else:
+                rows.append({**w, 'corrected_text': w['text'], 'confidence': 'high', 'reason': '原样保留'})
+        Path(shard['result']).write_text(json.dumps({'plan_id': plan['id'], 'reviews': rows}))
+    assert idx == 2
+    module.finish(config)
+    saved = {r['seq']: r for r in module.database_rows(config, plan['id'])}
+    assert saved[1]['corrected_text'] == segments[0]['text']
+    assert '自动回退原文' in saved[1]['reason']
+    assert saved[2]['corrected_text'] == '第2句今天，我们讨论语音识别。'
+
+
+def test_automation_capture_overrides_env_for_direct_cutover(tmp_path, monkeypatch):
+    from bilibili_live_monitor.config import load_settings
+    auto_path = tmp_path / 'automation.json'
+    auto_path.write_text(json.dumps({
+        'capture': {
+            'capture_backend': 'direct',
+            'asr_enabled': False,
+            'audio_format': 'opus',
+            'audio_bitrate': '32k',
+        },
+        'rooms': {},
+    }), encoding='utf-8')
+    monkeypatch.setenv('AUTOMATION_CONFIG', str(auto_path))
+    monkeypatch.setenv('ASR_ENABLED', '1')
+    settings = load_settings()
+    assert settings.capture_backend == 'direct'
+    assert settings.asr_enabled is False
+    assert settings.audio_format == 'opus'
+    assert settings.audio_bitrate == '32k'
