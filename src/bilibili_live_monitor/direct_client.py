@@ -41,6 +41,14 @@ _WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
 _SHANGHAI = ZoneInfo('Asia/Shanghai')
 
 
+class RoomNotLive(RuntimeError):
+    """平台确认未开播或轮播；不是采集失败，不消耗重连预算。"""
+
+    def __init__(self, live_status: int):
+        self.live_status = live_status
+        super().__init__(f'房间当前未在播: live_status={live_status}')
+
+
 def get_mixin_key(orig: str) -> str:
     if len(orig) < 64:
         raise ValueError('WBI 原始密钥长度不足64字符')
@@ -644,8 +652,8 @@ class DirectClient:
         if code != 0:
             raise RuntimeError(f'getRoomPlayInfo 失败: code={code} message={payload.get("message")}')
         data = payload.get('data') or {}
-        if data.get('live_status') not in (1, None) and not data.get('playurl_info'):
-            raise RuntimeError(f'房间当前未在播: live_status={data.get("live_status")}')
+        if data.get('live_status') in (0, 2):
+            raise RoomNotLive(data['live_status'])
         streams = (((data.get('playurl_info') or {}).get('playurl') or {}).get('stream')) or []
         flv_avc: list[str] = []
         flv_any: list[str] = []

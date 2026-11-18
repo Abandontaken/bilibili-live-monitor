@@ -30,6 +30,7 @@ from bilibili_live_monitor.direct_client import (
     DirectClient,
     GuestIdentity,
     MinimalAsyncWebSocket,
+    RoomNotLive,
     pack_bili_packet,
     sign_wbi,
 )
@@ -455,6 +456,44 @@ async def test_short_room_id_mapping_status_guard_and_workflow_compatibility(tmp
         await monitor.stop('654')
         await automation.close()
         await platform.close()
+    await monitor.close()
+    store.close()
+
+
+@pytest.mark.parametrize('live_status', [0, 2])
+async def test_stream_offline_is_a_broadcast_state_even_with_replay_url(live_status):
+    def handler(request):
+        return httpx.Response(200, json={'code': 0, 'data': {
+            'live_status': live_status, 'playurl_info': {'playurl': {'stream': []}},
+        }})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        direct = DirectClient(http_client=http)
+        direct.ensure_guest = AsyncMock(return_value=GuestIdentity('guest3', 'guest4', '', '', 0))
+        with pytest.raises(RoomNotLive) as error:
+            await direct.fetch_stream_url(123456)
+        assert error.value.live_status == live_status
+
+
+@pytest.mark.parametrize('live_status', [0, 2])
+async def test_capture_direct_offline_does_not_exhaust_retry_budget(tmp_path, live_status):
+    store = Store(tmp_path / 'monitor.sqlite3')
+    monitor = Monitor(Settings(data_dir=tmp_path, capture_backend='direct'), store)
+    monitor.direct.acquire_handshake_slot = AsyncMock()
+    monitor.direct.fetch_danmu_info = AsyncMock(return_value=None)
+    monitor.direct.fetch_stream_url = AsyncMock(side_effect=RoomNotLive(live_status))
+    room = {'room_id': '123456', 'real_room_id': '123456', 'record_mode': 'audio',
+            'reconnect_attempts': 19, 'status': 'capturing'}
+    store.room(room)
+    monitor.generations['123456'] = 'synthetic'
+    task = asyncio.create_task(monitor.capture_direct(room, 'synthetic'))
+    monitor.tasks['123456'] = task
+    await asyncio.wait_for(task, 2)
+    saved = store.rooms()[0]
+    assert saved['status'] == 'stopped' and saved['error'] is None
+    assert saved['reconnect_attempts'] == 0 and saved['next_retry_utc'] is None
+    assert saved['capture_live_status'] == live_status
+    assert monitor.direct.fetch_stream_url.await_count == 1 and not monitor.tasks
     await monitor.close()
     store.close()
 
@@ -970,4 +1009,3 @@ async def test_monitor_capture_direct_reconnects_then_halts_on_refusal(tmp_path)
     assert room_state['next_retry_utc'] is None
     await monitor.close()
     store.close()
-
