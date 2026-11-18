@@ -475,6 +475,49 @@ async def test_stream_offline_is_a_broadcast_state_even_with_replay_url(live_sta
         assert error.value.live_status == live_status
 
 
+@pytest.mark.asyncio
+async def test_direct_room_statuses_retries_once_on_transient_500_and_guard_classifies_errors(monkeypatch):
+    from bilibili_live_monitor.rotation import RoomStatusRefused
+
+    status_calls = 0
+    guard_code = -500
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal status_calls
+        url = str(request.url)
+        if '/getRoomBaseInfo' in url:
+            status_calls += 1
+            if status_calls == 1:
+                return httpx.Response(200, json={'code': -500, 'message': '服务调用超时'})
+            return httpx.Response(200, json={
+                'code': 0,
+                'data': {'by_room_ids': {'123456': {'room_id': 123456, 'uid': 999001, 'live_status': 0}}},
+            })
+        if '/guardTab/topList' in url:
+            return httpx.Response(200, json={'code': guard_code, 'message': 'err'})
+        raise AssertionError(url)
+
+    slept = []
+
+    async def fake_sleep(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr('bilibili_live_monitor.direct_client.asyncio.sleep', fake_sleep)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        direct = DirectClient(handshake_interval=0.0, http_client=http)
+        result = await direct.room_statuses([{'url': 'https://live.bilibili.com/123456'}])
+        assert status_calls == 2 and slept == [2.0]
+        assert result['123456']['live_status'] == 0
+
+        with pytest.raises(RuntimeError) as err_500:
+            await direct.guard_snapshot('123456', '999001')
+        assert not isinstance(err_500.value, RoomStatusRefused)
+
+        guard_code = -412
+        with pytest.raises(RoomStatusRefused):
+            await direct.guard_snapshot('123456', '999001')
+
+
 @pytest.mark.parametrize('live_status', [0, 2])
 async def test_capture_direct_offline_does_not_exhaust_retry_budget(tmp_path, live_status):
     store = Store(tmp_path / 'monitor.sqlite3')

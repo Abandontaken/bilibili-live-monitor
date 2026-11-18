@@ -20,7 +20,7 @@ import certifi
 import httpx
 
 from .browser import dispatch_messages, room_url
-from .rotation import RoomStatusRefused, index_rooms
+from .rotation import REFUSED_CODES, RoomStatusRefused, index_rooms
 from .store import utc_now
 
 USER_AGENT = (
@@ -463,14 +463,24 @@ class DirectClient:
                 ('req_biz', 'web_room_componet'),
                 ('use_cache', 'false'),
             ]
-            resp = await client.get(
-                'https://api.live.bilibili.com/xlive/web-room/v1/index/getRoomBaseInfo',
-                params=params,
-            )
-            if resp.status_code != 200:
-                err_cls = RoomStatusRefused if resp.status_code in (401, 403, 412, 429) else RuntimeError
-                raise err_cls(f'房间状态接口HTTP {resp.status_code}；不改动现有来源')
-            result.update(index_rooms(resp.json()))
+            for attempt in range(2):
+                try:
+                    resp = await client.get(
+                        'https://api.live.bilibili.com/xlive/web-room/v1/index/getRoomBaseInfo',
+                        params=params,
+                    )
+                    if resp.status_code != 200:
+                        err_cls = RoomStatusRefused if resp.status_code in (401, 403, 412, 429) else RuntimeError
+                        raise err_cls(f'房间状态接口HTTP {resp.status_code}；不改动现有来源')
+                    result.update(index_rooms(resp.json()))
+                    break
+                except RoomStatusRefused:
+                    raise
+                except Exception:
+                    if attempt == 0:
+                        await asyncio.sleep(2.0)
+                        continue
+                    raise
 
         # 若个别短号未被 getRoomBaseInfo 直接返回，或在线房间缺少格式化开播时间，用 room_init 精确补齐。
         checked: set[str] = set()
@@ -545,7 +555,9 @@ class DirectClient:
                 raise err_cls(f'舰队快照HTTP {resp.status_code}')
             payload = resp.json()
             if payload.get('code') != 0:
-                raise RoomStatusRefused(f'舰队快照拒绝：code={payload.get("code")}')
+                code = payload.get('code')
+                err_cls = RoomStatusRefused if code in REFUSED_CODES else RuntimeError
+                raise err_cls(f'舰队快照{"拒绝" if err_cls is RoomStatusRefused else "失败"}：code={code}')
             data = payload.get('data') or {}
             info = data.get('info') or {}
             if not isinstance(data.get('list'), list) or not isinstance(data.get('top3'), list):
