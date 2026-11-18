@@ -22,12 +22,16 @@ from .pk_bar import configure_parser as configure_pk_bar
 from .pk_bar import main as pk_bar_main
 from .recording_archive import configure_parser as configure_archive
 from .recording_archive import main as archive_main
+from .room_discovery import configure_parser as configure_room_discovery
+from .room_discovery import main as room_discovery_main
 from .rotation import configure_parser as configure_rotation
 from .rotation import main as rotation_main
 from .trailer import configure_parser as configure_trailer
 from .trailer import main as trailer_main
 from .trends import configure_parser as configure_trends
 from .trends import main as trends_main
+from .warehouse import configure_parser as configure_warehouse
+from .warehouse import main as warehouse_main
 
 
 def main():
@@ -50,7 +54,13 @@ def main():
     configure_gift_assets(commands)
     configure_gift_render(commands)
     configure_pk_bar(commands)
+    configure_warehouse(commands)
+    configure_room_discovery(commands)
     args = parser.parse_args()
+    if args.command == 'room-discovery':
+        return room_discovery_main(args)
+    if args.command == 'warehouse':
+        return warehouse_main(args)
     if args.command == 'pk-bar':
         return pk_bar_main(args)
     if args.command == 'gift-assets':
@@ -88,6 +98,14 @@ def main():
         run_session(settings, args.until if args.command == 'run' else None)
     else:
         async def run():
+            if getattr(settings, 'capture_backend', 'cdp') == 'direct':
+                from .direct_client import DirectClient
+                client = DirectClient(handshake_interval=settings.direct_handshake_interval)
+                try:
+                    print(json.dumps(await client.discover(args.limit), ensure_ascii=False, indent=2))
+                finally:
+                    await client.close()
+                return
             browser = Browser(settings.cdp_url)
             try:
                 print(json.dumps(await browser.discover(args.limit), ensure_ascii=False, indent=2))

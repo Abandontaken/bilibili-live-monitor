@@ -39,6 +39,16 @@ def validate_settings(config, rooms):
             raise ValueError('cursor_cli_grok须显式设置final_model，禁止继承实时模型')
         if config.get('finalize_parallel', True) is not True:
             raise ValueError('Cursor分片须启用finalize_parallel')
+    if 'warehouse_database' in config and config['warehouse_database'] is not None:
+        wh = config['warehouse_database']
+        if not isinstance(wh, str) or not wh.strip() or not Path(wh).is_absolute():
+            raise ValueError('session_workflow.warehouse_database须为绝对路径')
+    if 'talk_shard_max_windows' in config:
+        max_w = config['talk_shard_max_windows']
+        if type(max_w) is not int or not 1 <= max_w <= 500:
+            raise ValueError('session_workflow.talk_shard_max_windows须为1到500的整数')
+    if 'talk_revert_non_high_edits' in config and type(config['talk_revert_non_high_edits']) is not bool:
+        raise ValueError('session_workflow.talk_revert_non_high_edits须为布尔值')
     if not config.get('enabled'):
         return
     if type(config.get('finalize_parallel', True)) is not bool:
@@ -163,6 +173,12 @@ class SessionWorkflows:
                       final_subagent=cfg.get('final_subagent', 'general'))
         if 'final_model' in cfg:
             config['final_model'] = cfg['final_model']
+        if cfg.get('warehouse_database'):
+            config['warehouse_database'] = cfg['warehouse_database']
+        if 'talk_shard_max_windows' in cfg:
+            config['talk_shard_max_windows'] = cfg['talk_shard_max_windows']
+        if 'talk_revert_non_high_edits' in cfg:
+            config['talk_revert_non_high_edits'] = cfg['talk_revert_non_high_edits']
         audience = cfg.get('audience_crm', {}).get(rid)
         if audience:
             if not isinstance(audience, str) or not Path(audience).is_absolute():

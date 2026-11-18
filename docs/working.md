@@ -1,5 +1,28 @@
 # 工作记录
 
+## 免 Chrome 匿名直连采集、Opus 32kbps 离线链路与弹幕实名叠加（2026-11-17）
+
+- `config.py` 新增实例级 `CAPTURE_BACKEND`（`'cdp'` | `'direct'`，默认 `'cdp'` 保持实名与网页采音行为不变）、`AUDIO_FORMAT`（`'wav'` | `'mka'` | `'opus'`，`direct` 下默认 `'opus'`，`cdp` 下默认 `'wav'`）、`AUDIO_BITRATE`（默认 `'32k'`）及全局异步建连限速 `DIRECT_HANDSHAKE_INTERVAL`（默认 `2.5` 秒）。`direct` 模式强制仅用于 `anonymous` 未登录只读采集，拒绝 `welcome` / `like` 浏览器互动及实时网页 ASR/预览，`runtime.py`、`accounts.py` 与 `automation.py` 均不启动、不管理或连接 Chrome 进程。
+- 新增 `direct_client.py` 并接入 `room_status.py`、`platform.py`、`monitor.py`：通过 `httpx.AsyncClient` 缓存游客 `buvid3`/`buvid4` 与 WBI 签名（12 小时缓存及遇签名失效自动刷新一次重试），免 CDP 完成开播巡检、老房间长短号映射（采集与媒体保持页面短号契约，拉流与鉴权使用真实长号，兼容 `session_workflow.py`）与大航海榜单快照；纯标准库 `asyncio + ssl + certifi` RFC 6455 客户端在 HTTP 鉴权与每一次实际 WSS 握手（含备用主机回退）处均执行全局限速锁，完成 Op7/Op8 逐包认证、Op2 心跳、分片重组、控制帧穿插与 RFC 6455 帧头校验，外层二进制消息（含 `Op8+Op5` 与 `Op3+Op5` 合包）直接交由 `dispatch_messages(..., include_raw=True)` 写入 `Store.live_message`。
+- 打通 `.opus` 全链路录制与离线转写：`recording.py` 支持 `libopus` 48kHz 单声道 32kbps VBR 按 Ogg 分段输出 `<prefix>-%05d.opus`，并同步更新 `recording.py`、`pcm_recording.py`、`session_offline.py`、`offline_asr.py` 与 `media_recovery.py` 的媒体后缀白名单与时长探测回退。
+- `finalize_context.py`、`talk_finalize.py`、`session_finalize.py`、`transcript_corrections.py`、`session_timeline.py`、`warehouse.py` 与 `audience_crm.py` 支持对打码弹幕昵称（不含 `神秘人`）自动只读构建本场 `raw_events` 明文身份池，并在单场配置可选 `warehouse_database`（由 `session_workflow.py` 透传，以 `?mode=ro` 只读打开）时查询 `dim_users` / `dim_user_faces` 补齐跨场已知真名，贯通终审校验与最终时间线、数仓入库及观众档案消费；`talk_finalize.prepare` 固化数仓命中映射以保证外部数仓增量同步不影响已冻结计划指纹，源数据库零写入。同时解耦 `finalize_lifecycle.py` 续跑提示词，兼容 OpenCode 原生 `final_subagent`（如 `general` + `qwen38/qwen3.8-27b` / `ollama-cloud/glm-5.3-flash`）与既有 `cursor_cli_grok` 双路由闭环。
+- 验证：Python 全套 1404 passed、1 skipped，Ruff `src/tests/scripts` 通过，前端 TypeScript / Vite 构建、Node 8 项与 Vitest 70 项通过，隔离 Chrome 音频隔离脚本 `verify_isolation.py` 通过；本机真实在播公开房间 35 秒免 Chrome `direct` + `.opus` 隔离烟测完成，证据与独立代码/隐私/反过度设计审阅记录保存在私有 `.local/` 目录。
+
+## 数仓 v2 弹幕头像线索、房间状态/PK连麦表与数据库口径防坑指南（2026-11-17）
+
+- `warehouse_protocol.py` 与 `warehouse.py` 升级至 `EXTRACTOR_VERSION = 2`，执行 `bili-live warehouse sync` 时对已有 v1 数仓平滑建表、升级源库游标补扫历史弹幕头像、替换视图并自动重入旧版已完成场次，`warehouse stats` 新增 `room_metric_rows`、`cohost_intervals`、`cohost_intervals_by_kind`、`danmaku_resolution_basis` 与 `danmaku_with_face_clue` 统计。
+- 补齐 `DANMU_MSG` 中 `info[0][15]`（兼容扩展字典、JSON 字符串及 `extra` 嵌套 `user`）自定义头像 SHA1 提取并严格排除 `noface` 与 `/bfs/garb/`：实名弹幕同步纳入全局 `dim_user_faces` 观测；匿名弹幕写入 `fact_events.clue_face_sha1`，`v_resolved_events` 对弹幕按 `raw_uid` → `resolved_crc32_uid`（CRC32+首字）→ `v_unique_face_uid`（携带 `clue_crc32` 时要求 CRC32 一致以兼顾改名老观众与防撞图，缺失 `clue_crc32` 时要求首字无冲突，且不把匿名弹幕头像污染进同场 CRC32 碰撞消歧集合）顺序消解，未解出时保留 `clue_face_sha1` 供盲盒与弹幕关联。
+- 新增 `fact_room_metrics`（按整分钟桶提取 `ONLINE_RANK_COUNT` 同屏高能在线、`WATCHED_CHANGE` 累计看过、`ROOM_REAL_TIME_MESSAGE_UPDATE` 关注与粉丝团最新观测）与 `fact_cohost_intervals`（归并 `PK_*` 与 `VOICE_JOIN_*` 为 `pk`、`pk_punish`、`voice_join`、`voice_join_queue` 场内状态区间，兼容短房号与规范长房号识别对手并记录读秒冲刺起点、票数与惩罚信息）。
+- 新增公开子 skill `skills/bilibili-live-monitor/data-interpretation.md`，并在 `SKILL.md` 与 `warehouse.md` 补充入口路由，梳理双库职责边界、核心表与原始报文路径、八类常见口径误判及三组标准只读 SQL 范式。
+- 验证：Python 全套 1392 passed、1 skipped，Ruff `src/tests/scripts` 通过，前端 TypeScript / Vite 构建通过，独立 Chrome 音频隔离脚本 `verify_isolation.py` 通过；本机真实采集库只读 v1→v2 平滑升级烟测与独立 GPT-6.1 SOL Fast 代码/口径/隐私审阅通过，证据保存在私有 `.local/` 目录。
+
+## 跨房全局身份消解数仓与本地匿名看板差量回填（2026-11-17）
+
+- 新增 `bili-live warehouse sync / backfill-pages / stats` 子命令及 `warehouse.py`、`warehouse_protocol.py`、`warehouse_backfill.py` 模块，配套公开使用说明 `skills/bilibili-live-monitor/warehouse.md`；不改动或重启常驻采集进程。
+- 源数据库均以 URI `?mode=ro` 与 `PRAGMA query_only=ON` 只读打开。`sync` 按游标增量提取明文身份字典（覆盖 `ONLINE_RANK_V3`、`ENTRY_EFFECT`、`LIKE_INFO_V3_CLICK`、`USER_TOAST_MSG_V2`、`SUPER_CHAT_MESSAGE`、`PK_BATTLE_SETTLE_NEW`、`GUARD_BUY`、`guard_snapshots` 及无 `raw_events` 历史库的 `timeline` 回退），过滤 `noface` 与 `/bfs/garb/` 装扮图并由 `v_unique_face_uid` 自动隔离多人共用头像；已完成场次保留原始 `clue_md5`、`clue_face_sha1`、`clue_crc32` 与首字线索，支持跨房事后露面双向认领历史送礼与匿名弹幕（含同房共现消歧与碰撞熔断 `ambiguous_crc32`），`COMBO_SEND` 与成对上舰通知不重复记账。
+- 单场 `activity_summary` 增加区间去重送礼人数 `gift_users` 与页面列展示。`backfill-pages` 默认 `--dry-run`，严格仅处理 `stage == 'completed'` 且 `local_only == true` 的纯本地场次：合并已解出同 `uid` 送礼人、拆分独立 `clue_md5` 未解名打码送礼人（`某*** #短码`），保持已封口 `followups` 不变，无变化场次零磁盘写入；`--execute` 持场次双锁写出并通过原生 `verify_snapshot` 校验（失败自动回滚旧字节），追加 `identity_backfill_history.jsonl` 审计摘要并同步 `workflow.json` 的 `final_artifacts`。
+- 验证：Python 全套 1389 passed、1 skipped，Ruff `src/tests/scripts` 通过，前端 TypeScript / Vite 构建、Node 8 项与 Vitest 70 项通过，隔离 Chrome 音频隔离脚本 `verify_isolation.py` 通过；本机多源数据库纯只读烟测与 `backfill-pages --dry-run` 零源库/场次文件改动核验通过，证据保存在私有 `.local/` 目录。
+
 ## 本地累计改动收尾（2026-11-15）
 
 - 整理分类历史累计读取、整场礼物与分段覆盖核对、歌词提案规则，以及归档五路默认并发和warning统计。
@@ -847,3 +870,9 @@
 - 新增独立 `pk-bar plan/render/verify`，只读历史原始消息，按房间绑定左右比分，区分准备、对战、最后冲刺、结算、结果、惩罚及人工核对的连线区间。
 - 截止时间来自服务器字段；消息回放采用接收时刻，来源视频和字体以SHA绑定。固定画幅H.265输出保留原音轨，提供完整解码和音轨哈希核验。
 - 初版界面为重建渐变条，不声明网页SVGA及滚动数字完全复刻。3项定向回归通过：阶段边界、可读宽度、历史状态快照及未来分数隔离。
+
+# 2026-11-17 终审监督与收尾边界
+
+- 稳定零字节源保留原始文件、身份及估计缺口；同场有效媒体继续ASR。无有效媒体明确记为 `attention` / `no_media`，不伪装完成。
+- Runner与CRM Watch统一监督idle协调会话，最多续接3次、间隔300秒，busy不续投。固定解释器、cwd与显式模型；发送前持久化意图，ACK后核验同会话marker，未知结果不盲重投。Agent不再自行创建临时回访脚本。
+- 成功后的协调清理宽限120秒，之后沿用原stop及再验收。有效终审完成凭证超出原预算时，可有一次600秒publish-only期限；禁止借此新派发或无限延期，已有人工暂停仍须显式恢复。CRM接纳版本、冻结计划与current指针须一致。

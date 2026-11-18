@@ -102,7 +102,7 @@ def mark_attention(config):
 
 
 def advance(config, state, now):
-    check_budget(config, state, now=now)
+    check_budget(config, state, now=now, publication=state.get('stage') == 'finalizing')
     workspace = Path(config['workspace'])
     config_path = workspace / 'config.json'
     phase = state.setdefault('stage', 'created')
@@ -182,7 +182,12 @@ def advance(config, state, now):
             state['stage'] = 'offline_asr'
         return
     if phase == 'offline_asr':
-        config['offline_segments'] = run_offline(config, state)
+        from .session_offline import NoMediaError
+        try:
+            config['offline_segments'] = run_offline(config, state)
+        except NoMediaError as error:
+            state.update(stage='attention', media_status='no_media', last_error=str(error))
+            return
         atomic_json(config_path, {k: v for k, v in config.items() if not k.startswith('_')})
         state['stage'] = 'offline_review' if uses_ai or talk_final else 'finalizing'
         return
@@ -213,6 +218,9 @@ def advance(config, state, now):
             state['finalize_progress'] = talk_finalize.progress(config)
             if talk_finalize.complete(config):
                 state['stage'] = 'finalizing'
+            else:
+                from .finalize_lifecycle import supervise
+                supervise(config, state, state['final_session'], workspace / 'talk_finalize', now)
             return
         if not state.get('final_session'):
             state['final_session'] = ensure_ai(config, 'finalize')
@@ -240,6 +248,9 @@ def advance(config, state, now):
             if session_finalize.complete(config):
                 session_finalize.finish(config)
                 state['stage'] = 'finalizing'
+            else:
+                from .finalize_lifecycle import supervise
+                supervise(config, state, state['final_session'], workspace / 'finalize', now)
             return
         if ai_control(config, 'status', session=state['final_session']).get('type') in ('busy', 'retry'):
             return
@@ -248,7 +259,8 @@ def advance(config, state, now):
         source = read_session_source(config)
         from .session_finalize import reviewed as is_reviewed
         from .transcript_corrections import correction_context
-        corrections, _ = correction_context(workspace, source)
+        corrections, _ = correction_context(workspace, source,
+                                            warehouse_database=config.get('warehouse_database'))
         from .annotation_history import read_annotations
         reviews = read_annotations(workspace).get('reviews', [])
         reviewed = {r.get('seq'): r for r in reviews if isinstance(r, dict)}
@@ -268,16 +280,18 @@ def advance(config, state, now):
         watch.ai_once(final_config, {'cutoff': state['cutoff']}, source, now, final=True)
         return
     if phase == 'finalizing':
+        from .finalize_lifecycle import drain
         if config.get('content_mode') == 'talk':
             from .session_offline import verify_offline
             verify_offline(config, state['cutoff'])
         if talk_final:
             from . import talk_finalize
-            if not stop_ai(config, state.get('final_session'), children=True):
+            if not drain(config, state, state.get('final_session'), now):
                 return
             if not talk_finalize.complete(config):
                 raise ValueError('杂谈精修尚未完整入库，不能发布')
-        if uses_ai and not stop_ai(config, state.get('final_session'), children=config.get('finalize_parallel', False)):
+        if uses_ai and not drain(config, state, state.get('final_session'), now,
+                                 children=config.get('finalize_parallel', False)):
             return
         if uses_ai and config.get('finalize_parallel'):
             from .session_finalize import finish
@@ -297,7 +311,7 @@ def advance(config, state, now):
             from .audience_finalize import advance as advance_audience
             if not advance_audience(config, state):
                 return
-        check_budget(config, state)
+        check_budget(config, state, publication=True)
         watch.publish(config, workspace / 'public')
         verify_remote(config)
         state['final_artifacts'] = {name: hashlib.sha256((workspace / name).read_bytes()).hexdigest()
@@ -330,7 +344,8 @@ def run(path):
             started = time.time()
             config = load_config(path)
             try:
-                check_budget(config, state, now=started)
+                publication_ready(config, state, started)
+                check_budget(config, state, now=started, publication=state.get('stage') == 'finalizing')
             except BudgetPaused:
                 pause_budget(state, started)
                 atomic_json(status_path, state)
@@ -345,7 +360,8 @@ def run(path):
                 next_health_check = started + 300
             try:
                 advance(config, state, started)
-                state['last_error'] = None
+                if state['stage'] != 'attention':
+                    state['last_error'] = None
                 state['consecutive_errors'] = 0
             except MaintenancePaused:
                 return 0
@@ -395,6 +411,24 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=Path, required=True)
     return run(parser.parse_args().config.resolve())
+
+
+def publication_ready(config, state, now):
+    """有效完成凭证允许一次十分钟收尾，不允许新派发、重试或无限续期。"""
+    if state.get('automation_paused') or state.get('stage') not in ('offline_review', 'finalizing'):
+        return
+    if now < state.get('finish_deadline', float('inf')):
+        return
+    if config.get('content_mode') == 'talk' and config.get('talk_finalize'):
+        from .talk_finalize import complete
+    elif config.get('finalize_parallel'):
+        from .session_finalize import complete
+    else:
+        return
+    if complete(config):
+        state.setdefault('publication_deadline', now + 600)
+        state['stage'] = 'finalizing'
+        atomic_json(Path(config['workspace']) / 'workflow.json', state)
 
 
 if __name__ == '__main__':

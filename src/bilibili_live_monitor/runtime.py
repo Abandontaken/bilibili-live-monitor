@@ -97,17 +97,41 @@ def run_owned(commands, directory, deadline=None, env=None, stop_event=None):
 
 def run_session(settings, until=None):
     deadline = parse_deadline(until) if until else None
-    endpoint = urlparse(settings.cdp_url)
-    if endpoint.hostname not in ('127.0.0.1', 'localhost'):
-        raise ValueError('自管模式的CDP_URL必须指向本机回环地址')
-    for host, port in ((endpoint.hostname, endpoint.port or 9222),
-                       (os.getenv('APP_HOST', '127.0.0.1'), int(os.getenv('APP_PORT', '8765')))):
+    is_direct = getattr(settings, 'capture_backend', 'cdp') == 'direct'
+    app_host = os.getenv('APP_HOST', '127.0.0.1')
+    app_port = int(os.getenv('APP_PORT', '8765'))
+    if not is_direct:
+        endpoint = urlparse(settings.cdp_url)
+        if endpoint.hostname not in ('127.0.0.1', 'localhost'):
+            raise ValueError('自管模式的CDP_URL必须指向本机回环地址')
+        ports_to_check = ((endpoint.hostname, endpoint.port or 9222), (app_host, app_port))
+    else:
+        ports_to_check = ((app_host, app_port),)
+    for host, port in ports_to_check:
         try:
             connection = socket.create_connection((host, port), timeout=0.3)
         except OSError:
             continue
         connection.close()
         raise RuntimeError(f'端口已占用：{host}:{port}；不接管其他运行实例')
+    if is_direct:
+        if settings.automation_config:
+            config = json.loads(Path(settings.automation_config).read_text())
+            profiles = config.get('profiles') or {}
+            active = config.get('active_profile')
+            saved_path = settings.data_dir / 'active_account.json'
+            if saved_path.exists():
+                active = json.loads(saved_path.read_text()).get('active', active)
+            if profiles and profiles.get(active, {}).get('mode', 'account') != 'anonymous':
+                raise ValueError('direct模式仅支持anonymous匿名profile')
+            if any(r.get('welcome_enabled') for r in (config.get('rooms') or {}).values() if isinstance(r, dict)):
+                raise ValueError('direct模式禁止启用浏览器自动欢迎')
+        event = threading.Event()
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(signum, lambda *_: event.set())
+        return run_owned([('backend', [sys.executable, '-m', 'bilibili_live_monitor', 'serve'])],
+                         settings.data_dir, deadline,
+                         env={**os.environ, 'DATA_DIR': str(settings.data_dir)}, stop_event=event)
     if settings.automation_config:
         config = json.loads(Path(settings.automation_config).read_text())
         if config.get('profiles'):

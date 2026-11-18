@@ -1,6 +1,7 @@
 """场次结束后的观众状态更新；独立总会话用指定子代理处理按人分片。"""
 import json
 import shlex
+import time
 from pathlib import Path
 
 from . import audience_crm as crm
@@ -28,7 +29,7 @@ plan.tasks按列表位置从0编号，补零至少3位，例如000；编号对�
 Cursor只写候选，总协调逐项查证引用归属、未决承诺与previous保留，再把start改为accept（其他参数不变）完成程序验证及转正。reused=true的结果由原程序验证并直接保留；已有旧结果无Cursor回执时先做同样语义审核再accept，记录legacy_result，不伪造CLI回执、不重跑。
 明确failed/interrupted且无旧写入者时可把start改为retry，最多两次且优先同CLI UUID、同模型；发送不明先查回执与进程，不盲目重投或手工改状态。
 等待全部分片实际退出并验收，仍按原合同统一audience_crm finish，保留冻结材料、来源查证、逐字引用校验与current指针事务，不运行音乐终审的merge/corrections，不发布不通知。
-等CLI期间仅允许本任务唯一有界同会话回访，使用既有OpenCode submission/Launcher流程、原总协调模型与build agent、正确opencode_cwd及diagnose=false；每次读真实进展，完成即停链，不能用idle代替完成。超过本场预算或不可恢复时如实报告失败。
+程序负责同会话回访，不创建临时脚本或定时任务；不能用idle代替完成。超过本场预算或不可恢复时如实报告失败。
 '''
 
 def load_settings(session):
@@ -46,22 +47,38 @@ def load_settings(session):
     return config, path
 
 
+def accepted_ready(session):
+    path = Path(session['workspace']) / 'audience_finalize/plan.json'
+    if not path.exists():
+        return False
+    saved = json.loads(path.read_text())
+    directory = Path(saved['run'])
+    if not (directory / 'accepted.json').exists():
+        return False
+    config, _ = load_settings(session)
+    crm.verify_accepted(config, directory, saved['plan_id'])
+    return True
+
+
 def advance(session, state):
     """返回True才允许本场收尾；失败不改旧档案，不重复提交不确定的任务。"""
     if not session.get('audience_crm_config'):
         return True
     from .deployment import require_running
     require_running('crm')
-    from .session_budget import check_budget
-    check_budget(session, state)
     from .session_ai import ai_control
+    from .session_budget import check_budget
     from .session_finalize import dispatch
-    from .session_runner import ensure_ai, stop_ai
+    from .session_runner import ensure_ai
     config, path = load_settings(session)
     if config.get('coordinator_model'):
-        session = {**session, 'model': config['coordinator_model']}
+        session = {**session, 'model': config['coordinator_model'], 'final_model': config['coordinator_model']}
+    elif session.get('model'):
+        session = {**session, 'final_model': session['model']}
     state_path = Path(session.get('audience_state_path') or Path(session['workspace']) / 'workflow.json')
     root = Path(session['workspace']) / 'audience_finalize'
+    ready = accepted_ready(session)
+    check_budget(session, state, publication=ready)
     from .deployment import component_call
     pin_path = Path(session.get('deployment_pin') or root / 'deployment.json')
     session = {**session, 'deployment_pin': str(pin_path)}
@@ -84,20 +101,20 @@ def advance(session, state):
         atomic_json(marker, saved)
     directory = Path(saved['run'])
     accepted = directory / 'accepted.json'
+    check_budget(session, state, publication=accepted.exists())
     if (not accepted.exists()
             and json.loads((directory / 'material.json').read_text()).get('update_policy')
             != 'meaningful-interaction-v1'):
         raise ValueError('旧未完成CRM计划须按有效互动规则重新准备，不可继续派发')
     if accepted.exists():
-        current = json.loads((Path(config['workspace']) / 'current.json').read_text())
-        if current['room_id'] != session['room_id']:
-            raise ValueError('CRM接纳版本房间错误')
-        if not stop_ai(session, state.get('audience_session'), children=True):
+        crm.verify_accepted(config, directory, saved['plan_id'])
+        from .finalize_lifecycle import drain
+        if not drain(session, state, state.get('audience_session'), time.time(), key='audience_cleanup'):
             return False
         from .cursor_finalize import require_run_stopped
         require_run_stopped(directory)
         if config.get('publish_on_finalize') and not session.get('local_only', False):
-            check_budget(session, state)
+            check_budget(session, state, publication=True)
             from .audience_publish import publish
             result = publish(config)
         else:
@@ -138,4 +155,6 @@ plan.json中reused=true的任务已由程序校验复用上一版result，直接
         dispatch(session, ai_session, cursor_prompt(session, config, directory, prompt), root, handoff)
         state.pop('audience_dispatch_uncertain', None)
         state['audience_submitted'] = True
+    from .finalize_lifecycle import supervise
+    supervise(session, state, ai_session, root, time.time(), key='audience_watch')
     return False

@@ -116,9 +116,11 @@ python -m bilibili_live_monitor.audience_crm build --config .local/example-crm.j
 
 `validate` 通过仅代表 JSON 结构与引用字段合法，不代表语义通过。接纳前核对本人归属、ASR 近音、跨场履约、原唱与主播演唱的区别，以及公开引用的必要性。局部召回没有后续记录，不等于承诺未兑现；同一入团送歌与具体点歌按同一履约链处理。
 
-### Cursor CLI 终审分片
+### 终审分片路由与匿名弹幕实名叠加
 
-音乐与杂谈终审可设置 `final_subagent: "cursor_cli_grok"`，通过本机 Launcher 托管 Cursor CLI 分片。分片固定使用 `grok-4.7-high`，总协调由显式 `final_model: "provider/model"` 独立选择，不继承实时 `model`。必须启用 `finalize_parallel`，并发上限为十；总协调审核候选并执行 `accept` 后，继续各自的合并、来源登记与完成验收。`final_model` 只控制 OpenCode 总协调，不改变 Cursor 分片模型。热加载默认值只影响后续初始化的场次，已有场次保留其冻结配置。
+音乐与杂谈终审默认使用 OpenCode 原生 `final_subagent`（如 `"general"`）配合 `final_model`（如 `"qwen38/qwen3.8-27b"` 或 `"ollama-cloud/glm-5.3-flash"`）直接通过 `task` 分片写出 `NNN.result.json` 并执行 `finish`，无需依赖 Cursor CLI。也可设置 `final_subagent: "cursor_cli_grok"`，通过本机 Launcher 托管 Cursor CLI 分片：分片固定使用 `grok-4.7-high`，总协调由显式 `final_model: "provider/model"` 独立选择，不继承实时 `model`；必须启用 `finalize_parallel`，并发上限为十，总协调审核候选并执行 `accept` 后继续合并、来源登记与完成验收。热加载默认值只影响后续初始化的场次，已有场次保留其冻结配置。
+
+`session_workflow` 支持可选配置 `warehouse_database: "/PRIVATE/live_warehouse.sqlite3"`（透传至单场 `config.json`）。生成 `talk_finalize` 与 `session_finalize` 的纠错旁证 `danmaku` 时，若弹幕昵称为匿名打码格式（如 `某***`，不含 `神秘人`），程序自动只读构建本场 `raw_events` 明文身份池并按需只读查询数仓 `dim_users` / `dim_user_faces`，将解出的真实昵称填入分片输入供同音字纠错引用，不修改源库 `monitor.sqlite3`。
 
 ### 整场文件式查证（可选）
 
@@ -218,6 +220,8 @@ python -m bilibili_live_monitor.broadcast_email --env-file /PRIVATE/notify.env -
 终审也执行ASR回溯纠错：分片提出有来源的局部候选，总会话统一审核并合并私有`transcript_corrections.json`。以当前离线窗口指纹重新定位，不将实时校正按序号套用；原稿与冻结输入不修改。运行`python -m bilibili_live_monitor.session_finalize corrections --config ...`查看有效校正、失效原因与待重审窗口。校正影响的窗口须重新判断歌名、唱聊及声源，并记录当前`correction_id`；未完成时`finish`拒绝收尾。完成标记也绑定校正版本，校正新增、变化或撤销后不可沿用旧完成状态。
 
 ## 恢复与验收
+
+稳定零字节源只在封口和身份核验后从有效媒体清单排除，原件、身份与估计缺口保留在 `offline/manifest.json` 的 `excluded_empty_sources`；有效分片继续ASR，无有效媒体标为 `attention` / `media_status=no_media`。程序Runner与CRM Watch负责idle协调接续（最多3次、间隔300秒，busy跳过），不让Agent自建临时Timer。`supervision.json` 记录发送意图与同会话marker核验；未知发送状态不自动重投。成功后协调清理有120秒宽限，随后执行原stop和再验收。有效终审完成凭证可取得一次600秒publish-only期限，仅用于收尾发布、不允许新派发或无限延期；人工暂停仍须先核现场再显式恢复。CRM发布前须核对接纳版本与current事务一致。
 
 | 操作 | 命令/文件 | 约束 |
 |---|---|---|

@@ -22,14 +22,21 @@ class Accounts:
         self.active = saved.get('active', config.get('active_profile'))
         if self.profiles and self.active not in self.profiles:
             raise ValueError('当前账号不在已配置profile中')
+        if self._is_direct() and self.profiles and self.profiles[self.active].get('mode', 'account') != 'anonymous':
+            raise ValueError('direct模式仅支持anonymous匿名profile')
         self.process = None
         self.log = None
         self.epoch = 0
         self.switching = False
         self.identity = {'logged_in': False, 'uid': None, 'name': None}
 
+    def _is_direct(self):
+        return getattr(self.settings, 'capture_backend', 'cdp') == 'direct'
+
     @property
     def anonymous(self):
+        if self._is_direct():
+            return True
         return self.profiles.get(self.active, {}).get('mode', 'account') == 'anonymous'
 
     def summary(self):
@@ -40,6 +47,15 @@ class Accounts:
                 'switching': self.switching, **self.identity}
 
     async def start(self):
+        if self._is_direct():
+            if self.profiles:
+                if self.profiles[self.active].get('mode', 'account') != 'anonymous':
+                    raise ValueError('direct模式仅支持anonymous匿名profile')
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                self.path.write_text(json.dumps({'active': self.active}))
+            self.epoch += 1
+            self.identity = {'logged_in': False, 'uid': None, 'name': None}
+            return
         if not self.profiles:
             return
         endpoint = urlparse(self.settings.cdp_url)
@@ -79,6 +95,11 @@ class Accounts:
         raise RuntimeError('等待账号Chrome超时')
 
     async def refresh(self, browser):
+        if self._is_direct():
+            if self.profiles and self.profiles[self.active].get('mode', 'account') != 'anonymous':
+                raise RuntimeError('direct模式仅支持anonymous匿名profile')
+            self.identity = {'logged_in': False, 'uid': None, 'name': None}
+            return self.summary()
         try:
             context = await browser.connect()
             response = await context.request.get('https://api.bilibili.com/x/web-interface/nav', timeout=10000)

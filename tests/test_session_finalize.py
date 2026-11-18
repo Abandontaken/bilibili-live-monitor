@@ -203,6 +203,7 @@ def test_final_publish_rechecks_reviews_after_stopping_writers(tmp_path, monkeyp
     final.merge(config)
     final.finish(config)
     state = {'stage': 'finalizing', 'final_session': 'parent'}
+    state['final_cleanup'] = {'observed_complete_at': -1000}
     annotations = json.loads((Path(config['workspace']) / 'annotations.json').read_text())
     for review in annotations['reviews']:
         review['fingerprint'] = 'invalidated-after-finish'
@@ -355,6 +356,7 @@ def test_serial_finalization_waits_for_corrected_window_review(tmp_path, monkeyp
     runner.advance(config, state, 1)
     assert state['stage'] == 'offline_review' and state['unreviewed_windows'] == 1
     state['stage'] = 'finalizing'
+    state['final_cleanup'] = {'observed_complete_at': -1000}
     monkeypatch.setattr(runner, 'stop_ai', lambda *a, **k: True)
     with pytest.raises(ValueError, match='转写校正'):
         runner.advance(config, state, 2)
@@ -375,6 +377,7 @@ def test_serial_final_publish_checks_raw_fingerprint_not_only_correction_id(tmp_
     monkeypatch.setattr(runner, 'stop_ai', lambda *a, **k: True)
     monkeypatch.setattr(runner.watch, 'publish', lambda *a: pytest.fail('must not publish'))
     state = {'stage': 'finalizing', 'final_session': 'parent'}
+    state['final_cleanup'] = {'observed_complete_at': -1000}
     with pytest.raises(ValueError, match='转写校正'):
         runner.advance(config, state, 1)
     assert state['stage'] == 'finalizing'

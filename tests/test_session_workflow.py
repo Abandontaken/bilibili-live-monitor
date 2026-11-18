@@ -232,6 +232,7 @@ def test_final_publish_stays_same_url_and_only_happens_after_verification(tmp_pa
     from bilibili_live_monitor import session_finalize
     config = {'workspace': str(tmp_path), 'url': 'https://example.org/s/stable/'}
     state = {'stage': 'finalizing', 'final_session': 'owned-final'}
+    state['final_cleanup'] = {'observed_complete_at': -1000}
     events = []
     monkeypatch.setattr(runner, 'stop_ai', lambda *a, **k: events.append('stop') or True)
     monkeypatch.setattr(session_finalize, 'corrections', lambda *a:
@@ -371,6 +372,8 @@ def test_end_to_end_lifecycle_uses_offline_reviews_and_same_public_url(tmp_path,
     runner.advance(config, state, moment)  # 校验完整复核
     assert state['stage'] == 'finalizing'
     runner.advance(config, state, moment)
+    assert state['stage'] == 'finalizing'  # 成功完成后给协调会话120秒收尾。
+    runner.advance(config, state, moment + 120)
     assert state['stage'] == 'completed' and len(set(published)) == 1
     page = (path.parent / 'public/index.html').read_text()
     assert 'setInterval' not in page and '离线新增原文' not in page

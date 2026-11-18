@@ -163,7 +163,7 @@ def summarize_activity(source, activity, cutoff, *, completed=False, start=None)
     blocks = content_spans(activity, start=start, end=cutoff)
     starts = sorted(epoch(item['start']) for item in activity)
     stocks, gifts = observations(source)
-    gifts = [item[:3] for item in gift_observations(source, event_time_only=True)]
+    gifts = [item[:4] for item in gift_observations(source, event_time_only=True)]
     times = [time for time, _ in stocks]
     result = []
     for block in blocks:
@@ -172,27 +172,31 @@ def summarize_activity(source, activity, cutoff, *, completed=False, start=None)
         observed_end = min(target, cutoff)
         start_index, end_index = bisect_right(times, start) - 1, bisect_left(times, observed_end) - 1
         change = stocks[end_index][1] - stocks[start_index][1] if start_index >= 0 and end_index >= 0 else None
-        selected = [(count, amount) for at, count, amount in gifts if at is not None and
+        selected = [(count, amount, uid) for at, count, amount, uid in gifts if at is not None and
                     (start <= at < observed_end or at == cutoff == end)]
         next_start = bisect_left(starts, end)
         closed = completed or (end < cutoff and next_start < len(starts) and starts[next_start] <= cutoff)
         result.append({'kind': block['kind'], 'title': block['title'], 'start': iso(start), 'end': iso(end),
                        'window_end': iso(observed_end), 'followers_change': change,
-                       'gift_count': sum(count for count, _ in selected if count is not None),
-                       'gift_count_unknown': sum(count is None for count, _ in selected),
-                       'gift_amount_yuan': sum(amount for _, amount in selected if amount is not None) / 1000,
-                       'gift_amount_unknown': sum(amount is None for _, amount in selected),
+                       'gift_count': sum(count for count, _, _ in selected if count is not None),
+                       'gift_count_unknown': sum(count is None for count, _, _ in selected),
+                       'gift_users': len({str(uid) for _, _, uid in selected if uid}),
+                       'gift_users_unknown_events': sum(not uid for _, _, uid in selected),
+                       'gift_amount_yuan': sum(amount for _, amount, _ in selected if amount is not None) / 1000,
+                       'gift_amount_unknown': sum(amount is None for _, amount, _ in selected),
                        'status': 'complete' if closed and cutoff >= target else
                         'partial' if completed else 'collecting'})
-    uncertain = [(count, amount) for at, count, amount in gifts if at is None]
+    uncertain = [(count, amount, uid) for at, count, amount, uid in gifts if at is None]
     if uncertain:
         result.append({'kind': 'unclassified', 'title': None, 'time_unknown': True,
                        'start': result[0]['start'] if result else iso(cutoff), 'end': iso(cutoff),
                        'window_end': iso(cutoff), 'followers_change': None,
-                       'gift_count': sum(count for count, _ in uncertain if count is not None),
-                       'gift_count_unknown': sum(count is None for count, _ in uncertain),
-                       'gift_amount_yuan': sum(amount for _, amount in uncertain if amount is not None) / 1000,
-                       'gift_amount_unknown': sum(amount is None for _, amount in uncertain),
+                       'gift_count': sum(count for count, _, _ in uncertain if count is not None),
+                       'gift_count_unknown': sum(count is None for count, _, _ in uncertain),
+                       'gift_users': len({str(uid) for _, _, uid in uncertain if uid}),
+                       'gift_users_unknown_events': sum(not uid for _, _, uid in uncertain),
+                       'gift_amount_yuan': sum(amount for _, amount, _ in uncertain if amount is not None) / 1000,
+                       'gift_amount_unknown': sum(amount is None for _, amount, _ in uncertain),
                        'status': 'complete' if completed else 'collecting'})
     return result
 

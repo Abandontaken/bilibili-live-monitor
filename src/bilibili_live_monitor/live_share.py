@@ -342,11 +342,13 @@ def render_snapshot(snapshot: dict, *, navigation=None) -> str:
         change = item['followers_change']
         fans = '—' if change is None else f'{change:+d}' if change else '0'
         count = str(item['gift_count']) + ('+' if item['gift_count_unknown'] else '')
+        users = ('—' if item.get('gift_users') is None else
+                 str(item['gift_users']) + ('+' if item.get('gift_users_unknown_events') else ''))
         amount = (f'{item["gift_value_yuan"]:.2f}' if item.get('gift_value_yuan') is not None else '—') + ('+' if item['gift_amount_unknown'] else '')
         state = {'complete': '', 'collecting': '统计中', 'partial': '尾窗未满'}[item['status']]
         period = '—' if item.get('time_unknown') else f'{clock(epoch(item["start"]))}–{clock(epoch(item["end"]))}'
         rows.append(f'<tr><td>{period}</td>'
-                    f'<td{song_attr}>{esc(title)}</td><td>{fans}</td><td>{count}</td><td>{amount}</td><td>{state}</td></tr>')
+                    f'<td{song_attr}>{esc(title)}</td><td>{fans}</td><td>{count}</td><td>{users}</td><td>{amount}</td><td>{state}</td></tr>')
     from .activity_reconciliation import render_reconciliation
     reconciliation = (render_reconciliation(snapshot['activity_reconciliation'])
                       if snapshot.get('activity_reconciliation') else '')
@@ -354,8 +356,8 @@ def render_snapshot(snapshot: dict, *, navigation=None) -> str:
                '<p>按礼物发生时间归入互不重叠的内容区间；每笔仅计一次，缺口或内容不明列为未分类。'
                '涨粉为区间内观测净变化；盲盒按抽中礼物面值统计，非主播实收。'
                '“+”表示另有金额或数量未知的礼物。</p><div class="activity-table"><table>'
-               '<thead><tr><th>时间段</th><th>内容</th><th>涨粉</th><th>礼物数</th><th>金额（元）</th><th>状态</th></tr></thead>'
-               '<tbody>' + (''.join(rows) or '<tr><td colspan="6">暂无已识别的内容片段</td></tr>') +
+               '<thead><tr><th>时间段</th><th>内容</th><th>涨粉</th><th>礼物数</th><th>送礼人数</th><th>金额（元）</th><th>状态</th></tr></thead>'
+               '<tbody>' + (''.join(rows) or '<tr><td colspan="7">暂无已识别的内容片段</td></tr>') +
                '</tbody></table></div></section>')
     if snapshot.get('content_mode') == 'talk':
         footer = ''

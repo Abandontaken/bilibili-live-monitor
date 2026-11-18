@@ -21,7 +21,11 @@ def build(config, cutoff):
         from .talk_finalize import complete
         if not complete(config):
             raise ValueError('杂谈精修尚未完整入库')
-    corrections, _ = correction_context(Path(config['workspace']), source)
+    corrections, _ = correction_context(
+        Path(config['workspace']),
+        source,
+        warehouse_database=config.get('warehouse_database'),
+    )
     rows = []
     for segment in source['segments']:
         if not segment.get('is_final') or not segment.get('text'):
