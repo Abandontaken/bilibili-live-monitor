@@ -1,5 +1,11 @@
 # 工作记录
 
+## 舰队快照错误分类、拒绝退避自愈与查播单轮快速重试（2026-11-18）
+
+- **统一 `REFUSED_CODES` 覆盖舰队快照**：`room_status.guard_snapshot` 与 `DirectClient.guard_snapshot` 复用 `rotation.REFUSED_CODES`（仅 `-101/-111/-352/-403/-412/401/403/412/429` 抛出 `RoomStatusRefused`），业务 `code=-500` 等临时服务错误改为抛出普通 `RuntimeError`，60 秒后自动恢复，不再永久置位 `guard_refused`。
+- **`status_refused` 指数退避探测自愈**：`Platform.refresh_statuses` 遇 `RoomStatusRefused` 时记录 `status_refused_attempts` 与 `status_refused_until`（按 `900s → 1800s → 3600s` 封顶退避），冷却期内保持锁止不启动新房间，冷却到期后允许低频探测一次，探测成功即自动清零 `status_refused` 恢复常规轮询；人工 `resume` 立即清零保持不变。
+- **`DirectClient.room_statuses` 批内单次快速重试**：`getRoomBaseInfo` 出现非 `RoomStatusRefused` 的临时故障（如 `code=-500` 或网络抖动）时，先原地等待 `2s` 重试一次，降低单次网关 30 秒慢超时造成的巡检盲区。
+
 ## 固定守候的查播故障与正常下播恢复（2026-11-18）
 
 - **区分状态查询临时故障与永久拒绝**：`getRoomBaseInfo` 返回业务 `code=-500` 等服务错误时不再抛出 `RoomStatusRefused`，记录本次尝试时间并留待下一轮恢复；仅明确认证、权限或风控错误继续触发永久停止全局查播，保留短号映射及拒绝后需显式 `resume` 的边界。

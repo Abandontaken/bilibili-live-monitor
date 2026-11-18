@@ -106,6 +106,8 @@ class Platform:
         self.status_task = self.guard_task = None
         self.next_status_check = 0
         self.status_refused = saved.get('status_refused')
+        self.status_refused_attempts = int(saved.get('status_refused_attempts') or 0)
+        self.status_refused_until = float(saved.get('status_refused_until') or 0)
         self.session_workflow_rooms = set()
         self.room_capture_overrides = {}
         self.session_asr = saved.get('session_asr', {})
@@ -123,7 +125,9 @@ class Platform:
                                             'candidates': self.candidates,
                                              'discovery_blocked': self.discovery_blocked,
                                              'session_asr': self.session_asr,
-                                            'status_refused': self.status_refused})
+                                            'status_refused': self.status_refused,
+                                            'status_refused_attempts': self.status_refused_attempts,
+                                            'status_refused_until': self.status_refused_until})
 
     def event(self, action, **data):
         self.store.event('platform_action', {'at_utc': utc_now(), 'action': action, **data})
@@ -217,6 +221,8 @@ class Platform:
                 room.update(reconnect_attempts=0, next_retry_utc=None)
                 self.store.room(room)
         self.status_refused = None
+        self.status_refused_attempts = 0
+        self.status_refused_until = 0
         self.next_status_check = 0
         self.revision += 1
         self.save()
@@ -256,10 +262,14 @@ class Platform:
             if self.revision != revision:
                 return
             self.event('status_check_failed', error=str(error))
-            # 明确拒绝持久停查；网络异常下轮恢复，不把未知当下播。
+            # 明确拒绝进入低频退避探测；网络异常下轮恢复，不把未知当下播。
             from .rotation import RoomStatusRefused
             if isinstance(error, RoomStatusRefused):
                 self.status_refused = str(error)
+                self.status_refused_attempts += 1
+                cooldown = backoff_delay(self.status_refused_attempts, base=900, maximum=3600)
+                self.status_refused_until = time.time() + cooldown
+                self.next_status_check = max(self.next_status_check, self.status_refused_until)
             for c in candidates:
                 self.candidates[c['url']].update(status_error=str(error), offline_checks=0,
                                                   live_status=None, watch_state='unknown',
@@ -268,6 +278,10 @@ class Platform:
             return
         if self.revision != revision or self.policy.mode != 'fixed' or not self.policy.enabled:
             return
+        if self.status_refused is not None or self.status_refused_attempts or self.status_refused_until:
+            self.status_refused = None
+            self.status_refused_attempts = 0
+            self.status_refused_until = 0
         for c in unresolved_aliases:
             row = statuses.get(c['url'].rsplit('/', 1)[-1])
             if row:
@@ -495,7 +509,9 @@ class Platform:
         fixed = self.policy.mode == 'fixed'
         if fixed and target:
             if self.status_task is None or self.status_task.done():
-                if not self.status_refused and time.time() >= self.next_status_check:
+                cooldown_passed = (not self.status_refused
+                                   or (self.status_refused_until > 0 and time.time() >= self.status_refused_until))
+                if cooldown_passed and time.time() >= self.next_status_check:
                     self.next_status_check = time.time() + self.settings.watch_poll_seconds
                     self.status_task = asyncio.create_task(self.refresh_statuses())
             if self.guard_task is None or self.guard_task.done():

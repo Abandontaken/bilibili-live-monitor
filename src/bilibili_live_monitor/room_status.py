@@ -2,7 +2,7 @@
 import math
 from urllib.parse import urlencode
 
-from .rotation import RoomStatusRefused, inspect
+from .rotation import REFUSED_CODES, RoomStatusRefused, inspect
 from .store import utc_now
 
 
@@ -49,7 +49,9 @@ async def guard_snapshot(browser, room_id, anchor_uid):
             raise error(f'舰队快照HTTP {response.status}')
         payload = await response.json()
         if payload.get('code') != 0:
-            raise RoomStatusRefused(f'舰队快照拒绝：code={payload.get("code")}')
+            code = payload.get('code')
+            error = RoomStatusRefused if code in REFUSED_CODES else RuntimeError
+            raise error(f'舰队快照{"拒绝" if error is RoomStatusRefused else "失败"}：code={code}')
         data = payload.get('data', {})
         info = data.get('info', {})
         if not isinstance(data.get('list'), list) or not isinstance(data.get('top3'), list):
