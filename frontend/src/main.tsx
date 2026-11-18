@@ -47,6 +47,17 @@ const labels:Record<string,string> = {
   error:'异常',silent:'静音跳过',done:'已转写',empty:'未识别到文字',cancelled:'已取消',truncated:'识别截断',reconnecting:'正在重连',waiting:'守候中'
 };
 const time = (iso:string) => new Date(iso).toLocaleTimeString('zh-CN',{hour12:false});
+const FOCUS_ROOM_EVENT = 'bili-focus-room';
+type FocusRoomDetail = {instanceId:string;anchorId:string};
+export function roomAnchorId(base:string,roomId:string){
+  return 'room-'+base.replace(/\W/g,'-')+roomId;
+}
+export function roomDisplayName(room:Pick<Room,'display_name'|'title'|'room_id'>){
+  return room.display_name||room.title.replace(/ - 哔哩哔哩直播.*$/,'')||room.room_id;
+}
+function focusRoom(instanceId:string,anchorId:string){
+  window.dispatchEvent(new CustomEvent<FocusRoomDetail>(FOCUS_ROOM_EVENT,{detail:{instanceId,anchorId}}));
+}
 
 type Resources = {epoch:number;sample_seconds:number;cpu_cores:number;rss_gib:number;
   system_gpu_percent:number|null;external_download_mbps:number;external_upload_mbps:number;
@@ -130,8 +141,8 @@ const RoomCard = React.memo(function RoomCard({room,status,onError}:{room:Room;s
   useLayoutEffect(()=>{
     if(following&&scroller.current)scroller.current.scrollTop=scroller.current.scrollHeight;
   },[room.items,following]);
-  return <article className="card">
-    <div className="card-body"><div className="room-heading"><a href={room.url} target="_blank" rel="noreferrer">{room.display_name||room.title.replace(/ - 哔哩哔哩直播.*$/,'')}</a><span className={'badge '+status}>{room.stale?'状态未知':labels[status]||status}</span></div>
+  return <article className={'card'+(status==='capturing'||status==='transcribing'?' is-capturing':'')}>
+    <div className="card-body"><div className="room-heading"><a href={room.url} target="_blank" rel="noreferrer">{roomDisplayName(room)}</a><span className={'badge '+status}>{room.stale?'状态未知':labels[status]||status}</span></div>
     {room.stale&&<p role="status">实例暂不可用 · 以下为上次结果 · {room.last_success?new Date(room.last_success).toLocaleString('zh-CN'):'尚未取得快照'}</p>}
     <RoomLinks liveUrl={room.url} archiveUrl={room.home_url?base+room.home_url:undefined}/>
     <div className="room-sub"><span>房间 {room.room_id}{room.instance_label?` · ${room.instance_label}`:''}</span><button className="text-button" disabled={room.status==='stopped'||room.status==='waiting'} onClick={()=>api(`rooms/${room.room_id}/stop`,{method:'POST'}).catch(e=>onError(e.message))}>停止监控</button></div>
@@ -170,11 +181,32 @@ function SnapshotApp({onState}:{onState?:Report}){
   const [error,setError] = useState('');
   const [candidates,setCandidates] = useState<{url:string;title:string}[]>([]);
   const [fullscreen,setFullscreen]=useState(false);
+  const [spotlight,setSpotlight]=useState<{anchorId:string;pulse:number}|null>(null);
   const timer = useRef<ReturnType<typeof setTimeout>|null>(null);
+  const spotlightTimer = useRef<ReturnType<typeof setTimeout>|null>(null);
   const changes=useRef<Change[]>([]);
   useEffect(()=>{onState?.(id,state,connected)},[id,state,connected,onState]);
   useEffect(()=>{const update=()=>setFullscreen(Boolean(document.fullscreenElement));
     document.addEventListener('fullscreenchange',update);return()=>document.removeEventListener('fullscreenchange',update)},[]);
+  useEffect(()=>{
+    const onFocus=(event:Event)=>{
+      const detail=(event as CustomEvent<FocusRoomDetail>).detail;
+      if(!detail||detail.instanceId!==id)return;
+      setSpotlight(prev=>({anchorId:detail.anchorId,pulse:(prev?.pulse??0)+1}));
+      if(spotlightTimer.current)clearTimeout(spotlightTimer.current);
+      spotlightTimer.current=setTimeout(()=>setSpotlight(null),2400);
+      requestAnimationFrame(()=>{
+        const target=document.getElementById(detail.anchorId);
+        if(target){
+          window.history.replaceState(null,'','#'+detail.anchorId);
+          const reduced=typeof window.matchMedia==='function'&&window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+          if(typeof target.scrollIntoView==='function')target.scrollIntoView({behavior:reduced?'auto':'smooth',block:'center'});
+        }
+      });
+    };
+    window.addEventListener(FOCUS_ROOM_EVENT,onFocus);
+    return()=>{window.removeEventListener(FOCUS_ROOM_EVENT,onFocus);if(spotlightTimer.current)clearTimeout(spotlightTimer.current)};
+  },[id]);
   useEffect(()=>{
     let alive=true;
     const enqueue=(change:Change)=>{changes.current.push(change);if(timer.current)return;
@@ -234,8 +266,8 @@ function SnapshotApp({onState}:{onState?:Report}){
     {candidates.length>0&&<section className="candidates">{candidates.map(c=><button disabled={busy} key={c.url} className="secondary" onClick={()=>void add(c.url)}>{c.title||c.url}</button>)}</section>}
     <a className="export-link" href={base+'api/export'}>导出全部快照</a>
     {state.rooms.length===0&&<section className="empty">当前暂无监控房间，请输入直播间链接或房间号开始监听。</section>}
-    <section className={'grid '+(mode==='anonymous'?'anonymous-grid':'account-grid')}>{state.rooms.filter(r=>r.fixed_task!==false).map(original=>{const room={...original,stale:!connected,last_success:lastSnapshot};return <div id={'room-'+base.replace(/\W/g,'-')+room.room_id} key={room.room_id}>{mode==='anonymous'?<CompactRoom room={room}/>:<RoomCard room={room} status={room.status==='capturing'&&state.inflight?.room_id===room.room_id?'transcribing':room.status} onError={setError}/>}</div>})}</section>
-    {state.rooms.some(r=>r.fixed_task===false)&&<details className="dashboard-details"><summary>临时任务 · {state.rooms.filter(r=>r.fixed_task===false).length}</summary><div className="grid">{state.rooms.filter(r=>r.fixed_task===false).map(room=>mode==='anonymous'?<CompactRoom key={room.room_id} room={{...room,stale:!connected,last_success:lastSnapshot}}/>:<RoomCard key={room.room_id} room={{...room,stale:!connected,last_success:lastSnapshot}} status={room.status} onError={setError}/>)}</div></details>}
+    <section className={'grid '+(mode==='anonymous'?'anonymous-grid':'account-grid')}>{state.rooms.filter(r=>r.fixed_task!==false).map(original=>{const room={...original,stale:!connected,last_success:lastSnapshot};const anchorId=roomAnchorId(base,room.room_id);const spotClass=spotlight?.anchorId===anchorId?(spotlight.pulse%2?' spotlight-a':' spotlight-b'):'';return <div id={anchorId} className={'room-anchor'+spotClass} key={room.room_id}>{mode==='anonymous'?<CompactRoom room={room}/>:<RoomCard room={room} status={room.status==='capturing'&&state.inflight?.room_id===room.room_id?'transcribing':room.status} onError={setError}/>}</div>})}</section>
+    {state.rooms.some(r=>r.fixed_task===false)&&<details className="dashboard-details"><summary>临时任务 · {state.rooms.filter(r=>r.fixed_task===false).length}</summary><div className="grid">{state.rooms.filter(r=>r.fixed_task===false).map(room=>{const anchorId=roomAnchorId(base,room.room_id);const spotClass=spotlight?.anchorId===anchorId?(spotlight.pulse%2?' spotlight-a':' spotlight-b'):'';return <div id={anchorId} className={'room-anchor'+spotClass} key={room.room_id}>{mode==='anonymous'?<CompactRoom room={{...room,stale:!connected,last_success:lastSnapshot}}/>:<RoomCard room={{...room,stale:!connected,last_success:lastSnapshot}} status={room.status} onError={setError}/>}</div>})}</div></details>}
     <details className="technical-details"><summary>数据说明</summary><p className="footnote">每房间显示最近80条消息。完整时间线保存在本地，可导出快照。历史统计与金额口径见按日汇总。</p></details>
   </main>;
 }
@@ -244,7 +276,8 @@ function resultLabel(room:Room){
 }
 function CompactRoom({room}:{room:Room}){
  const {base}=useInstance();
- return <article className="card compact-room"><div className="card-body">
+ const isCapturing=!room.stale&&!room.policy_paused&&room.status==='capturing';
+ return <article className={'card compact-room'+(isCapturing?' is-capturing':'')}><div className="card-body">
   <div className="room-heading"><strong title={room.display_name||room.title}>{room.display_name||room.title}</strong><span className={'badge '+room.status}>{room.stale?'状态未知':room.policy_paused?'已暂停':labels[room.status]||room.status}</span></div>
   {room.stale&&<p role="status">实例暂不可用 · 以下为上次结果 · {room.last_success?new Date(room.last_success).toLocaleString('zh-CN'):'尚未取得快照'}</p>}
   <small>房间 {room.room_id}</small>
@@ -257,25 +290,60 @@ function CompactRoom({room}:{room:Room}){
 function SingleApp({onState}:{onState?:Report}){
   const instance=useInstance();
   const [page,setPage]=useState<'snapshot'|'assistant'>('snapshot');
+  useEffect(()=>{
+    if(instance.mode==='anonymous')return;
+    const onFocus=(event:Event)=>{
+      const detail=(event as CustomEvent<FocusRoomDetail>).detail;
+      if(detail?.instanceId===instance.id)setPage('snapshot');
+    };
+    window.addEventListener(FOCUS_ROOM_EVENT,onFocus);
+    return()=>window.removeEventListener(FOCUS_ROOM_EVENT,onFocus);
+  },[instance.id,instance.mode]);
    if(instance.mode==='anonymous')return <SnapshotApp onState={onState}/>;
   return <><nav className="top-nav" aria-label="页面">
     <button aria-pressed={page==='snapshot'} onClick={()=>setPage('snapshot')}>快照</button>
     <button aria-pressed={page==='assistant'} onClick={()=>setPage('assistant')}>直播助手</button>
    </nav><div hidden={page!=='snapshot'}><SnapshotApp onState={onState}/></div>{page==='assistant'&&<main><Assistant/></main>}</>;
 }
-function SystemHealth({instances,reports}:{instances:Instance[];reports:Record<string,{state:State;connected:boolean}>}){
+export function SystemHealth({instances,reports}:{instances:Instance[];reports:Record<string,{state:State;connected:boolean}>}){
+ const [expanded,setExpanded]=useState(false);
  const rows=instances.map(i=>reports[i.id]),complete=rows.every(r=>r?.connected&&r.state.fixed_task_count!=null);
  const known=rows.filter((r):r is {state:State;connected:boolean}=>!!r?.connected&&r.state.fixed_task_count!=null);
  const sum=(key:'fixed_task_count'|'queue_depth'|'queue_capacity')=>known.reduce((n,r)=>n+(r.state[key]??0),0);
  const rooms=known.flatMap(r=>r.state.rooms.filter(r=>r.fixed_task));
+ const activeItems=instances.flatMap(inst=>{
+   const rep=reports[inst.id];
+   if(!rep?.connected||rep.state.fixed_task_count==null)return [];
+   return rep.state.rooms.filter(r=>r.fixed_task&&r.status==='capturing').map(r=>({
+     instanceId:inst.id,
+     instanceLabel:inst.label,
+     anchorId:roomAnchorId(inst.base,r.room_id),
+     roomId:r.room_id,
+     name:roomDisplayName(r),
+     isRecording:r.recording_status==='recording',
+     minutes:r.recorded_seconds>=60?Math.floor(r.recorded_seconds/60):null,
+   }));
+ });
+ const recordingCount=rooms.filter(r=>r.status==='capturing'&&r.recording_status==='recording').length;
  const value=(n:number)=>complete?n:known.length?`${n} + —`:'—';
  return <section className="system-health" aria-label="系统状态与资源"><header><h1>B站多路直播监控看板</h1><button className="secondary" onClick={()=>{void (document.fullscreenElement?document.exitFullscreen():document.documentElement.requestFullscreen()).catch(()=>{})}}>进入全屏</button></header>
  <p role="status">{complete?'实时连接正常':'部分实例暂不可用'}</p><div className="metrics">
  <div><span>配置监控任务</span><strong>{value(sum('fixed_task_count'))}<small> 路</small></strong></div>
- <div><span>当前实际采集</span><strong>{value(rooms.filter(r=>r.status==='capturing').length)}</strong><small>录制 {value(rooms.filter(r=>r.status==='capturing'&&r.recording_status==='recording').length)}</small></div>
+ <div><span>当前实际采集</span><strong>{value(rooms.filter(r=>r.status==='capturing').length)}</strong>{activeItems.length>0?<button type="button" className={'recording-toggle'+(expanded?' open':'')} aria-expanded={expanded} aria-controls="active-recording-drawer" onClick={()=>setExpanded(v=>!v)}><span>录制 {value(recordingCount)}</span><i aria-hidden="true">{expanded?'▴':'▾'}</i></button>:<small>录制 {value(recordingCount)}</small>}</div>
  <div><span>当前异常</span><strong>{value(rooms.filter(r=>r.current_issue).length)}</strong></div>
  <div><span>ASR 队列</span><strong>{value(sum('queue_depth'))}<small> / {value(sum('queue_capacity'))}</small></strong><small>处理中 {value(known.filter(r=>r.state.inflight).length)}</small></div>
- </div><details><summary>诊断信息</summary>{instances.map(i=>{const r=reports[i.id];return <p key={i.id}>{i.label} · {r?.connected?'实时连接正常':'暂不可用'} · 配置 {r?.state.fixed_task_count??'—'} / 原始 {r?.state.raw_fixed_count??'—'} · ASR {r?.connected?(!r.state.asr_enabled?'禁用':r.state.asr_error?'等待恢复':r.state.asr_ready?'已就绪':'正在加载'):'—'}</p>})}</details>
+ </div>
+ {expanded&&activeItems.length>0&&<div id="active-recording-drawer" className="recording-drawer" role="region" aria-label="正在采集的直播间">
+   <span className="recording-drawer-label">正在录制 / 采集（点击定位）：</span>
+   <div className="recording-chip-list">
+     {activeItems.map(item=><a key={item.anchorId} href={'#'+item.anchorId} className={'recording-chip'+(item.isRecording?' is-recording':'')} onClick={e=>{e.preventDefault();focusRoom(item.instanceId,item.anchorId)}}>
+       <span className="recording-dot" aria-hidden="true"/>
+       <strong>{item.name}</strong>
+       <small>{item.instanceLabel}{item.minutes!=null?` · ${item.minutes}m`:''}</small>
+     </a>)}
+   </div>
+ </div>}
+ <details><summary>诊断信息</summary>{instances.map(i=>{const r=reports[i.id];return <p key={i.id}>{i.label} · {r?.connected?'实时连接正常':'暂不可用'} · 配置 {r?.state.fixed_task_count??'—'} / 原始 {r?.state.raw_fixed_count??'—'} · ASR {r?.connected?(!r.state.asr_enabled?'禁用':r.state.asr_error?'等待恢复':r.state.asr_ready?'已就绪':'正在加载'):'—'}</p>})}</details>
   <SystemResources/></section>;
 }
 export function App(){
@@ -292,5 +360,8 @@ export function App(){
     <InstanceProvider instance={instance}>{instance.mode==='anonymous'?<SingleApp onState={report}/>:<AutomationProvider><SingleApp onState={report}/></AutomationProvider>}</InstanceProvider></section>)}</div>;
 }
 const archiveRoute=window.location.pathname.match(/^(.*\/instances\/[^/]+\/)rooms\/(\d+)\/$/);
-createRoot(document.getElementById('root')!).render(<React.StrictMode>{archiveRoute?
-  <RoomArchive base={archiveRoute[1]} roomId={archiveRoute[2]}/>:<App/>}</React.StrictMode>);
+const rootElement=document.getElementById('root');
+if(rootElement){
+  createRoot(rootElement).render(<React.StrictMode>{archiveRoute?
+    <RoomArchive base={archiveRoute[1]} roomId={archiveRoute[2]}/>:<App/>}</React.StrictMode>);
+}
