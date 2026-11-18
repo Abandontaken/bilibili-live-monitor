@@ -219,6 +219,8 @@ python -m bilibili_live_monitor.broadcast_email --env-file /PRIVATE/notify.env -
 
 终审也执行ASR回溯纠错：分片提出有来源的局部候选，总会话统一审核并合并私有`transcript_corrections.json`。以当前离线窗口指纹重新定位，不将实时校正按序号套用；原稿与冻结输入不修改。运行`python -m bilibili_live_monitor.session_finalize corrections --config ...`查看有效校正、失效原因与待重审窗口。校正影响的窗口须重新判断歌名、唱聊及声源，并记录当前`correction_id`；未完成时`finish`拒绝收尾。完成标记也绑定校正版本，校正新增、变化或撤销后不可沿用旧完成状态。
 
+终审之外的任何对话、事后汇总或复盘若需复述本场转写内容，落笔前先按窗口 seq 与原稿指纹把有效校正版叠加到对应窗口，引文一律使用校正版；原始`text`只作定位与指纹锚点，未经叠加的原文不直接复述给用户。没有校正记录的窗口按原稿引用，但须知其为未校正稿。原稿与校正双轨并存属设计行为：原稿冻结不变不代表校正未生效，公开快照按白名单不含转写原文同理。
+
 ## 恢复与验收
 
 稳定零字节源只在封口和身份核验后从有效媒体清单排除，原件、身份与估计缺口保留在 `offline/manifest.json` 的 `excluded_empty_sources`；有效分片继续ASR，无有效媒体标为 `attention` / `media_status=no_media`。程序Runner与CRM Watch负责idle协调接续（最多3次、间隔300秒，busy跳过），不让Agent自建临时Timer。`supervision.json` 记录发送意图与同会话marker核验；未知发送状态不自动重投。成功后协调清理有120秒宽限，随后执行原stop和再验收。有效终审完成凭证可取得一次600秒publish-only期限，仅用于收尾发布、不允许新派发或无限延期；人工暂停仍须先核现场再显式恢复。CRM发布前须核对接纳版本与current事务一致。

@@ -1,5 +1,10 @@
 # 工作记录
 
+## 转写校正层阅读契约（2026-11-18）
+
+- `skills/bilibili-live-monitor/session-workflow.md` 终审纠错段新增阅读契约：终审之外任何对话、事后汇总或复盘若复述本场转写，落笔前必须按窗口 seq 与原稿指纹叠加 `transcript_corrections.json` 的有效校正版（`corrected_text`），引文一律用校正版；原始 `text` 只作定位与指纹锚点，不得未经叠加直接复述。
+- 背景：事后拉取某场内容汇总时直接读取原始 ASR 窗口，把终审已校正的错字（歌名同音转写错字等）原样呈现给用户，造成「校正层未生效」的误判。程序侧 `corrections` 命令、needs_review 闭环与完成标记绑定已正常工作，缺口在终审流程之外的旁路读取场景；本契约补齐该场景的最小规则，无代码改动。
+
 ## 开播事件驱动的短驻静音浏览器打卡助手（2026-11-18）
 
 - 新增 `live_checkin.py` 与 `bili-live checkin` CLI 子命令（同时支持 `python -m bilibili_live_monitor.live_checkin` 独立入口），配套公开子 skill `skills/bilibili-live-monitor/live-checkin.md` 与根 `SKILL.md` 路由：复用 `Automation` 逐房 `notification_command` 的 `stdin`/`stdout` JSON 契约，在不改动匿名直连采集与实名常驻槽位的前提下完成开播短驻静音打卡。
