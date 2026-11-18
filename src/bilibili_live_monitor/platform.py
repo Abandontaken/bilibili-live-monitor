@@ -9,6 +9,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .browser import room_url
+from .direct_client import RoomNotLive
 from .retry import backoff_delay, remaining_delay
 from .room_status import guard_snapshot, room_statuses
 from .store import utc_now
@@ -261,7 +262,8 @@ class Platform:
                 self.status_refused = str(error)
             for c in candidates:
                 self.candidates[c['url']].update(status_error=str(error), offline_checks=0,
-                                                  live_status=None, watch_state='unknown')
+                                                  live_status=None, watch_state='unknown',
+                                                  status_checked_utc=utc_now())
             self.save()
             return
         if self.revision != revision or self.policy.mode != 'fixed' or not self.policy.enabled:
@@ -408,6 +410,18 @@ class Platform:
         self.save()
         self.event('source_failed', url=candidate['url'], error=error, blocked=candidate['blocked'])
 
+    def wait_for_broadcast(self, candidate, live_status):
+        candidate.update(selected=False, attempts=0, next_attempt=0, last_error=None,
+                         live_status=live_status, offline_checks=1, watch_state='confirming_offline')
+        room = self.retry_room(candidate)
+        if room:
+            room.update(status='stopped', error=None, reconnect_attempts=0,
+                        next_retry_utc=None, recording_status='stopped')
+            self.store.room(room)
+        self.next_status_check = 0
+        self.save()
+        self.event('broadcast_waiting', url=candidate['url'], live_status=live_status)
+
     def capture_options(self, candidate):
         options = self.policy.model_dump(exclude={'enabled', 'target_rooms', 'mode', 'fixed_rooms'})
         rid = candidate.get('room_id')
@@ -447,6 +461,8 @@ class Platform:
             candidate['selected'] = False
             self.save()
             raise
+        except RoomNotLive as error:
+            self.wait_for_broadcast(candidate, error.live_status)
         except Exception as error:
             self.failed(candidate, f'{type(error).__name__}: {error}')
 
@@ -516,8 +532,11 @@ class Platform:
                 self.event('broadcast_finished', url=url, room_id=rid)
             elif rid not in self.monitor.tasks:
                 self.active.pop(url)
-                self.failed(candidate, rooms.get(rid, {}).get('error') or 'capture_ended',
-                            already_counted=bool(rooms.get(rid, {}).get('reconnect_attempts')))
+                if self._is_direct() and current.get('capture_live_status') in (0, 2):
+                    self.wait_for_broadcast(candidate, current['capture_live_status'])
+                else:
+                    self.failed(candidate, current.get('error') or 'capture_ended',
+                                already_counted=bool(current.get('reconnect_attempts')))
             # 媒体无进度由每次Recording实例自己的40秒检查处理；外层不以旧启动时刻抢停恢复。
         # 先取消多余启动，再停止多余任务；不停止非平台拥有的手工任务。
         excess = max(0, len(self.monitor.tasks)+len(self.launching)-target)

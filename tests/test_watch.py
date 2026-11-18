@@ -94,6 +94,80 @@ async def test_unknown_does_not_confirm_offline_and_refusal_persists(tmp_path, m
     platform.store.close()
 
 
+async def test_business_500_does_not_latch_and_next_poll_recovers(tmp_path, monkeypatch):
+    from bilibili_live_monitor.rotation import index_rooms
+
+    platform = fixture(tmp_path)
+    platform.monitor.browser = object()
+    platform.import_candidates([Candidate(url='123456')])
+    platform.configure(Policy(mode='fixed', enabled=True, target_rooms=1))
+    calls = 0
+
+    async def read(*args):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return index_rooms({'code': -500})
+        return {'123456': {'room_id': 123456, 'uid': 654321, 'live_status': 1}}
+
+    async def no_guards():
+        pass
+
+    monkeypatch.setattr('bilibili_live_monitor.platform.room_statuses', read)
+    platform.refresh_guards = no_guards
+    await platform.tick()
+    await platform.status_task
+    assert platform.status_refused is None
+    candidate = next(iter(platform.candidates.values()))
+    assert candidate['live_status'] is None and candidate['status_checked_utc']
+    platform.next_status_check = 0
+    await platform.tick()
+    await platform.status_task
+    await settled(platform)
+    assert calls == 2 and platform.active
+    assert candidate['attempts'] == 0 and candidate['status_error'] is None
+    await platform.close()
+    platform.store.close()
+
+
+async def test_direct_offline_return_waits_without_budget_and_can_start_next_session(tmp_path, monkeypatch):
+    from bilibili_live_monitor.direct_client import RoomNotLive
+
+    platform = fixture(tmp_path, capture_backend='direct')
+    platform.monitor.direct = object()
+    platform.import_candidates([Candidate(url='123456')])
+    platform.configure(Policy(mode='fixed', enabled=True, target_rooms=1))
+    c = next(iter(platform.candidates.values()))
+    c.update(room_id='123456', live_status=1)
+    add = platform.monitor.add
+
+    async def offline(*args, **kwargs):
+        raise RoomNotLive(2)
+
+    platform.monitor.add = offline
+    await platform.launch(c)
+    assert c['attempts'] == 0 and not c['blocked'] and c['live_status'] == 2
+    platform.monitor.add = add
+    await platform.launch(c)
+    platform.monitor.tasks.clear()
+    room = platform.store.rooms()[0]
+    room.update(status='stopped', capture_live_status=0)
+    platform.store.room(room)
+    platform.next_status_check = float('inf')
+
+    async def no_guards():
+        pass
+
+    platform.refresh_guards = no_guards
+    await platform.tick()
+    assert not platform.active and c['attempts'] == 0 and not c['blocked']
+    await status(platform, monkeypatch, 1)
+    await settled(platform)
+    assert platform.active and c['attempts'] == 0
+    await platform.close()
+    platform.store.close()
+
+
 async def test_status_response_cannot_overwrite_new_policy(tmp_path, monkeypatch):
     platform = fixture(tmp_path)
     platform.monitor.browser = object()

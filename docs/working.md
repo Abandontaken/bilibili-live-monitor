@@ -1,5 +1,11 @@
 # 工作记录
 
+## 固定守候的查播故障与正常下播恢复（2026-11-18）
+
+- **区分状态查询临时故障与永久拒绝**：`getRoomBaseInfo` 返回业务 `code=-500` 等服务错误时不再抛出 `RoomStatusRefused`，记录本次尝试时间并留待下一轮恢复；仅明确认证、权限或风控错误继续触发永久停止全局查播，保留短号映射及拒绝后需显式 `resume` 的边界。
+- **新增 `RoomNotLive` 回退守候**：`room_init` 或拉流确认 `live_status=0/2` 时停止当前采集并回到 fixed 守候，不消耗重连预算；轮播即使携带 `playurl` 也不采集，下一场确认开播后自动启动。
+- **回归验证与审阅（尚未部署）**：新增 `-500` 恢复、明确拒绝继续锁止、正常下播不耗预算及下一场自动启动回归用例；Python 全套测试 `1459 passed`，Ruff `src` 与 `tests` 检查通过，独立 GPT-6.1 SOL Fast 审阅 `APPROVE`。
+
 ## 转写校正层阅读契约（2026-11-18）
 
 - `skills/bilibili-live-monitor/session-workflow.md` 终审纠错段新增阅读契约：终审之外任何对话、事后汇总或复盘若复述本场转写，落笔前必须按窗口 seq 与原稿指纹叠加 `transcript_corrections.json` 的有效校正版（`corrected_text`），引文一律用校正版；原始 `text` 只作定位与指纹锚点，不得未经叠加直接复述。
