@@ -113,7 +113,10 @@ async def close_page(page):
         try:
             await asyncio.wait_for(session.send('Page.close'), 3)
         finally:
-            await session.detach()
+            try:
+                await asyncio.wait_for(session.detach(), 2)
+            except Exception:
+                pass
 
 
 class Browser:

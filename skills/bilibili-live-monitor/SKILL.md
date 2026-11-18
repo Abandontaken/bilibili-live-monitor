@@ -53,6 +53,8 @@ PK录屏花屏、视频剪辑读取及压缩前的参数检查见[PK编码参数
 
 需要基于数仓大中小 R 观众做分层滚雪球扩房、免登录核验候选主播近 14 天活跃度与舰长规模档位，并生成跨赛道均衡抽样方案时，见[扩房发现与分层采样](room-discovery.md)：使用 `bili-live room-discovery pull-followings/screen-candidates/sample-plan`，对数仓严格只读，带登录态拉取默认 `--dry-run`。
 
+需要在不迁移匿名直连采集的前提下，复用本机已登录小号 Chrome 在目标房间确认开播时短驻静音发送一条授权打卡弹幕并立即关页退出时，见[开播短驻静音打卡助手](live-checkin.md)：使用 `bili-live checkin --config ... --dry-run` 预检并挂载逐房 `notification_command` 热加载接入。
+
 需要从整场直播制作2–3分钟引流预告时，见[直播引流预告片](trailer.md)：事件选择、源时间映射、隐私裁剪、`trailer render/verify`、剪点与独立审阅。真实精剪表和媒体留在私有输出目录。
 
 ## 环境与安装

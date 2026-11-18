@@ -1,5 +1,12 @@
 # 工作记录
 
+## 开播事件驱动的短驻静音浏览器打卡助手（2026-11-18）
+
+- 新增 `live_checkin.py` 与 `bili-live checkin` CLI 子命令（同时支持 `python -m bilibili_live_monitor.live_checkin` 独立入口），配套公开子 skill `skills/bilibili-live-monitor/live-checkin.md` 与根 `SKILL.md` 路由：复用 `Automation` 逐房 `notification_command` 的 `stdin`/`stdout` JSON 契约，在不改动匿名直连采集与实名常驻槽位的前提下完成开播短驻静音打卡。
+- 进房前安全门禁：仅允许本机回环 `cdp_url`，业务阶段共享统一单调时钟预算（封顶 `64s`，独立分配取消收敛 `2s`、单页保活 `3s`、双级关页 `11.5s`、空白页撤离 `2s` 及 Playwright 断连 `3s`，累计最坏 `85.5s` 另留 `4.5s` 进程启动与输出余量，对齐 `Automation.send_notification` 的 `90s` 上限，并为 `browser.close_page` 的 `session.detach()` 补齐 2 秒超时保护）；在调用 `context.new_page()` 前先通过 `context.request.get` 核验 `/x/web-interface/nav` 的 `isLogin` 与 `expected_uid` 严格一致，并核验 `Room/get_info` 的规范房号与 `live_status == 1`，避免账号切回大号或房间下播时误开标签页产生进房记录。
+- 短驻静音与幂等账本：新建独立页面先注入 `MUTE_SCRIPT` 再导航，复用 `welcome.send_chat`（同步补齐发送前草稿/字数/建连异常的 `send_attempted = False` 标记）精准校验发送，在 `finally` 中先独立尝试关闭临时页，单页、关页报错或关页超时后再独立执行空白页导航撤离（回执暴露 `cleanup_failed` 与 `cleanup_evacuated` 且不回滚已发送账本），随后有界调用 `pw.stop()` 断开，绝不调用 `browser.close()`；基于 `flock` 文件锁与原子状态文件实现同 `live_start`、自然日 `once_per_day` 与 `min_interval_seconds` 三重防重，并提供零开页、零写入的 `--dry-run` 预检模式。
+- 验证：Python 全套 1443 passed（含 `test_live_checkin.py` 16 项安全门禁、真实 `welcome.send_chat` 发送前失败回退、关页超时独立撤离、调用方取消与子进程契约回归），Ruff `src/tests/scripts` 通过，独立 GPT-6.1 SOL Fast 代码与隐私审阅通过。
+
 ## 免 Chrome 匿名直连采集、Opus 32kbps 离线链路与弹幕实名叠加（2026-11-17）
 
 - `config.py` 新增实例级 `CAPTURE_BACKEND`（`'cdp'` | `'direct'`，默认 `'cdp'` 保持实名与网页采音行为不变）、`AUDIO_FORMAT`（`'wav'` | `'mka'` | `'opus'`，`direct` 下默认 `'opus'`，`cdp` 下默认 `'wav'`）、`AUDIO_BITRATE`（默认 `'32k'`）及全局异步建连限速 `DIRECT_HANDSHAKE_INTERVAL`（默认 `2.5` 秒）。`direct` 模式强制仅用于 `anonymous` 未登录只读采集，拒绝 `welcome` / `like` 浏览器互动及实时网页 ASR/预览，`runtime.py`、`accounts.py` 与 `automation.py` 均不启动、不管理或连接 Chrome 进程。
