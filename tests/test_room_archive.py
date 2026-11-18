@@ -388,3 +388,25 @@ def test_chained_history_sources_take_only_their_own_interval_in_order():
                                      else (b, s['since_epoch'], s['until_epoch']) for s in sources],
                            sources[-1]['until_epoch'])
     assert [row[2]['n'] for row in merged['raw']] == ['a1', 'b2', 'c3']
+
+
+def test_nested_and_unsorted_historical_windows_preserve_raw_entries(tmp_path):
+    from datetime import datetime
+
+    root, db = fixture(tmp_path)
+    with sqlite3.connect(db) as conn:
+        for stamp, uid in [('2025-12-31T03:30:00+00:00', 101), ('2025-12-31T05:00:00+00:00', 102)]:
+            conn.execute(
+                'INSERT INTO raw_events(room_id,received_utc,command,data) VALUES (?,?,?,?)',
+                ('1', stamp, 'INTERACT_WORD', json.dumps({'data': {'uid': uid, 'uname': '访客', 'msg_type': 1, 'timestamp': int(epoch(stamp))}})),
+            )
+    # 故意传入乱序+嵌套窗口：[05:00,05:30]、[01:00,04:00]、[02:00,03:00]
+    windows = [
+        {'start': '2025-12-31T05:00:00+00:00', 'end': '2025-12-31T05:30:00+00:00'},
+        {'start': '2025-12-31T01:00:00+00:00', 'end': '2025-12-31T04:00:00+00:00'},
+        {'start': '2025-12-31T02:00:00+00:00', 'end': '2025-12-31T03:00:00+00:00'},
+    ]
+    data = archive_data(root, db, '1', '测试', historical_windows=windows,
+                        now=datetime.fromisoformat('2026-01-02T00:30:00+08:00'))
+    old = next(day for day in data['days'] if day['date'] == '2025-12-31')
+    assert old['entries'] == 2

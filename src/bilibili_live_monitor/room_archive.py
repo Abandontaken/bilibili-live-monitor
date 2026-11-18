@@ -2,6 +2,8 @@
 import json
 import math
 import re
+from bisect import bisect_left, bisect_right
+from datetime import date as date_cls
 from datetime import datetime, time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -13,6 +15,22 @@ from .song_followers import merged_windows
 from .time_utils import epoch, iso
 
 ZONE = ZoneInfo('Asia/Shanghai')
+_ARCHIVE_RAW_COMMANDS = ('ONLINE_RANK_COUNT', 'WATCHED_CHANGE', 'ROOM_REAL_TIME_MESSAGE_UPDATE')
+_HISTORY_RAW_COMMANDS = _ARCHIVE_RAW_COMMANDS + ('INTERACT_WORD', 'INTERACT_WORD_V2')
+_DAY_CACHE: dict[int, str] = {}
+
+
+def _shanghai_date(stamp: float) -> str:
+    # 1992年后Asia/Shanghai恒为UTC+8无夏令时；按整天缓存避免百万次datetime构造。
+    if stamp >= 700_000_000:
+        day_num = (math.floor(stamp) + 28800) // 86400
+        cached = _DAY_CACHE.get(day_num)
+        if cached is None:
+            cached = date_cls.fromordinal(day_num + 719163).isoformat()
+            if len(_DAY_CACHE) < 4096:
+                _DAY_CACHE[day_num] = cached
+        return cached
+    return datetime.fromtimestamp(stamp, ZONE).date().isoformat()
 
 
 def within(root, path):
@@ -121,7 +139,7 @@ def archive_data(session_root, database, room_id, name, include_summaries=True, 
                    'summary': {k: summary.get(k)
                                for k in ('followers_change', 'gift_count', 'gift_amount_yuan', 'watched')},
                    'dates': [d for d, _, _ in day_windows(start, end)] or
-                            [datetime.fromtimestamp(start, ZONE).date().isoformat()]}
+                            [_shanghai_date(start)]}
             offline_path = within(root, directory / 'offline_segments.json')
             staged_coverage = []
             if wf.get('stage') == 'completed' and offline_path.is_file():
@@ -164,21 +182,29 @@ def archive_data(session_root, database, room_id, name, include_summaries=True, 
             result['gift_share'] = {'label': share_label, 'percentage': None}
         return value_fields(result)
     earliest = min([a for a, _ in windows] + [epoch(s['start']) for s in sessions])
-    source = read_source(Path(database), room_id, iso(earliest))
+    raw_cmds = _HISTORY_RAW_COMMANDS if history else _ARCHIVE_RAW_COMMANDS
+    item_kinds = ('gift', 'entry') if history else ('gift',)
+    source = read_source(Path(database), room_id, iso(earliest),
+                         raw_commands=raw_cmds, item_json_kinds=item_kinds)
     if sources:
         # 历史库只读到截止前（多读一秒，再按精确边界过滤）。
         source = merge_sources(source, [(read_source(Path(item['database']), room_id, iso(earliest),
-                                                     iso(item['until_epoch'] + 1)),
+                                                     iso(item['until_epoch'] + 1),
+                                                     raw_commands=raw_cmds, item_json_kinds=item_kinds),
                                          item['since_epoch'], item['until_epoch']) for item in sources],
                                sources[-1]['until_epoch'])
     if history:
         # 早期归档可能只有原始进房报文；仅补足已授权历史窗口的缺失事件。
         from .danmaku import entry_message
+        merged_history = merged_windows(history)
+        hist_starts = [a for a, _ in merged_history]
         seen = {item.get('source_key') for kind, _, item in source['items'] if kind == 'entry'}
         for at, command, packet in source['raw']:
             if command not in ('INTERACT_WORD', 'INTERACT_WORD_V2'):
                 continue
-            if not any(a <= epoch(at) <= b for a, b in history):
+            stamp = epoch(at)
+            h_idx = bisect_right(hist_starts, stamp) - 1
+            if not (h_idx >= 0 and stamp <= merged_history[h_idx][1]):
                 continue
             try:
                 entry = entry_message({**packet, 'cmd': command}, received_utc=at)
@@ -189,16 +215,18 @@ def archive_data(session_root, database, room_id, name, include_summaries=True, 
                 source['items'].append(('entry', at, entry))
                 seen.add(entry['source_key'])
     from .archive_summary import summaries
-    session_summaries = summaries(source, sessions) if include_summaries else []
+    all_summaries = summaries(source, sessions)
+    session_summaries = all_summaries if include_summaries else []
     # 场次卡片不再依赖旧快照的投入口径；直接复用同范围原子事件的结果价值。
-    computed = {row['key']: row['metrics']['amount'] for row in
-                (session_summaries if include_summaries else summaries(source, sessions))}
+    computed = {row['key']: row['metrics']['amount'] for row in all_summaries}
     for session in sessions:
         session['summary']['gift_amount_yuan'] = computed.get(session['key'])
     windows = merged_windows(windows)
+    win_starts = [a for a, _ in windows]
 
     def observed(at):
-        return any(a <= at <= b for a, b in windows)
+        idx = bisect_right(win_starts, at) - 1
+        return idx >= 0 and at <= windows[idx][1]
 
     # 已完成场次使用离线覆盖，其余场次使用当前转写覆盖；区间合并防止滑窗重复计时。
     live_windows = [(epoch(s['start']), epoch(s['end'])) for s in sessions if s['key'] not in offline_keys] + history
@@ -226,15 +254,22 @@ def archive_data(session_root, database, room_id, name, include_summaries=True, 
         for start, end in spans:
             for date, a, b in day_windows(start, end):
                 days[date][field] += b - a
-    for kind, at, _ in source['items']:
+
+    observed_message_dates: set[str] = set()
+    gift_items_only = []
+    for kind, at, item in source['items']:
         stamp = epoch(at)
-        if observed(stamp) and kind in ('danmaku', 'entry'):
-            date = datetime.fromtimestamp(stamp, ZONE).date().isoformat()
-            if date in days:
+        if observed(stamp):
+            date = _shanghai_date(stamp)
+            observed_message_dates.add(date)
+            if kind in ('danmaku', 'entry') and date in days:
                 days[date]['danmaku' if kind == 'danmaku' else 'entries'] += 1
+        if kind == 'gift':
+            gift_items_only.append((kind, at, item))
+
     share_amounts = {}
-    for stamp, count, amount, uid, _ in gift_observations(source, platform_uid=True):
-        date = datetime.fromtimestamp(stamp, ZONE).date().isoformat()
+    for stamp, count, amount, uid, _ in gift_observations({'items': gift_items_only}, platform_uid=True):
+        date = _shanghai_date(stamp)
         if observed(stamp) and date in days:
             day = days[date]
             day['gift_count'] += count or 0
@@ -246,55 +281,69 @@ def archive_data(session_root, database, room_id, name, include_summaries=True, 
                     share_amounts[date] = None
                 elif str(uid) in share_uids and share_amounts.get(date, 0) is not None:
                     share_amounts[date] = share_amounts.get(date, 0) + amount / 1000
-    points = sorted((epoch(at), packet['data']['fans']) for at, command, packet in source['raw']
-                    if command == 'ROOM_REAL_TIME_MESSAGE_UPDATE' and isinstance(packet.get('data'), dict)
-                    and nonnegative_integer(packet['data'].get('fans')) is not None)
-    # 粉丝团为平台推送的当前点亮人数（存量），只在开播期间推送；每天取最后一次推送作为收盘值。
-    clubs = sorted((epoch(at), packet['data']['fans_club']) for at, command, packet in source['raw']
-                   if command == 'ROOM_REAL_TIME_MESSAGE_UPDATE' and isinstance(packet.get('data'), dict)
-                   and nonnegative_integer(packet['data'].get('fans_club')) is not None and observed(epoch(at)))
-    watched = sorted((epoch(at), packet['data']['num']) for at, command, packet in source['raw']
-                     if command == 'WATCHED_CHANGE' and isinstance(packet.get('data'), dict)
-                     and nonnegative_integer(packet['data'].get('num')) is not None)
+
+    points = []
+    clubs = []
+    watched = []
+    for at, command, packet in source['raw']:
+        stamp = epoch(at)
+        is_obs = observed(stamp)
+        if is_obs:
+            observed_message_dates.add(_shanghai_date(stamp))
+        if command == 'ROOM_REAL_TIME_MESSAGE_UPDATE' and isinstance(packet.get('data'), dict):
+            data = packet['data']
+            if nonnegative_integer(data.get('fans')) is not None:
+                points.append((stamp, data['fans']))
+            if is_obs and nonnegative_integer(data.get('fans_club')) is not None:
+                clubs.append((stamp, data['fans_club']))
+        elif command == 'WATCHED_CHANGE' and isinstance(packet.get('data'), dict):
+            if nonnegative_integer(packet['data'].get('num')) is not None:
+                watched.append((stamp, packet['data']['num']))
+    points.sort()
+    clubs.sort()
+    watched.sort()
+    point_epochs = [p[0] for p in points]
+    watched_epochs = [w[0] for w in watched]
+
     # 每个场次分别求观察端点差，不把离线期间的粉丝变化归给下一场。
+    sessions_by_key = {s['key']: (epoch(s['start']), epoch(s['end']), s) for s in sessions}
     for date, day in days.items():
         day_end = datetime.combine(datetime.fromisoformat(date).date() + timedelta(days=1), time(), ZONE).timestamp()
         day['watched_sessions'] = []
-        for session in sessions:
-            if session['key'] not in day['session_keys']:
-                continue
-            start, end = epoch(session['start']), epoch(session['end'])
-            values = [(at, n) for at, n in watched if start <= at <= end and at < day_end]
+        for s_key in day['session_keys']:
+            start, end, session = sessions_by_key[s_key]
+            w_left = bisect_left(watched_epochs, start)
+            w_right = min(bisect_right(watched_epochs, end), bisect_left(watched_epochs, day_end))
+            last_watched = watched[w_right - 1] if w_right > w_left else None
             day['watched_sessions'].append({'key': session['key'], 'start': session['start'],
-                'value': values[-1][1] if values else None,
-                'observed_at': iso(values[-1][0]) if values else None})
+                'value': last_watched[1] if last_watched else None,
+                'observed_at': iso(last_watched[0]) if last_watched else None})
         changes = []
         for start, end in windows:
             for d, a, b in day_windows(start, end):
                 if d != date:
                     continue
-                selected = [(at, n) for at, n in points if a <= at < b]
-                prior = [(at, n) for at, n in points if start <= at < a]
-                values = (prior[-1:] + selected) if prior else selected
+                p_a = bisect_left(point_epochs, a)
+                p_b = bisect_left(point_epochs, b)
+                p_start = bisect_left(point_epochs, start)
+                selected = points[p_a:p_b]
+                prior_last = [points[p_a - 1]] if p_a > p_start else []
+                values = prior_last + selected
                 if len(values) >= 2:
                     changes.append(values[-1][1] - values[0][1])
-                    day['followers_partial'] |= not prior and values[0][0] > a
+                    day['followers_partial'] |= not prior_last and values[0][0] > a
                 else:
                     day['followers_partial'] = True
         day['followers_change'] = sum(changes) if changes else None
         day['gift_amount_yuan'] = round(day['gift_amount_yuan'], 3)
-        day['has_message_observations'] = (any(
-            observed(epoch(at)) and datetime.fromtimestamp(epoch(at), ZONE).date().isoformat() == date
-            for at, _, _ in source['raw']) or any(
-            observed(epoch(at)) and datetime.fromtimestamp(epoch(at), ZONE).date().isoformat() == date
-            for _, at, _ in source['items']))
+        day['has_message_observations'] = date in observed_message_dates
         day['has_observations'] = day['coverage_seconds'] > 0 or day['has_message_observations']
         if not day['has_message_observations']:
             for field in ('danmaku', 'entries', 'gift_count', 'gift_amount_yuan'):
                 day[field] = None
     closes = {}
     for at, value in clubs:
-        closes[datetime.fromtimestamp(at, ZONE).date().isoformat()] = (at, value)
+        closes[_shanghai_date(at)] = (at, value)
     previous = None
     for date in sorted(days):
         day = days[date]

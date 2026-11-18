@@ -1,9 +1,10 @@
 import {useEffect,useState} from 'react';
 
+const MAX_CONCURRENT_ARCHIVE_FETCHES=3;
 let running=0;
 const waiting:(()=>void)[]=[];
 async function archiveFetch(url:string,controller:AbortController){
- await new Promise<void>(resolve=>{const start=()=>{running++;resolve()};if(running<2)start();else waiting.push(start)});
+ await new Promise<void>(resolve=>{const start=()=>{running++;resolve()};if(running<MAX_CONCURRENT_ARCHIVE_FETCHES)start();else waiting.push(start)});
  const timeout=setTimeout(()=>controller.abort(),60000);
  try{controller.signal.throwIfAborted();return await fetch(url,{cache:'no-store',signal:controller.signal});}
  finally{clearTimeout(timeout);running--;waiting.shift()?.();}

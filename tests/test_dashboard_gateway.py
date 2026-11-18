@@ -323,3 +323,104 @@ def test_bad_history_sources_fail_at_startup(sources):
     with pytest.raises(ValueError):
         validate_instances([{'id': 'one', 'label': 'one', 'url': 'http://127.0.0.1:1',
                              'archive': {'rooms': {}, 'history_sources': sources}}])
+
+
+def test_anonymous_snapshot_strips_unused_timeline_items_while_account_keeps_them():
+    state = {'rooms': [{'room_id': '123456', 'status': 'capturing',
+                        'items': [{'id': 1, 'text': '弹幕'}], 'segments': [{'seq': 1, 'text': '片段'}]}]}
+    anon = room_snapshot(state, {}, {'account': {'mode': 'anonymous'}}, {'id': 'guest', 'label': '匿名', 'mode': 'anonymous'})
+    acct = room_snapshot(state, {}, {'account': {'mode': 'account'}}, {'id': 'account', 'label': '账号', 'mode': 'account'})
+    assert anon['rooms'][0]['items'] == [] and anon['rooms'][0]['segments'] == []
+    assert len(acct['rooms'][0]['items']) == 1 and len(acct['rooms'][0]['segments']) == 1
+    assert len(state['rooms'][0]['items']) == 1
+
+
+def test_same_day_stale_archive_returns_cached_immediately_and_refreshes_in_background(tmp_path, monkeypatch):
+    import time as time_mod
+
+    from bilibili_live_monitor import dashboard_gateway, room_archive
+
+    clock = [1000.0]
+    monkeypatch.setattr(dashboard_gateway.time, 'monotonic', lambda: clock[0])
+    versions = [1]
+
+    def aggregate(*args, **kwargs):
+        val = versions[0]
+        return {'periods': [{'days': 7, 'observed_days': val}], 'sessions': [], 'days': [], 'summaries': [],
+                'updated_at': f'v{val}', 'timezone': 'Asia/Shanghai', 'warnings': 0}
+
+    monkeypatch.setattr(room_archive, 'archive_data', aggregate)
+    config = {'instances': [{'id': 'one', 'label': '合成', 'url': 'http://127.0.0.1:8765',
+              'session_root': str(tmp_path), 'archive': {'database': 'unused', 'rooms': {'123456': '合成'}}}]}
+    with TestClient(dashboard_gateway.create_gateway(config)) as client:
+        path = '/instances/one/api/rooms/123456/archive?overview=true'
+        assert client.get(path).json()['updated_at'] == 'v1'
+        versions[0] = 2
+        clock[0] = 1350.0  # 超过300s TTL，仍在同一自然日
+        # 首次过期读取立即返回旧值并触发后台刷新
+        assert client.get(path).json()['updated_at'] == 'v1'
+        for _ in range(40):
+            time_mod.sleep(0.01)
+            if client.get(path).json()['updated_at'] == 'v2':
+                break
+        assert client.get(path).json()['updated_at'] == 'v2'
+
+
+def test_prewarm_archives_populates_cache_on_startup(tmp_path, monkeypatch):
+    import time as time_mod
+
+    from bilibili_live_monitor import dashboard_gateway, room_archive
+
+    calls = []
+
+    def aggregate(_root, _db, room_id, *_args, **_kwargs):
+        calls.append(room_id)
+        return {'periods': [{'days': 7, 'observed_days': 3}], 'sessions': [], 'days': [], 'summaries': [],
+                'updated_at': 'warm', 'timezone': 'Asia/Shanghai', 'warnings': 0}
+
+    monkeypatch.setattr(room_archive, 'archive_data', aggregate)
+    config = {'instances': [{'id': 'one', 'label': '合成', 'url': 'http://127.0.0.1:8765',
+              'session_root': str(tmp_path), 'hidden_rooms': ['999'],
+              'archive': {'database': 'unused', 'rooms': {'999': '隐藏', '123': '可见'}}}]}
+    with TestClient(dashboard_gateway.create_gateway(config, prewarm_archives=True)) as client:
+        for _ in range(50):
+            if len(calls) >= 2:
+                break
+            time_mod.sleep(0.01)
+        assert calls[:2] == ['123', '999']
+        assert client.get('/instances/one/api/rooms/123/archive?overview=true').json()['updated_at'] == 'warm'
+        assert len(calls) == 2
+
+
+def test_cross_midnight_archive_computation_does_not_poison_next_day_cache(tmp_path, monkeypatch):
+    from datetime import datetime
+
+    from bilibili_live_monitor import dashboard_gateway, room_archive
+
+    current_day = [1]
+
+    class RollingClock:
+        @staticmethod
+        def now(tz):
+            return datetime(2031, 1, current_day[0], 0, 0, 1, tzinfo=tz)
+
+    monkeypatch.setattr(dashboard_gateway, 'datetime', RollingClock)
+    seen_days = []
+
+    def aggregate(*_args, **kwargs):
+        now_arg = kwargs['now']
+        seen_days.append(now_arg.date().isoformat())
+        # 模拟聚合执行期间跨过午夜：archive_data返回前时钟已进入次日
+        current_day[0] = 2
+        return {'periods': [{'days': 7, 'end': now_arg.date().isoformat(), 'observed_days': 1}],
+                'sessions': [], 'days': [], 'summaries': [], 'updated_at': 'ok', 'timezone': 'Asia/Shanghai', 'warnings': 0}
+
+    monkeypatch.setattr(room_archive, 'archive_data', aggregate)
+    config = {'instances': [{'id': 'one', 'label': '合成', 'url': 'http://127.0.0.1:8765',
+              'session_root': str(tmp_path), 'archive': {'database': 'unused', 'rooms': {'123456': '合成'}}}]}
+    with TestClient(dashboard_gateway.create_gateway(config)) as client:
+        path = '/instances/one/api/rooms/123456/archive?overview=true'
+        assert client.get(path).json()['periods'][0]['end'] == '2031-01-01'
+        # 次日首次请求不应把昨日窗口当成今日命中，必须立即重算次日窗口
+        assert client.get(path).json()['periods'][0]['end'] == '2031-01-02'
+        assert seen_days == ['2031-01-01', '2031-01-02']

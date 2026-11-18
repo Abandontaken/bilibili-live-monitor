@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 
 
 def epoch(value: str) -> float:
-    parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+    parsed = datetime.fromisoformat(value[:-1] + '+00:00' if value.endswith('Z') else value)
     if parsed.tzinfo is None:
         raise ValueError('时间必须带时区')
     return parsed.timestamp()
