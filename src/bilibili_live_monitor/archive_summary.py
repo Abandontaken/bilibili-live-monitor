@@ -7,7 +7,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
-from .archive_metrics import aggregate_metrics
+from .archive_metrics import aggregate_prepared_metrics, prepare_archive_source
 from .gift_value import VALUE_BASIS
 from .time_utils import epoch
 
@@ -17,10 +17,12 @@ FIELDS = ('online_mean', 'online_peak', 'watched_last', 'followers_net', 'amount
 
 def summaries(source, sessions):
     rows = []
+    prepared = prepare_archive_source(source) if sessions else None
+    shanghai = ZoneInfo('Asia/Shanghai')
     for session in sessions:
         lower, upper = epoch(session['start']), epoch(session['end'])
-        metrics = aggregate_metrics(source, lower, upper)
-        local = datetime.fromtimestamp(lower, ZoneInfo('Asia/Shanghai'))
+        metrics = aggregate_prepared_metrics(prepared, lower, upper)
+        local = datetime.fromtimestamp(lower, shanghai)
         rows.append({'key': session['key'], 'date': local.date().isoformat(),
                      'session': '上午场' if local.hour < 12 else '下午场' if local.hour < 19 else '晚间场',
                      'start_utc': session['start'], 'updated_at': session['end'],

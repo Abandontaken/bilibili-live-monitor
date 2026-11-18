@@ -109,9 +109,26 @@ def presentation_sessions(instance):
     return result
 
 
-def room_snapshot(state, platform, automation, instance, sessions=()):
+def _read_session_status(root_str, key, fallback_stage):
+    root = Path(root_str).resolve()
+    directory = (root / key).resolve()
+    if not directory.is_relative_to(root):
+        return None
+    stage = fallback_stage
+    status = directory / 'workflow.json'
+    try:
+        if status.exists():
+            saved = json.loads(status.read_text())
+            if isinstance(saved, dict):
+                stage = saved.get('stage', fallback_stage)
+    except (OSError, ValueError):
+        stage = ('_unreadable', fallback_stage)
+    return stage, (directory / 'public/index.html').is_file()
+
+
+def room_snapshot(state, platform, automation, instance, sessions=(), status_cache=None):
     account = automation.get('account', {})
-    mode = account.get('mode', 'account')
+    mode = instance.get('mode') or account.get('mode', 'account')
     label = '匿名' if mode == 'anonymous' else next(
         (p['label'] for p in account.get('profiles', []) if p['id'] == account.get('active')), instance['label'])
     aliases = instance.get('_room_aliases', {})
@@ -158,8 +175,13 @@ def room_snapshot(state, platform, automation, instance, sessions=()):
     # 已移交其他实例的房间不在本实例首页显示；房间主页与历史场次链接仍可直接访问。
     for rid in hidden:
         rooms.pop(rid, None)
+    now_mono = time.monotonic()
     for rid, room in rooms.items():
         room.update(instance_id=instance['id'], instance_label=label, account_mode=mode)
+        if mode == 'anonymous':
+            # 匿名紧凑卡片与顶部汇总均不展示逐条弹幕/切片；裁剪掉约1.7MB/2s的无用SSE载荷，完整导出仍走/api/export。
+            room['items'] = []
+            room['segments'] = []
         if rid in instance.get('archive', {}).get('rooms', {}):
             room['home_url'] = f'rooms/{rid}/'
             room['display_name'] = instance['archive']['rooms'][rid]
@@ -168,29 +190,139 @@ def room_snapshot(state, platform, automation, instance, sessions=()):
             latest = max(records, key=lambda r: r.get('start', ''))
             key = latest.get('key', '')
             if re.fullmatch(r'[a-f0-9]{24}', key) and instance.get('session_root'):
-                root = Path(instance['session_root']).resolve()
-                directory = (root / key).resolve()
-                if directory.is_relative_to(root):
-                    status = directory / 'workflow.json'
-                    room['workflow_stage'] = latest.get('stage')
-                    try:
-                        if status.exists():
-                            saved = json.loads(status.read_text())
-                            if isinstance(saved, dict):
-                                room['workflow_stage'] = saved.get('stage', latest.get('stage'))
-                    except (OSError, ValueError):
+                cache_key = (instance['id'], key, latest.get('stage'))
+                cached_meta = status_cache.get(cache_key) if status_cache is not None else None
+                if cached_meta and now_mono - cached_meta[0] < 5:
+                    meta = cached_meta[1]
+                else:
+                    meta = _read_session_status(instance['session_root'], key, latest.get('stage'))
+                    if status_cache is not None:
+                        status_cache[cache_key] = (now_mono, meta)
+                if meta is not None:
+                    stage_val, has_html = meta
+                    if isinstance(stage_val, tuple) and stage_val[0] == '_unreadable':
                         logging.getLogger(__name__).warning('房间 %s 的场次状态不可读，保留采集状态', rid)
-                    if (directory / 'public/index.html').is_file():
+                        room['workflow_stage'] = stage_val[1]
+                    else:
+                        room['workflow_stage'] = stage_val
+                    if has_html:
                         room['result_url'] = f'sessions/{key}/'
     ordered = [rooms[rid] for rid in fixed_ids] + [r for rid, r in rooms.items() if rid not in fixed_ids]
     return {**state, 'rooms': ordered, 'instance_label': label,
             'fixed_task_count': len(fixed_ids), 'raw_fixed_count': len(fixed)}
 
 
-def create_gateway(config, *, transport=None):
+def create_gateway(config, *, transport=None, prewarm_archives=False):
     from .dashboard_resources import resource_url, yamon_metrics
     resources_url = resource_url(config.get('resources_url'))
     instances = validate_instances(config['instances'])
+    enable_prewarm = bool(prewarm_archives or config.get('prewarm_archives'))
+    archive_cache = {}
+    archive_locks = {}
+    bg_refreshing = set()
+    bg_tasks = set()
+    bg_semaphore = asyncio.Semaphore(1)
+    session_cache = {}
+    status_cache = {}
+    snapshot_cache = {}
+    snapshot_locks = {}
+    reconciliation_cache = {}
+
+    def instance(ident):
+        if ident not in instances:
+            raise HTTPException(404, '未知监控实例')
+        return instances[ident]
+
+    def archive_room(ident, room_id):
+        row = instance(ident)
+        archive = row.get('archive', {})
+        if (room_id not in archive.get('rooms', {}) or not re.fullmatch(r'\d+', room_id)
+                or not row.get('session_root') or not archive.get('database')):
+            raise HTTPException(404, '未配置房间主页')
+        return row, archive
+
+    async def _compute_archive(ident, room_id):
+        row, archive = archive_room(ident, room_id)
+        from .room_archive import archive_data
+        # 统一采样同一上海时间基准传入archive_data并标记缓存，杜绝跨午夜返回时将昨日窗口误标为今日。
+        computed_now = datetime.now(ZoneInfo('Asia/Shanghai'))
+        computed_day = computed_now.date().isoformat()
+        summary_file = archive.get('summary_files', {}).get(room_id)
+        data = await asyncio.to_thread(archive_data, row['session_root'], archive['database'],
+                                       room_id, archive['rooms'][room_id], not bool(summary_file),
+                                       now=computed_now,
+                                       gift_share=archive.get('gift_share', {}).get(room_id),
+                                       historical_windows=archive.get('historical_windows', {}).get(room_id, []),
+                                       historical_root=archive.get('historical_root'),
+                                       history_sources=archive.get('history_sources', {}).get(room_id, []))
+        data['mode'] = row.get('mode', 'account')
+        if summary_file:
+            from .archive_summary import shared_summaries
+            data['summaries'] = await asyncio.to_thread(shared_summaries, summary_file,
+                [{**s, 'start_utc': s['start']} for s in data['sessions']],
+                archive.get('summary_origins', {}).get(room_id))
+            data['summary_source'] = 'shared'
+            if ('gift_share' in data and archive.get('gift_share', {}).get(room_id, {})
+                    .get('overall_from_summaries') is True):
+                from .period_overview import summary_gift_share
+                data['gift_share'] = summary_gift_share(data['summaries'], data['gift_share']['label'])
+        archive_cache[ident, room_id] = time.monotonic(), data, computed_day
+        return data
+
+    def _schedule_bg_archive_refresh(ident, room_id):
+        key = (ident, room_id)
+        if key in bg_refreshing:
+            return
+        bg_refreshing.add(key)
+
+        async def _runner():
+            try:
+                async with bg_semaphore:
+                    async with archive_locks.setdefault(key, asyncio.Lock()):
+                        await _compute_archive(ident, room_id)
+            except Exception:
+                logging.getLogger(__name__).debug('后台刷新房间归档 %s/%s 失败，保留既有缓存', ident, room_id, exc_info=True)
+            finally:
+                bg_refreshing.discard(key)
+
+        task = asyncio.create_task(_runner())
+        bg_tasks.add(task)
+        task.add_done_callback(bg_tasks.discard)
+
+    async def _prewarm_loop():
+        try:
+            while True:
+                today = datetime.now(ZoneInfo('Asia/Shanghai')).date().isoformat()
+                now_mono = time.monotonic()
+                targets = []
+                for ident, row in instances.items():
+                    arch = row.get('archive', {})
+                    if not row.get('session_root') or not arch.get('database'):
+                        continue
+                    hidden = set(row.get('hidden_rooms', []))
+                    for rid in arch.get('rooms', {}):
+                        if not re.fullmatch(r'\d+', str(rid)):
+                            continue
+                        cached = archive_cache.get((ident, rid))
+                        if not cached or cached[2] != today or now_mono - cached[0] >= 240:
+                            targets.append((rid in hidden, ident, rid))
+                # 优先预热首页可见房间，隐藏的历史房间排在后面。
+                targets.sort(key=lambda item: item[0])
+                for _, ident, rid in targets:
+                    async with bg_semaphore:
+                        try:
+                            async with archive_locks.setdefault((ident, rid), asyncio.Lock()):
+                                cached = archive_cache.get((ident, rid))
+                                cur_today = datetime.now(ZoneInfo('Asia/Shanghai')).date().isoformat()
+                                if not cached or cached[2] != cur_today or time.monotonic() - cached[0] >= 240:
+                                    await _compute_archive(ident, rid)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            logging.getLogger(__name__).debug('预热房间归档 %s/%s 失败', ident, rid, exc_info=True)
+                await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            return
 
     @asynccontextmanager
     async def lifespan(app):
@@ -198,7 +330,17 @@ def create_gateway(config, *, transport=None):
             row['_room_aliases'] = await asyncio.to_thread(presentation_aliases, row)
         async with httpx.AsyncClient(timeout=20, follow_redirects=False, trust_env=False, transport=transport) as client:
             app.state.client = client
-            yield
+            warmer = asyncio.create_task(_prewarm_loop()) if enable_prewarm else None
+            try:
+                yield
+            finally:
+                if warmer is not None:
+                    warmer.cancel()
+                    await asyncio.gather(warmer, return_exceptions=True)
+                for task in list(bg_tasks):
+                    task.cancel()
+                if bg_tasks:
+                    await asyncio.gather(*list(bg_tasks), return_exceptions=True)
 
     app = FastAPI(title='B站统一监控看板', lifespan=lifespan)
 
@@ -209,34 +351,35 @@ def create_gateway(config, *, transport=None):
         if response.headers.get('content-type', '').startswith('text/html'):
             response.headers['Cache-Control'] = 'no-cache'
         return response
-    archive_cache = {}
-    archive_locks = {}
-    session_cache = {}
-    reconciliation_cache = {}
-
-    def instance(ident):
-        if ident not in instances:
-            raise HTTPException(404, '未知监控实例')
-        return instances[ident]
 
     async def snapshot(row):
-        responses = await asyncio.gather(*(app.state.client.get(row['url'] + path)
-            for path in ('/api/state', '/api/platform', '/api/automation')))
-        for response in responses:
-            response.raise_for_status()
-        cached = session_cache.get(row['id'])
-        if not cached or time.monotonic() - cached[0] >= 30:
-            records = await asyncio.to_thread(presentation_sessions, row)
-            cached = session_cache[row['id']] = (time.monotonic(), records)
-        return room_snapshot(*(response.json() for response in responses), row, sessions=cached[1])
-
-    def archive_room(ident, room_id):
-        row = instance(ident)
-        archive = row.get('archive', {})
-        if (room_id not in archive.get('rooms', {}) or not re.fullmatch(r'\d+', room_id)
-                or not row.get('session_root') or not archive.get('database')):
-            raise HTTPException(404, '未配置房间主页')
-        return row, archive
+        # 真实网络模式下对0.5s内的并发state/SSE请求合并采样，减少多标签页或刷新时的重复拉取。
+        if transport is None:
+            snap_cached = snapshot_cache.get(row['id'])
+            if snap_cached and time.monotonic() - snap_cached[0] < 0.5:
+                return snap_cached[1]
+        async with snapshot_locks.setdefault(row['id'], asyncio.Lock()):
+            if transport is None:
+                snap_cached = snapshot_cache.get(row['id'])
+                if snap_cached and time.monotonic() - snap_cached[0] < 0.5:
+                    return snap_cached[1]
+            responses = await asyncio.gather(*(app.state.client.get(row['url'] + path)
+                for path in ('/api/state', '/api/platform', '/api/automation')))
+            for response in responses:
+                response.raise_for_status()
+            cached = session_cache.get(row['id'])
+            if not cached or time.monotonic() - cached[0] >= 30:
+                records = await asyncio.to_thread(presentation_sessions, row)
+                cached = session_cache[row['id']] = (time.monotonic(), records)
+            result = room_snapshot(
+                *(response.json() for response in responses),
+                row,
+                sessions=cached[1],
+                status_cache=status_cache if transport is None else None,
+            )
+            if transport is None:
+                snapshot_cache[row['id']] = (time.monotonic(), result)
+            return result
 
     @app.get('/instances/{ident}/api/rooms/{room_id}/archive')
     async def room_archive(ident: str, room_id: str, trend: bool = False, overview: bool = False):
@@ -248,11 +391,19 @@ def create_gateway(config, *, transport=None):
                 return {key: value for key, value in {**data, 'periods': [p for p in data.get('periods', [])
                     if p['days'] == 7]}.items() if key in ('periods', 'updated_at', 'timezone', 'warnings')}
             return {'summaries': data.get('summaries', []), 'updated_at': data.get('updated_at')} if trend else data
+        ttl = 300 if trend or overview else 30
+        today = datetime.now(ZoneInfo('Asia/Shanghai')).date().isoformat()
+        cached = archive_cache.get((ident, room_id))
+        if cached and cached[2] == today:
+            if time.monotonic() - cached[0] >= ttl:
+                _schedule_bg_archive_refresh(ident, room_id)
+            return project(cached[1])
         async with archive_locks.setdefault((ident, room_id), asyncio.Lock()):
-            cached = archive_cache.get((ident, room_id))
             today = datetime.now(ZoneInfo('Asia/Shanghai')).date().isoformat()
-            if (cached and cached[2] == today
-                    and time.monotonic() - cached[0] < (300 if trend or overview else 30)):
+            cached = archive_cache.get((ident, room_id))
+            if cached and cached[2] == today:
+                if time.monotonic() - cached[0] >= ttl:
+                    _schedule_bg_archive_refresh(ident, room_id)
                 return project(cached[1])
             summary_file = archive.get('summary_files', {}).get(room_id)
             if trend and summary_file:
@@ -264,28 +415,9 @@ def create_gateway(config, *, transport=None):
                 except (OSError, ValueError, TypeError) as error:
                     raise HTTPException(503, '暂时无法读取场次趋势') from error
             try:
-                from .room_archive import archive_data
-                summary_file = archive.get('summary_files', {}).get(room_id)
-                data = await asyncio.to_thread(archive_data, row['session_root'], archive['database'],
-                                               room_id, archive['rooms'][room_id], not bool(summary_file),
-                                               gift_share=archive.get('gift_share', {}).get(room_id),
-                                               historical_windows=archive.get('historical_windows', {}).get(room_id, []),
-                                               historical_root=archive.get('historical_root'),
-                                               history_sources=archive.get('history_sources', {}).get(room_id, []))
-                data['mode'] = row.get('mode', 'account')
-                if summary_file:
-                    from .archive_summary import shared_summaries
-                    data['summaries'] = await asyncio.to_thread(shared_summaries, summary_file,
-                        [{**s, 'start_utc': s['start']} for s in data['sessions']],
-                        archive.get('summary_origins', {}).get(room_id))
-                    data['summary_source'] = 'shared'
-                    if ('gift_share' in data and archive.get('gift_share', {}).get(room_id, {})
-                            .get('overall_from_summaries') is True):
-                        from .period_overview import summary_gift_share
-                        data['gift_share'] = summary_gift_share(data['summaries'], data['gift_share']['label'])
+                data = await _compute_archive(ident, room_id)
             except (OSError, ValueError, TypeError) as error:
                 raise HTTPException(503, '暂时无法读取房间归档，请稍后刷新') from error
-            archive_cache[ident, room_id] = time.monotonic(), data, today
             return project(data)
 
     @app.get('/instances/{ident}/rooms/{room_id}/')
@@ -464,7 +596,7 @@ def main():
     parser.add_argument('--config', type=Path, required=True)
     parser.add_argument('--port', type=int, default=8767)
     args = parser.parse_args()
-    uvicorn.run(create_gateway(json.loads(args.config.read_text())), host='127.0.0.1', port=args.port)
+    uvicorn.run(create_gateway(json.loads(args.config.read_text()), prewarm_archives=True), host='127.0.0.1', port=args.port)
 
 
 if __name__ == '__main__':
