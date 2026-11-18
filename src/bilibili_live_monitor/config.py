@@ -76,6 +76,58 @@ class Settings:
             raise ValueError('babysitter命令需为JSON字符串数组；调度间隔和并发需为正数')
 
 
+CAPTURE_CONFIG_TYPES = {
+    'capture_backend': str,
+    'record_mode': str,
+    'audio_format': str,
+    'audio_bitrate': str,
+    'direct_handshake_interval': (int, float),
+    'asr_enabled': bool,
+    'preview_enabled': bool,
+    'recording_segment_seconds': int,
+    'max_rooms': int,
+    'queue_size': int,
+}
+
+
+def _automation_capture_overrides(automation_config: str) -> dict:
+    path_str = (automation_config or '').strip()
+    if not path_str:
+        return {}
+    path = Path(path_str)
+    if not path.is_file():
+        return {}
+    data = json.loads(path.read_text(encoding='utf-8'))
+    if not isinstance(data, dict) or 'capture' not in data:
+        return {}
+    raw = data['capture']
+    if not isinstance(raw, dict):
+        raise ValueError('automation.capture须为JSON对象')
+    overrides = {}
+    for key, value in raw.items():
+        expected = CAPTURE_CONFIG_TYPES.get(key)
+        if expected is None:
+            raise ValueError(f'automation.capture包含不支持的字段：{key}')
+        if expected is bool:
+            if type(value) is not bool:
+                raise ValueError(f'automation.capture.{key}须为布尔值')
+            overrides[key] = value
+        elif expected is int:
+            if type(value) is not int:
+                raise ValueError(f'automation.capture.{key}须为整数')
+            overrides[key] = value
+        elif expected == (int, float):
+            if type(value) not in (int, float):
+                raise ValueError(f'automation.capture.{key}须为数值')
+            overrides[key] = float(value)
+        else:
+            if not isinstance(value, str):
+                raise ValueError(f'automation.capture.{key}须为字符串')
+            overrides[key] = value.strip().lower() if key in ('capture_backend', 'audio_format', 'audio_bitrate') else value
+    return overrides
+
+
 def load_settings():
     load_dotenv()
-    return Settings()
+    automation_config = os.getenv('AUTOMATION_CONFIG', '')
+    return Settings(**_automation_capture_overrides(automation_config))
