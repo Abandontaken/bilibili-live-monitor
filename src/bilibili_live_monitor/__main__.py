@@ -22,6 +22,8 @@ from .pk_bar import configure_parser as configure_pk_bar
 from .pk_bar import main as pk_bar_main
 from .recording_archive import configure_parser as configure_archive
 from .recording_archive import main as archive_main
+from .room_discovery import configure_parser as configure_room_discovery
+from .room_discovery import main as room_discovery_main
 from .rotation import configure_parser as configure_rotation
 from .rotation import main as rotation_main
 from .trailer import configure_parser as configure_trailer
@@ -53,7 +55,10 @@ def main():
     configure_gift_render(commands)
     configure_pk_bar(commands)
     configure_warehouse(commands)
+    configure_room_discovery(commands)
     args = parser.parse_args()
+    if args.command == 'room-discovery':
+        return room_discovery_main(args)
     if args.command == 'warehouse':
         return warehouse_main(args)
     if args.command == 'pk-bar':
