@@ -1,5 +1,11 @@
 # 工作记录
 
+## PK 动画版复用流程纠正（2026-11-19）
+
+- 修正礼物重渲染工作流遗漏样式参数而退回基础 PK 条的问题。PK skill 示例明确列出原网页动画素材、比分粗斜体和倒计时正体参数；沿用已验收版本前核对历史计划及素材/字体指纹。
+- CLI 帮助明确未传 `--style-assets` 只有基础渐变条，不改变基础模式和现有渲染实现；不新增框架。
+- 验收要求检查多时刻箭头/光效/字体，从无旧 PK 条的底片重渲染；只改画面时复用已验证总音轨并核对音频包哈希。
+
 ## 数仓短长房号按主播 UID 归并、外部赛道台账接入与离线 ASR 全局并发信号量（2026-11-19）
 
 - **数仓短/长房号按 `anchor_uid` 归并**：`warehouse.py` 为 `dim_rooms` 增加 `short_room_id` 平滑迁移列，并在源库增量扫描（`_IdentityBatch.flush`）、已完成场次入库（`_ingest_completed_session`）与入库后对账（`_reconcile_rooms_and_metadata`）三处统一按 `anchor_uid`、`platform_room_id` 及 `short_room_id` 正反向并查集归并靓号短房号与平台规范长房号，自动将历史分裂记录在单事务内合并至规范长房号并同步更新 `dim_sessions`、`fact_events`、`fact_room_metrics`、`fact_cohost_intervals` 与 `fact_session_presence`。
