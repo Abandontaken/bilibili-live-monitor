@@ -360,7 +360,10 @@ class Monitor:
                     await self.direct.acquire_handshake_slot()
                     danmu_info = await self.direct.fetch_danmu_info(real_room_id)
                     if room.get('record_mode', 'none') != 'none':
-                        stream_url = await self.direct.fetch_stream_url(real_room_id)
+                        qn = (getattr(self.settings, 'direct_audio_qn', 80)
+                              if room.get('record_mode') == 'audio'
+                              else getattr(self.settings, 'direct_video_qn', 10000))
+                        stream_url = await self.direct.fetch_stream_url(real_room_id, qn=qn)
                         recorder = Recording(self.settings, room)
                         await recorder.start(stream_url)
                     ws_task = asyncio.create_task(

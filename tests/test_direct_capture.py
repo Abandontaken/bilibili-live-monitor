@@ -117,7 +117,16 @@ def test_settings_defaults_and_direct_constraints(tmp_path):
     assert direct_default.capture_backend == 'direct'
     assert direct_default.audio_format == 'opus'
     assert direct_default.audio_bitrate == '32k'
+    assert direct_default.direct_audio_qn == 80
+    assert direct_default.direct_video_qn == 10000
     assert direct_default.direct_handshake_interval == 2.5
+
+    with pytest.raises(ValueError, match='direct_audio_qn'):
+        Settings(data_dir=tmp_path, capture_backend='direct', direct_audio_qn=0)
+    with pytest.raises(ValueError, match='direct_audio_qn'):
+        Settings(data_dir=tmp_path, capture_backend='direct', direct_audio_qn=True)
+    with pytest.raises(ValueError, match='direct_video_qn'):
+        Settings(data_dir=tmp_path, capture_backend='direct', direct_video_qn=30001)
 
     with pytest.raises(ValueError, match='opus或mka'):
         Settings(data_dir=tmp_path, capture_backend='direct', audio_format='wav')
@@ -1050,5 +1059,137 @@ async def test_monitor_capture_direct_reconnects_then_halts_on_refusal(tmp_path)
     assert room_state['reconnect_attempts'] == 2
     assert 'recording_refused' in room_state['error']
     assert room_state['next_retry_utc'] is None
+    await monitor.close()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_fetch_stream_url_qn_negotiation_and_monitor_mode_routing(tmp_path):
+    calls: list[tuple[str, dict[str, str]]] = []
+    live_status = 1
+    accept_qn = [10000]
+    v2_current_qn = 10000
+    _unset = object()
+    v1_status = 200
+    v1_payload_override = _unset
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append((request.url.path, dict(request.url.params)))
+        if request.url.path.endswith('/getRoomPlayInfo'):
+            return httpx.Response(200, json={
+                'code': 0,
+                'data': {
+                    'live_status': live_status,
+                    'playurl_info': {
+                        'playurl': {
+                            'stream': [{
+                                'protocol_name': 'http_stream',
+                                'format': [{
+                                    'format_name': 'flv',
+                                    'codec': [{
+                                        'codec_name': 'avc',
+                                        'current_qn': v2_current_qn,
+                                        'accept_qn': accept_qn,
+                                        'base_url': f'/live-bvc/stream_{v2_current_qn}.flv',
+                                        'url_info': [{'host': 'https://cdn.example.org', 'extra': '?from=v2'}],
+                                    }],
+                                }],
+                            }],
+                        },
+                    },
+                },
+            })
+        if request.url.path.endswith('/Room/playUrl'):
+            if v1_status != 200:
+                return httpx.Response(v1_status, text='server error')
+            if v1_payload_override is not _unset:
+                return httpx.Response(200, json=v1_payload_override)
+            req_qn = int(request.url.params['qn'])
+            return httpx.Response(200, json={
+                'code': 0,
+                'data': {
+                    'current_qn': req_qn,
+                    'durl': [{'url': f'https://cdn.example.org/live-bvc/stream_{req_qn}.flv?from=v1'}],
+                },
+            })
+        raise AssertionError(str(request.url))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        direct = DirectClient(handshake_interval=0.0, http_client=http)
+        direct.ensure_guest = AsyncMock(return_value=GuestIdentity('guest3', 'guest4', '', '', 0))
+
+        with pytest.raises(ValueError, match='正整数'):
+            await direct.fetch_stream_url(123456, qn=True)
+
+        # 单档位房间（仅 10000）：请求 qn=80 时服务端回退 10000，不额外请求 v1 playUrl
+        url_single = await direct.fetch_stream_url(123456, qn=80)
+        assert url_single == 'https://cdn.example.org/live-bvc/stream_10000.flv?from=v2'
+        assert calls == [('/xlive/web-room/v2/index/getRoomPlayInfo', {
+            'room_id': '123456', 'protocol': '0,1', 'format': '0,1,2', 'codec': '0,1',
+            'qn': '80', 'platform': 'web', 'ptype': '8', 'dolby': '5', 'panorama': '1',
+        })]
+
+        # 多档位房间（v2 游客钳制在 250，但 accept_qn 含 150）：协商获取更低码率 150 流
+        calls.clear()
+        accept_qn = [10000, 400, 250, 150]
+        v2_current_qn = 250
+        url_low = await direct.fetch_stream_url(123456, qn=80)
+        assert url_low == 'https://cdn.example.org/live-bvc/stream_150.flv?from=v1'
+        assert len(calls) == 2
+        assert calls[1] == ('/room/v1/Room/playUrl', {'cid': '123456', 'qn': '150', 'platform': 'web'})
+
+        # 请求档位（如 400）高于所有可用低档位（250/150/80）时，选择最接近的最高可用低档 250 而非 80
+        calls.clear()
+        accept_qn = [10000, 250, 150, 80]
+        v2_current_qn = 10000
+        url_nearest = await direct.fetch_stream_url(123456, qn=400)
+        assert url_nearest == 'https://cdn.example.org/live-bvc/stream_250.flv?from=v1'
+        assert calls[1] == ('/room/v1/Room/playUrl', {'cid': '123456', 'qn': '250', 'platform': 'web'})
+
+        # 离线或轮播（live_status=0/2）在 qn=80 下立即抛出 RoomNotLive，不请求 v1 playUrl
+        for offline_state in (0, 2):
+            calls.clear()
+            live_status = offline_state
+            with pytest.raises(RoomNotLive) as exc_info:
+                await direct.fetch_stream_url(123456, qn=80)
+            assert exc_info.value.live_status == offline_state
+            assert len(calls) == 1
+        live_status = 1
+
+        # v1 接口 HTTP 异常或非字典响应时无缝回退 v2 已取得的流地址，不中断录制
+        accept_qn = [10000, 400, 250, 150]
+        v2_current_qn = 250
+        v1_status = 502
+        assert await direct.fetch_stream_url(123456, qn=80) == 'https://cdn.example.org/live-bvc/stream_250.flv?from=v2'
+        v1_status = 200
+        for malformed in (None, ['unexpected'], {'code': 0, 'data': 'bad'}):
+            v1_payload_override = malformed
+            assert await direct.fetch_stream_url(123456, qn=80) == 'https://cdn.example.org/live-bvc/stream_250.flv?from=v2'
+        v1_payload_override = _unset
+
+        # 视频模式请求 qn=10000 时不触发低档位降级
+        calls.clear()
+        url_video = await direct.fetch_stream_url(123456, qn=10000)
+        assert url_video == 'https://cdn.example.org/live-bvc/stream_250.flv?from=v2'
+        assert len(calls) == 1
+
+    # 验证 Monitor.capture_direct 按房间 record_mode 分别透传 direct_audio_qn / direct_video_qn
+    store = Store(tmp_path / 'monitor.sqlite3')
+    settings = Settings(data_dir=tmp_path, capture_backend='direct', direct_audio_qn=150, direct_video_qn=10000)
+    monitor = Monitor(settings, store)
+    monitor.direct.acquire_handshake_slot = AsyncMock()
+    monitor.direct.fetch_danmu_info = AsyncMock(return_value=None)
+    monitor.direct.fetch_stream_url = AsyncMock(side_effect=RoomNotLive(0))
+
+    for mode, expected_qn in (('audio', 150), ('video', 10000)):
+        monitor.direct.fetch_stream_url.reset_mock()
+        room = {'room_id': '123456', 'real_room_id': '123456', 'record_mode': mode, 'status': 'capturing'}
+        store.room(room)
+        monitor.generations['123456'] = f'gen-{mode}'
+        task = asyncio.create_task(monitor.capture_direct(room, f'gen-{mode}'))
+        monitor.tasks['123456'] = task
+        await asyncio.wait_for(task, 2)
+        monitor.direct.fetch_stream_url.assert_awaited_once_with(123456, qn=expected_qn)
+
     await monitor.close()
     store.close()
