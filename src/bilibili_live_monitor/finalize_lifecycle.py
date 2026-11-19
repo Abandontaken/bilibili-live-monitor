@@ -64,10 +64,13 @@ def supervise(config, state, session, root, now, *, key='coordinator_watch'):
         (key == 'audience_watch' and config.get('author_agent') in ('cursor_grok_cli', 'grok_build_cli'))
         or (key != 'audience_watch' and config.get('final_subagent') in ('cursor_cli_grok', 'grok_build_cli'))
     )
+    author = config.get('author_agent')
     review_line = (
         f'沿用原输入、原模型、已有结果和CLI回执。\n检查分片进度，有候选则实质语义审核后accept；全部通过后{finish_steps}。'
         if uses_cli else
-        f'检查既有结果和冻结输入；仅把未完成分片通过task派发给冻结的 {config["author_agent"]} 子代理；全部通过后{finish_steps}。'
+        f'检查既有结果和冻结输入；仅把未完成分片通过task派发给冻结的 {author} 子代理；全部通过后{finish_steps}。'
+        if key == 'audience_watch' and author else
+        f'执行路由未知，不得派发新分片；如既有结果全部通过则{finish_steps}。'
         if key == 'audience_watch' else
         f'沿用原输入、原模型和已有分片结果。\n检查分片进度，未完成分片通过task派发给plan.json指定的subagent写入对应result路径，核验覆盖与指纹后{finish_steps}。'
     )
