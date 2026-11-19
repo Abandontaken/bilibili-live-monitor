@@ -5,6 +5,7 @@ import pytest
 from test_cursor_finalize import setup
 
 from bilibili_live_monitor import cursor_finalize as finalize
+from bilibili_live_monitor import finalize_lifecycle as lifecycle
 from bilibili_live_monitor.cursor_finalize import CURSOR_AUTHOR, frozen_author
 
 
@@ -52,6 +53,20 @@ def test_legacy_crm_route_not_guessed_after_switch(tmp_path):
     prompt.write_text('Launcher托管单片Cursor')
     assert frozen_author({}, tmp_path) == CURSOR_AUTHOR
     assert frozen_author({'author_agent': finalize.GROK_BACKEND}, tmp_path) == finalize.GROK_BACKEND
+
+
+def test_native_crm_idle_wake_names_frozen_agent(tmp_path, monkeypatch):
+    from subprocess import CompletedProcess
+
+    monkeypatch.setattr(lifecycle, 'ai_control', lambda *_args, **_kw: {'type': 'idle'})
+    monkeypatch.setattr(lifecycle.subprocess, 'run', lambda *_args, **_kw: CompletedProcess([], 0, '', ''))
+    config = {'author_agent': 'general', 'model': 'example/coordinator',
+              'opencode_python': 'python', 'opencode_cwd': str(tmp_path), 'workspace': str(tmp_path)}
+    state = {'audience_watch': {'last_wake_at': 0, 'attempts': 0}}
+    lifecycle.supervise(config, state, 'test-session', tmp_path, 301, key='audience_watch')
+    prompt = (tmp_path / 'resume_prompt.md').read_text()
+    assert '冻结的 general 子代理' in prompt
+    assert 'plan.json指定的subagent' not in prompt
 
 
 @pytest.mark.parametrize(('code', 'text', 'model', 'ready'), [
