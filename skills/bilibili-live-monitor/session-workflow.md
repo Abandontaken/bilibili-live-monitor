@@ -118,6 +118,8 @@ python -m bilibili_live_monitor.audience_crm build --config .local/example-crm.j
 
 ### 终审分片路由与匿名弹幕实名叠加
 
+可用 `final_subagent: "grok_build_cli"` 或 CRM 的 `author_agent: "grok_build_cli"` 选择 xAI Grok Build CLI。执行机器须已通过 `grok login` 登录，并确认 `grok models` 列出 `grok-4.7`。程序显式请求该模型，不继承 `XAI_API_KEY`；仅接受 CLI 正常退出、终态 `end_turn`、实际模型 `grok-4.7-build` 且候选存在的分片，随后仍须进行语义审核与 `accept`。总协调模型仍独立配置。既有分片入口及回执目录名保持兼容；已冻结场次或批次不随默认值重新派发。
+
 音乐与杂谈终审默认使用 OpenCode 原生 `final_subagent`（如 `"general"`）配合 `final_model`（如 `"qwen38/qwen3.8-27b"` 或 `"ollama-cloud/glm-5.3-flash"`）直接通过 `task` 分片写出 `NNN.result.json` 并执行 `finish`，无需依赖 Cursor CLI。也可设置 `final_subagent: "cursor_cli_grok"`，通过本机 Launcher 托管 Cursor CLI 分片：分片固定使用 `grok-4.7-high`，总协调由显式 `final_model: "provider/model"` 独立选择，不继承实时 `model`；必须启用 `finalize_parallel`，并发上限为十，总协调审核候选并执行 `accept` 后继续合并、来源登记与完成验收。热加载默认值只影响后续初始化的场次，已有场次保留其冻结配置。
 
 `session_workflow` 支持可选配置 `warehouse_database: "/PRIVATE/live_warehouse.sqlite3"`（透传至单场 `config.json`）。生成 `talk_finalize` 与 `session_finalize` 的纠错旁证 `danmaku` 时，若弹幕昵称为匿名打码格式（如 `某***`，不含 `神秘人`），程序自动只读构建本场 `raw_events` 明文身份池并按需只读查询数仓 `dim_users` / `dim_user_faces`，将解出的真实昵称填入分片输入供同音字纠错引用，不修改源库 `monitor.sqlite3`。

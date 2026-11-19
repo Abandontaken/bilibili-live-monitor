@@ -34,9 +34,9 @@ def validate_settings(config, rooms):
         raise ValueError('final_concurrency须为1到10的整数')
     if not isinstance(config.get('final_subagent', 'general'), str) or not config.get('final_subagent', 'general').strip():
         raise ValueError('final_subagent须为非空agent名称')
-    if config.get('final_subagent') == 'cursor_cli_grok':
+    if config.get('final_subagent') in ('cursor_cli_grok', 'grok_build_cli'):
         if 'final_model' not in config:
-            raise ValueError('cursor_cli_grok须显式设置final_model，禁止继承实时模型')
+            raise ValueError('CLI终审须显式设置final_model，禁止继承实时模型')
         if config.get('finalize_parallel', True) is not True:
             raise ValueError('Cursor分片须启用finalize_parallel')
     if 'warehouse_database' in config and config['warehouse_database'] is not None:

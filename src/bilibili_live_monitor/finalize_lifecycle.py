@@ -60,13 +60,13 @@ def supervise(config, state, session, root, now, *, key='coordinator_watch'):
                     if key == 'audience_watch' else
                     '仅按原talk_finalize finish合同收尾；禁止音乐merge/corrections'
                     if root.name == 'talk_finalize' else '按原合同merge/校正重审/finish')
-    uses_cursor = (
-        (key == 'audience_watch' and config.get('author_agent') == 'cursor_grok_cli')
-        or (key != 'audience_watch' and config.get('final_subagent') == 'cursor_cli_grok')
+    uses_cli = (
+        (key == 'audience_watch' and config.get('author_agent') in ('cursor_grok_cli', 'grok_build_cli'))
+        or (key != 'audience_watch' and config.get('final_subagent') in ('cursor_cli_grok', 'grok_build_cli'))
     )
     review_line = (
         f'沿用原输入、原模型、已有结果和CLI回执。\n检查分片进度，有候选则实质语义审核后accept；全部通过后{finish_steps}。'
-        if uses_cursor else
+        if uses_cli else
         f'沿用原输入、原模型和已有分片结果。\n检查分片进度，未完成分片通过task派发给plan.json指定的subagent写入对应result路径，核验覆盖与指纹后{finish_steps}。'
     )
     prompt = root / 'resume_prompt.md'
