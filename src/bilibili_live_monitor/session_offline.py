@@ -105,8 +105,20 @@ def run_offline(config, state):
     unavailable = sum(row.get('sealed') != 'sealed_readable' for row in rows)
     if unavailable:
         raise RuntimeError(f'{unavailable}个本场文件尚不可读取，保留清单并重试，不将部分稿当作全场完成')
-    args = SimpleNamespace(full=True, sample=None, max_files=None, model=config['asr_model'],
-                           chunk_seconds=30.1, start_timeout=180, infer_timeout=180)
+    args = SimpleNamespace(
+        full=True,
+        sample=None,
+        max_files=None,
+        model=config['asr_model'],
+        chunk_seconds=30.1,
+        start_timeout=180,
+        infer_timeout=180,
+        max_concurrent=config.get('asr_max_concurrent'),
+        global_lock_dir=config.get('asr_lock_dir'),
+        slot_deadline=state.get('finish_deadline'),
+        budget_on_slot_timeout=True,
+        respect_session_pause=True,
+    )
     offline_asr._sync(out, rows, offline_asr.build_plan(rows, None))
     pending = offline_asr.pending_rows(out, rows, args)
     if pending:

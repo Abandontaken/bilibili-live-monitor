@@ -19,12 +19,13 @@
 以下路径与房间号均为公开文档占位示例，实际运行数据存放在私有 `.local/` 目录：
 
 ```bash
-# 1. 增量扫描源库字典并将已完成场次标准化入库（天然幂等）
+# 1. 增量扫描源库字典并将已完成场次标准化入库（天然幂等；可选传入外部房间台账归并短长房号并写入赛道分类）
 bili-live warehouse sync \
   --warehouse /PRIVATE/warehouse.sqlite3 \
   --source account=/PRIVATE/account/monitor.sqlite3 \
   --source anonymous=/PRIVATE/anonymous/monitor.sqlite3 \
-  --session-root /PRIVATE/anonymous/live_sessions
+  --session-root /PRIVATE/anonymous/live_sessions \
+  --room-registry /PRIVATE/room_registry.json
 
 # 单场解析升级或重验时，可按 workflow_key 事务重入（传 * 重入全部已完成场次）
 bili-live warehouse sync \
