@@ -5,14 +5,13 @@ import time
 from pathlib import Path
 
 from . import audience_crm as crm
+from .cursor_finalize import CURSOR_AUTHOR, GROK_BACKEND, frozen_author
 from .live_share import atomic_json
-
-CURSOR_AUTHOR = 'cursor_grok_cli'
 
 
 def cursor_prompt(session, config, directory, prompt):
     """保留CRM内容与总协调模型，只替换按人的执行后端。"""
-    if config['author_agent'] != CURSOR_AUTHOR:
+    if config['author_agent'] not in (CURSOR_AUTHOR, GROK_BACKEND):
         return prompt
     old = f"仅对reused=false（本场有新互动、新提名或来源变更）的任务使用task的{config['author_agent']}子代理处理input/result，最多同时10个；不可静默改模型或创建下一级代理。"
     prompt = prompt.replace(old, '仅对reused=false的任务使用Cursor Grok CLI查证；不使用OpenCode task，不创建下一级代理。')
@@ -21,7 +20,7 @@ def cursor_prompt(session, config, directory, prompt):
     from .deployment import task_command
     command = task_command(session, 'bilibili_live_monitor.cursor_finalize', component='crm') + ' ' + shlex.join([
         'start', '--config', session['_config_path'], '--kind', 'audience_finalize'])
-    return prompt + f'''
+    rendered = prompt + f'''
 总协调仍由本OpenCode会话完成，先创建可见todo并按人更新状态、CLI session及验收结果；总协调模型保持原指定配置，不改成分片模型。
 plan.tasks按列表位置从0编号，补零至少3位，例如000；编号对应同一person_id，不把person_id当数字序号。
 对每个非reused任务调用 `{command} --shard 000`，替换实际编号。Launcher托管单片Cursor，固定grok-4.7-high、每片45分钟、最多10并发；同批启动所有就绪片，不把长CLI直接塞进短bash，不用sleep占满工具预算。
@@ -31,6 +30,13 @@ Cursor只写候选，总协调逐项查证引用归属、未决承诺与previous
 等待全部分片实际退出并验收，仍按原合同统一audience_crm finish，保留冻结材料、来源查证、逐字引用校验与current指针事务，不运行音乐终审的merge/corrections，不发布不通知。
 程序负责同会话回访，不创建临时脚本或定时任务；不能用idle代替完成。超过本场预算或不可恢复时如实报告失败。
 '''
+    if config['author_agent'] == GROK_BACKEND:
+        rendered = (rendered.replace('Cursor Grok CLI', 'Grok Build CLI')
+                    .replace('单片Cursor', '单片Grok Build CLI').replace('grok-4.7-high', 'grok-4.7')
+                    .replace('stream init含CLI session_id', '终态JSON含CLI sessionId')
+                    .replace('最终result/success/is_error=false', '终态end_turn及实际模型grok-4.7-build')
+                    .replace('Cursor只写', 'Grok Build CLI只写').replace('无Cursor回执', '无CLI回执'))
+    return rendered
 
 def load_settings(session):
     path = Path(session['audience_crm_config'])
@@ -94,7 +100,8 @@ def advance(session, state):
         config['_include_session'] = session['_config_path']
         directory, plan = crm.prepare(config, crm.load_material(config))
         atomic_json(marker, {'run': str(directory), 'plan_id': plan['id'],
-                            'budget_state_path': str(state_path)})
+                            'budget_state_path': str(state_path),
+                            'author_agent': config['author_agent']})
     saved = json.loads(marker.read_text())
     if saved.get('budget_state_path') != str(state_path):
         saved['budget_state_path'] = str(state_path)
@@ -123,6 +130,7 @@ def advance(session, state):
         state['audience_crm'] = {'plan_id': result['plan_id'], 'people': result['people'],
                                  'published': result.get('status') == 'published'}
         return True
+    config['author_agent'] = frozen_author(saved, root)
     if not state.get('audience_session'):
         state['audience_session'] = ensure_ai(session, 'audience_finalize')
         atomic_json(state_path, state)
@@ -156,5 +164,6 @@ plan.json中reused=true的任务已由程序校验复用上一版result，直接
         state.pop('audience_dispatch_uncertain', None)
         state['audience_submitted'] = True
     from .finalize_lifecycle import supervise
-    supervise(session, state, ai_session, root, time.time(), key='audience_watch')
+    supervise({**session, 'author_agent': config['author_agent']},
+              state, ai_session, root, time.time(), key='audience_watch')
     return False
