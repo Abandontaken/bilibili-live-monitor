@@ -182,3 +182,173 @@ async def test_nested_publish_types_fail_before_state_change(tmp_path, publish):
         await service.reload_rooms(incoming)
     assert service.config == before
     assert service.rooms == before['rooms']
+
+
+@pytest.mark.asyncio
+async def test_capture_hot_reload_updates_runtime_settings_and_rejects_non_reloadable_fields(tmp_path, monkeypatch):
+    import json
+
+    from bilibili_live_monitor.accounts import Accounts
+    from bilibili_live_monitor.config import load_settings
+    from bilibili_live_monitor.monitor import Monitor
+    from bilibili_live_monitor.platform import Candidate, Platform, Policy
+
+    settings = Settings(
+        data_dir=tmp_path,
+        capture_backend='direct',
+        max_rooms=30,
+        direct_handshake_interval=1.5,
+    )
+    # 构造 Settings 后注入宿主干扰环境变量，验证 Automation 基线与 parse_capture_overrides 均不受污染
+    monkeypatch.setenv('MAX_ROOMS', '999')
+    monkeypatch.setenv('DIRECT_AUDIO_QN', '0')
+    monkeypatch.setenv('BABYSITTER_INTERVAL_SECONDS', '-5')
+    store = Store(tmp_path / 'monitor.sqlite3')
+    monitor = Monitor(settings, store)
+    platform = Platform(monitor)
+    platform.import_candidates([
+        Candidate(url='https://live.bilibili.com/123456'),
+        Candidate(url='https://live.bilibili.com/654321'),
+    ])
+    platform.configure(Policy(
+        enabled=True,
+        target_rooms=2,
+        mode='fixed',
+        fixed_rooms=['https://live.bilibili.com/123456', 'https://live.bilibili.com/654321'],
+        record_mode='audio',
+    ))
+
+    # 初始化时 capture.max_rooms 小于当前 target_rooms 必须拒绝
+    too_small_init = {
+        'profiles': {'anon': {'mode': 'anonymous', 'label': '匿名'}},
+        'active_profile': 'anon',
+        'rooms': {'123456': {'label': '测试主播', 'intro': '仅匿名监控', 'welcome_enabled': False}},
+        'capture': {'capture_backend': 'direct', 'max_rooms': 1},
+    }
+    accounts = Accounts(settings, too_small_init)
+    with pytest.raises(ValueError, match='target_rooms'):
+        Automation(platform, accounts, too_small_init)
+    assert settings.max_rooms == 30
+
+    # 初始配置自带动态字段时，基线仍保留显式 Settings(max_rooms=30, direct_handshake_interval=1.5)
+    base_config = {
+        'profiles': {'anon': {'mode': 'anonymous', 'label': '匿名'}},
+        'active_profile': 'anon',
+        'rooms': {'123456': {'label': '测试主播', 'intro': '仅匿名监控', 'welcome_enabled': False}},
+        'capture': {
+            'capture_backend': 'direct',
+            'record_mode': 'audio',
+            'audio_format': 'opus',
+            'audio_bitrate': '32k',
+            'direct_handshake_interval': 3.0,
+            'max_rooms': 50,
+            'asr_enabled': False,
+            'preview_enabled': False,
+        },
+    }
+    service = Automation(platform, accounts, base_config)
+    service.start = AsyncMock()
+    assert settings.max_rooms == 50
+    assert settings.direct_handshake_interval == 3.0
+    assert monitor.direct.handshake_interval == 3.0
+
+    updated = deepcopy(base_config)
+    updated['capture'].update(
+        direct_audio_qn=150,
+        direct_video_qn=400,
+        direct_handshake_interval=1.25,
+        audio_bitrate='48k',
+        recording_segment_seconds=120,
+        max_rooms=60,
+    )
+    res = await service.reload_rooms(updated)
+    assert res['accepted'] is True
+    assert res['capture'] == {
+        'direct_audio_qn': 150,
+        'direct_video_qn': 400,
+        'direct_handshake_interval': 1.25,
+        'audio_bitrate': '48k',
+        'recording_segment_seconds': 120,
+        'max_rooms': 60,
+    }
+    assert settings.direct_audio_qn == 150
+    assert settings.direct_video_qn == 400
+    assert settings.direct_handshake_interval == 1.25
+    assert monitor.direct.handshake_interval == 1.25
+    assert settings.audio_bitrate == '48k'
+    assert settings.recording_segment_seconds == 120
+    assert settings.max_rooms == 60
+
+    # 移除所有动态字段（含初始就存在的 max_rooms 与 direct_handshake_interval）时，回退至显式 Settings 基线
+    stripped_cfg = deepcopy(base_config)
+    for k in ('max_rooms', 'direct_handshake_interval', 'audio_bitrate'):
+        stripped_cfg['capture'].pop(k, None)
+    await service.reload_rooms(stripped_cfg)
+    assert settings.direct_audio_qn == 80
+    assert settings.direct_video_qn == 10000
+    assert settings.max_rooms == 30
+    assert settings.direct_handshake_interval == 1.5
+    assert monitor.direct.handshake_interval == 1.5
+
+    # 非热加载字段、越界值与小于当前 target_rooms 的 max_rooms 均原子拒绝
+    snapshot = deepcopy(service.config)
+    for bad_patch in (
+        {'capture_backend': 'cdp'},
+        {'record_mode': 'video'},
+        {'asr_enabled': True},
+        {'preview_enabled': True},
+        {'audio_format': 'mka'},
+        {'queue_size': 50},
+        {'direct_audio_qn': 0},
+        {'direct_audio_qn': True},
+        {'audio_bitrate': 'invalid'},
+        {'recording_segment_seconds': 5},
+        {'max_rooms': 1},
+    ):
+        broken = deepcopy(stripped_cfg)
+        broken['capture'].update(bad_patch)
+        with pytest.raises(ValueError):
+            await service.reload_rooms(broken)
+        assert service.config == snapshot
+        assert settings.direct_audio_qn == 80
+        assert settings.max_rooms == 30
+        assert monitor.direct.handshake_interval == 1.5
+
+    await service.close()
+    await platform.close()
+    await monitor.close()
+    store.close()
+
+    # 验证 load_settings() 入口保留合法环境变量基线并忽略被 automation.capture 覆盖的脏环境变量
+    auto_file = tmp_path / 'auto_env.json'
+    auto_file.write_text(json.dumps({
+        'profiles': {'anon': {'mode': 'anonymous', 'label': '匿名'}},
+        'active_profile': 'anon',
+        'rooms': {'123456': {'label': '测试主播', 'intro': '仅匿名监控', 'welcome_enabled': False}},
+        'capture': {'capture_backend': 'direct', 'direct_audio_qn': 250, 'max_rooms': 80},
+    }))
+    monkeypatch.setenv('DATA_DIR', str(tmp_path / 'env_data'))
+    monkeypatch.setenv('AUTOMATION_CONFIG', str(auto_file))
+    monkeypatch.setenv('MAX_ROOMS', '40')
+    monkeypatch.setenv('DIRECT_AUDIO_QN', '0')
+    monkeypatch.setenv('BABYSITTER_INTERVAL_SECONDS', '300')
+    loaded = load_settings()
+    assert loaded.max_rooms == 80 and loaded.direct_audio_qn == 250
+    store2 = Store(loaded.data_dir / 'monitor.sqlite3')
+    mon2 = Monitor(loaded, store2)
+    plat2 = Platform(mon2)
+    acc2 = Accounts(loaded, json.loads(auto_file.read_text()))
+    svc2 = Automation(plat2, acc2, json.loads(auto_file.read_text()))
+    svc2.start = AsyncMock()
+    await svc2.reload_rooms({
+        'profiles': {'anon': {'mode': 'anonymous', 'label': '匿名'}},
+        'active_profile': 'anon',
+        'rooms': {'123456': {'label': '测试主播', 'intro': '仅匿名监控', 'welcome_enabled': False}},
+        'capture': {'capture_backend': 'direct'},
+    })
+    assert loaded.max_rooms == 40
+    assert loaded.direct_audio_qn == 80
+    await svc2.close()
+    await plat2.close()
+    await mon2.close()
+    store2.close()

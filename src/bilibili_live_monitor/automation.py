@@ -1,5 +1,6 @@
 """持久房间自动化：跨场守候、明确外发开关和账号隔离。"""
 import asyncio
+import dataclasses
 import hashlib
 import html
 import json
@@ -9,6 +10,7 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
+from .config import HOT_RELOADABLE_CAPTURE_KEYS, Settings, parse_capture_overrides
 from .likes import trigger_likes
 from .room_config import capture_overrides, reload_plan, validate_rooms
 from .welcome import WelcomeDecision, correct_page, message_limit, observations, send_chat, welcome_messages
@@ -49,6 +51,30 @@ class Automation:
         self.workflows = SessionWorkflows(self, config.get('session_workflow', {}))
         self.platform.session_workflow_rooms = set(self.rooms) if self.workflows.enabled else set()
         self.platform.room_capture_overrides = capture_overrides(self.rooms)
+        self._base_capture_settings = {}
+        settings = self._settings_obj()
+        if isinstance(settings, Settings):
+            baseline = getattr(settings, '_capture_baseline', None)
+            self._base_capture_settings = (
+                dict(baseline)
+                if isinstance(baseline, dict)
+                else {k: getattr(settings, k) for k in HOT_RELOADABLE_CAPTURE_KEYS}
+            )
+            initial_capture = parse_capture_overrides(self.config)
+            if any(k in initial_capture for k in HOT_RELOADABLE_CAPTURE_KEYS):
+                merged_init = {
+                    k: initial_capture.get(k, self._base_capture_settings[k])
+                    for k in HOT_RELOADABLE_CAPTURE_KEYS
+                }
+                validated_init = dataclasses.replace(settings, **merged_init)
+                target_rooms = getattr(getattr(self.platform, 'policy', None), 'target_rooms', 0)
+                if validated_init.max_rooms < target_rooms:
+                    raise ValueError('automation.capture.max_rooms不能小于当前platform.policy.target_rooms')
+                for k in HOT_RELOADABLE_CAPTURE_KEYS:
+                    setattr(settings, k, getattr(validated_init, k))
+                direct = getattr(getattr(self.platform, 'monitor', None), 'direct', None)
+                if direct is not None:
+                    direct.handshake_interval = settings.direct_handshake_interval
         if self._is_direct():
             if any(cfg.get('welcome_enabled') for cfg in self.rooms.values()):
                 raise ValueError('direct模式仅支持匿名只读采集，禁止启用浏览器自动欢迎')
@@ -70,10 +96,12 @@ class Automation:
                 self.row(rid).pop('variant_id', None)
         self.save()
 
-    def _is_direct(self):
-        settings = getattr(self.platform, 'settings', None) or getattr(
+    def _settings_obj(self):
+        return getattr(self.platform, 'settings', None) or getattr(
             getattr(self.platform, 'monitor', None), 'settings', None)
-        return getattr(settings, 'capture_backend', 'cdp') == 'direct'
+
+    def _is_direct(self):
+        return getattr(self._settings_obj(), 'capture_backend', 'cdp') == 'direct'
 
     def save(self):
         self.store.save_control('automation', self.state)
@@ -159,6 +187,18 @@ class Automation:
 
     async def reload_rooms(self, config):
         config = reload_plan(self.config, config)
+        capture_updates = parse_capture_overrides(config)
+        settings = self._settings_obj()
+        validated_settings = None
+        if isinstance(settings, Settings):
+            merged_capture = {
+                k: capture_updates.get(k, self._base_capture_settings[k])
+                for k in HOT_RELOADABLE_CAPTURE_KEYS
+            }
+            validated_settings = dataclasses.replace(settings, **merged_capture)
+            target_rooms = getattr(getattr(self.platform, 'policy', None), 'target_rooms', 0)
+            if validated_settings.max_rooms < target_rooms:
+                raise ValueError('automation.capture.max_rooms不能小于当前platform.policy.target_rooms')
         rooms = self.prepare_room_configs(config.get('rooms', {}))
         if self._is_direct() and any(cfg.get('welcome_enabled') for cfg in rooms.values()):
             raise ValueError('direct模式仅支持匿名只读采集，禁止启用浏览器自动欢迎')
@@ -167,6 +207,12 @@ class Automation:
         cancelled = []
         # No await before replacing all references and revoking changed sends.
         # Existing session records retain their frozen URL and workspace.
+        if isinstance(settings, Settings) and validated_settings is not None:
+            for k in HOT_RELOADABLE_CAPTURE_KEYS:
+                setattr(settings, k, getattr(validated_settings, k))
+            direct = getattr(getattr(self.platform, 'monitor', None), 'direct', None)
+            if direct is not None:
+                direct.handshake_interval = settings.direct_handshake_interval
         self.rooms = rooms
         self.variants = variants
         self.workflows.config = deepcopy(config.get('session_workflow', {}))
@@ -186,7 +232,10 @@ class Automation:
         if cancelled:
             await asyncio.gather(*cancelled, return_exceptions=True)
         await self.start()
-        return {'accepted': True, 'added': added, 'rooms': sorted(rooms)}
+        result = {'accepted': True, 'added': added, 'rooms': sorted(rooms)}
+        if isinstance(settings, Settings):
+            result['capture'] = {k: getattr(settings, k) for k in HOT_RELOADABLE_CAPTURE_KEYS}
+        return result
 
     async def start(self):
         if self.rooms and (self.loop is None or self.loop.done()):

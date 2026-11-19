@@ -1,5 +1,12 @@
 # 工作记录
 
+## 直连音频模式低码率流画质协商与动态采集参数热加载（2026-11-18）
+
+- **直连模式按录制模式分离请求画质档位**：`config.py` 新增 `DIRECT_AUDIO_QN`（默认 `80`）与 `DIRECT_VIDEO_QN`（默认 `10000`），`Monitor.capture_direct` 在 `record_mode == 'audio'` 时默认请求最低码率档位以降低多路并发下行带宽，在 `record_mode == 'video'` 时保持原画请求。
+- **保留 `v2` 开播状态门禁并按需协商低档位流**：`DirectClient.fetch_stream_url` 先经 `v2/index/getRoomPlayInfo` 校验 `live_status`（防止误录未开播或轮播回放）；当游客态 `v2` 响应将 `current_qn` 钳制在较高档位（如 `250`）且 `accept_qn` 明确存在更低转码档位（如 `150`/`80`）时，再向 `v1/Room/playUrl` 请求对应低档位 HTTP-FLV 流，失败或异常时无缝回退 `v2` 已取得的流地址。
+- **`automation.capture` 动态参数热加载**：`room_config.reload_plan` 与 `Automation.reload_rooms` 支持通过 `POST /api/automation/reload` 原子热更新 `direct_audio_qn`、`direct_video_qn`、`direct_handshake_interval`（同步更新在线 `DirectClient.handshake_interval`）、`audio_bitrate`、`recording_segment_seconds` 与 `max_rooms`（禁止小于当前 `platform.policy.target_rooms`），非动态字段（如 `capture_backend`、`audio_format`、`queue_size`）变更或越界值均在生效前原子拒绝。
+- **验证**：Python 全套测试 `1463 passed`，`ruff check src tests scripts` 通过。
+
 ## 舰队快照错误分类、拒绝退避自愈与查播单轮快速重试（2026-11-18）
 
 - **统一 `REFUSED_CODES` 覆盖舰队快照**：`room_status.guard_snapshot` 与 `DirectClient.guard_snapshot` 复用 `rotation.REFUSED_CODES`（仅 `-101/-111/-352/-403/-412/401/403/412/429` 抛出 `RoomStatusRefused`），业务 `code=-500` 等临时服务错误改为抛出普通 `RuntimeError`，60 秒后自动恢复，不再永久置位 `guard_refused`。

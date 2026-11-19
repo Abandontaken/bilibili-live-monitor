@@ -629,17 +629,26 @@ class DirectClient:
             raise RuntimeError(f'getDanmuInfo 失败: code={code} message={payload.get("message")}')
         raise RuntimeError('getDanmuInfo 签名刷新重试后仍失败')
 
-    async def fetch_stream_url(self, real_room_id: int | str) -> str:
+    async def fetch_stream_url(self, real_room_id: int | str, *, qn: int = 10000) -> str:
         """获取直播流地址，优先 HTTP-FLV（单流低开销），回退 HLS。"""
         rid = int(real_room_id)
+        if isinstance(qn, bool):
+            raise ValueError('直播流画质档位 qn 须为正整数')
+        requested_qn = int(qn)
+        if requested_qn < 1:
+            raise ValueError('直播流画质档位 qn 须为正整数')
         guest = await self.ensure_guest()
         client = self._client()
+        headers = {
+            'Referer': f'https://live.bilibili.com/{rid}',
+            'Cookie': f'buvid3={guest.buvid3}; buvid4={guest.buvid4}',
+        }
         params = {
             'room_id': rid,
             'protocol': '0,1',
             'format': '0,1,2',
             'codec': '0,1',
-            'qn': 10000,
+            'qn': requested_qn,
             'platform': 'web',
             'ptype': 8,
             'dolby': 5,
@@ -648,10 +657,7 @@ class DirectClient:
         resp = await client.get(
             'https://api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInfo',
             params=params,
-            headers={
-                'Referer': f'https://live.bilibili.com/{rid}',
-                'Cookie': f'buvid3={guest.buvid3}; buvid4={guest.buvid4}',
-            },
+            headers=headers,
         )
         if resp.status_code in (403, 412, 429):
             raise RuntimeError(f'recording_refused: getRoomPlayInfo HTTP {resp.status_code}')
@@ -671,6 +677,10 @@ class DirectClient:
         flv_any: list[str] = []
         hls_any: list[str] = []
         fallback: list[str] = []
+        primary_current_qn: int | None = None
+        primary_accept_qn: list[int] = []
+        fallback_current_qn: int | None = None
+        fallback_accept_qn: list[int] = []
         for st in streams:
             proto_name = st.get('protocol_name')
             for fmt in st.get('format') or []:
@@ -678,14 +688,22 @@ class DirectClient:
                 for cd in fmt.get('codec') or []:
                     codec_name = cd.get('codec_name')
                     base_url = cd.get('base_url') or ''
+                    cur_qn = int(cd.get('current_qn') or 0) or None
+                    acc_qn = [x for x in (cd.get('accept_qn') or []) if type(x) is int and x > 0]
                     for u in cd.get('url_info') or []:
                         host = u.get('host') or ''
                         if not host or not base_url:
                             continue
                         full = f'{host}{base_url}{u.get("extra") or ""}'
+                        if fallback_current_qn is None and cur_qn is not None:
+                            fallback_current_qn = cur_qn
+                            fallback_accept_qn = acc_qn
                         if proto_name == 'http_stream' and fmt_name == 'flv':
                             if codec_name == 'avc':
                                 flv_avc.append(full)
+                                if primary_current_qn is None and cur_qn is not None:
+                                    primary_current_qn = cur_qn
+                                    primary_accept_qn = acc_qn
                             else:
                                 flv_any.append(full)
                         elif proto_name == 'http_hls':
@@ -695,6 +713,30 @@ class DirectClient:
         chosen = (flv_avc or flv_any or hls_any or fallback)
         if not chosen:
             raise RuntimeError(f'recording_url_missing：未找到可用直播流地址 room={rid}')
+        v2_cur_qn = primary_current_qn if primary_current_qn is not None else fallback_current_qn
+        v2_acc_qn = primary_accept_qn if primary_current_qn is not None else fallback_accept_qn
+        if v2_cur_qn is not None and requested_qn < v2_cur_qn:
+            lower_tiers = [t for t in v2_acc_qn if t < v2_cur_qn]
+            if lower_tiers:
+                target_qn = min((t for t in lower_tiers if t >= requested_qn), default=max(lower_tiers))
+                try:
+                    v1_resp = await client.get(
+                        'https://api.live.bilibili.com/room/v1/Room/playUrl',
+                        params={'cid': rid, 'qn': target_qn, 'platform': 'web'},
+                        headers=headers,
+                    )
+                    if v1_resp.status_code == 200:
+                        v1_payload = v1_resp.json()
+                        raw_data = v1_payload.get('data') if isinstance(v1_payload, dict) and v1_payload.get('code') == 0 else None
+                        v1_data = raw_data if isinstance(raw_data, dict) else {}
+                        v1_cur_qn = int(v1_data.get('current_qn') or 0)
+                        durls = v1_data.get('durl')
+                        first_durl = durls[0] if isinstance(durls, list) and durls and isinstance(durls[0], dict) else {}
+                        v1_url = str(first_durl.get('url') or '').strip()
+                        if v1_url.startswith(('http://', 'https://')) and 0 < v1_cur_qn < v2_cur_qn:
+                            return v1_url
+                except (httpx.HTTPError, ValueError, TypeError, KeyError):
+                    pass
         return chosen[0]
 
     async def stream_danmaku(
