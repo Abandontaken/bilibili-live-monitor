@@ -1,30 +1,12 @@
 """场次结束后的观众状态更新；独立总会话用指定子代理处理按人分片。"""
 import json
-import re
 import shlex
 import time
 from pathlib import Path
 
 from . import audience_crm as crm
-from .cursor_finalize import BACKEND, GROK_BACKEND
+from .cursor_finalize import CURSOR_AUTHOR, GROK_BACKEND, frozen_author
 from .live_share import atomic_json
-
-CURSOR_AUTHOR = 'cursor_grok_cli'
-
-
-def frozen_author(marker, root, requested):
-    if 'author_agent' in marker:
-        return marker['author_agent']
-    if requested != GROK_BACKEND:
-        return requested
-    prompt_file = root / 'prompt.md'
-    prompt = prompt_file.read_text() if prompt_file.is_file() else ''
-    if 'Launcher托管单片Cursor' in prompt:
-        return CURSOR_AUTHOR
-    match = re.search(r'使用task的([\w.-]+)子代理处理input/result', prompt)
-    if match:
-        return match[1]
-    raise ValueError('无法确认既有CRM计划的原始执行路由，请保留原配置处理')
 
 
 def cursor_prompt(session, config, directory, prompt):
@@ -119,10 +101,8 @@ def advance(session, state):
         directory, plan = crm.prepare(config, crm.load_material(config))
         atomic_json(marker, {'run': str(directory), 'plan_id': plan['id'],
                             'budget_state_path': str(state_path),
-                            'author_agent': config['author_agent'],
-                            'worker_backend': GROK_BACKEND if config['author_agent'] == GROK_BACKEND else BACKEND})
+                            'author_agent': config['author_agent']})
     saved = json.loads(marker.read_text())
-    config['author_agent'] = frozen_author(saved, root, config['author_agent'])
     if saved.get('budget_state_path') != str(state_path):
         saved['budget_state_path'] = str(state_path)
         atomic_json(marker, saved)
@@ -150,6 +130,7 @@ def advance(session, state):
         state['audience_crm'] = {'plan_id': result['plan_id'], 'people': result['people'],
                                  'published': result.get('status') == 'published'}
         return True
+    config['author_agent'] = frozen_author(saved, root)
     if not state.get('audience_session'):
         state['audience_session'] = ensure_ai(session, 'audience_finalize')
         atomic_json(state_path, state)

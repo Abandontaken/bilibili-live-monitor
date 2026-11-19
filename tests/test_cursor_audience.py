@@ -23,7 +23,8 @@ def make(tmp_path):
     directory, plan = crm.prepare(cfg, material)
     marker = Path(session['workspace']) / 'audience_finalize'
     marker.mkdir()
-    atomic_json(marker / 'plan.json', {'run': str(directory), 'plan_id': plan['id']})
+    atomic_json(marker / 'plan.json', {'run': str(directory), 'plan_id': plan['id'],
+                                      'author_agent': 'cursor_grok_cli'})
     return session, cfg, directory, plan, material
 
 

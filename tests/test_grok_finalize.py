@@ -5,7 +5,7 @@ import pytest
 from test_cursor_finalize import setup
 
 from bilibili_live_monitor import cursor_finalize as finalize
-from bilibili_live_monitor.audience_finalize import CURSOR_AUTHOR, frozen_author
+from bilibili_live_monitor.cursor_finalize import CURSOR_AUTHOR, frozen_author
 
 
 @pytest.mark.parametrize(('stop', 'model', 'expected'), [
@@ -27,9 +27,10 @@ def test_crm_dispatch_uses_frozen_backend(tmp_path):
     marker = root / 'plan.json'
     config = {'workspace': str(tmp_path), 'final_subagent': finalize.GROK_BACKEND}
     marker.write_text('{}')
+    (root / 'prompt.md').write_text('Launcher托管单片Cursor')
     assert finalize.shard_backend(config, 'audience_finalize') == finalize.BACKEND
     assert finalize.shard_backend(config, 'finalize') == finalize.GROK_BACKEND
-    marker.write_text(json.dumps({'worker_backend': finalize.GROK_BACKEND}))
+    marker.write_text(json.dumps({'author_agent': finalize.GROK_BACKEND}))
     assert finalize.shard_backend(config, 'audience_finalize') == finalize.GROK_BACKEND
 
 
@@ -44,23 +45,30 @@ def test_grok_command_uses_native_cli_and_pins_model(tmp_path):
 
 def test_legacy_crm_route_not_guessed_after_switch(tmp_path):
     with pytest.raises(ValueError, match='无法确认'):
-        frozen_author({}, tmp_path, finalize.GROK_BACKEND)
+        frozen_author({}, tmp_path)
     prompt = tmp_path / 'prompt.md'
     prompt.write_text('例如使用task的general子代理处理input/result')
-    assert frozen_author({}, tmp_path, finalize.GROK_BACKEND) == 'general'
+    assert frozen_author({}, tmp_path) == 'general'
     prompt.write_text('Launcher托管单片Cursor')
-    assert frozen_author({}, tmp_path, finalize.GROK_BACKEND) == CURSOR_AUTHOR
-    assert frozen_author({'author_agent': finalize.GROK_BACKEND}, tmp_path, CURSOR_AUTHOR) == finalize.GROK_BACKEND
+    assert frozen_author({}, tmp_path) == CURSOR_AUTHOR
+    assert frozen_author({'author_agent': finalize.GROK_BACKEND}, tmp_path) == finalize.GROK_BACKEND
 
 
 @pytest.mark.parametrize(('code', 'text', 'model', 'ready'), [
-    (0, '{"reviews": []}', 'grok-4.7-build', True),
-    (1, '{"reviews": []}', 'grok-4.7-build', False),
+    (0, 'valid', 'grok-4.7-build', True),
+    (1, 'valid', 'grok-4.7-build', False),
     (0, None, 'grok-4.7-build', False),
-    (0, '{"reviews": []}', 'grok-4.7-build-fast', False),
+    (0, 'valid', 'grok-4.7-build-fast', False),
+    (0, '{"reviews": []}', 'grok-4.7-build', False),
 ])
 def test_worker_writes_candidate_only_for_valid_grok_run(tmp_path, monkeypatch, code, text, model, ready):
-    config, _, root = setup(tmp_path)
+    config, plan, root = setup(tmp_path)
+    inputs = json.loads((root / '000.input.json').read_text())
+    if text == 'valid':
+        text = json.dumps({'plan_id': plan['id'], 'reviews': [
+            {'seq': w['seq'], 'fingerprint': w['fingerprint'], 'correction_id': w.get('correction_id'),
+             'investigation_version': 2, 'label': 'speaking', 'music_source': 'none'}
+            for w in inputs['windows'] if w['seq'] in inputs['target_seqs']]})
     config['final_subagent'] = finalize.GROK_BACKEND
     monkeypatch.setattr(finalize, 'post', lambda *_: {'pid': 123, 'diagnose_on_failure': False})
     monkeypatch.setattr(finalize, 'stop_group', lambda _: None)

@@ -4,6 +4,7 @@ import errno
 import fcntl
 import json
 import os
+import re
 import shlex
 import signal
 import subprocess
@@ -18,6 +19,7 @@ from .live_share import atomic_json
 from .live_share_control import load_config
 
 BACKEND = 'cursor_cli_grok'
+CURSOR_AUTHOR = 'cursor_grok_cli'
 MODEL = 'grok-4.7-high'
 GROK_BACKEND = 'grok_build_cli'
 GROK_MODEL = 'grok-4.7'
@@ -25,10 +27,26 @@ BACKENDS = (BACKEND, GROK_BACKEND)
 KINDS = ('finalize', 'talk_finalize', 'audience_finalize')
 
 
+def frozen_author(marker, root):
+    if 'author_agent' in marker:
+        return marker['author_agent']
+    prompt_file = root / 'prompt.md'
+    prompt = prompt_file.read_text() if prompt_file.is_file() else ''
+    if 'Launcher托管单片Cursor' in prompt:
+        return CURSOR_AUTHOR
+    match = re.search(r'使用task的([\w.-]+)子代理处理input/result', prompt)
+    if match:
+        return match[1]
+    raise ValueError('无法确认既有CRM计划的原始执行路由')
+
+
 def shard_backend(config, kind):
     if kind == 'audience_finalize':
         marker = Path(config['workspace']) / kind / 'plan.json'
-        return json.loads(marker.read_text()).get('worker_backend', BACKEND)
+        author = frozen_author(json.loads(marker.read_text()), marker.parent)
+        if author not in (GROK_BACKEND, CURSOR_AUTHOR):
+            raise ValueError('CRM计划未选择CLI后端')
+        return GROK_BACKEND if author == GROK_BACKEND else BACKEND
     return GROK_BACKEND if config.get('final_subagent') == GROK_BACKEND else BACKEND
 
 
@@ -307,7 +325,13 @@ def worker(config, kind, shard_id, token):
                     candidate = None
                 success = isinstance(candidate, dict) and bool(candidate)
                 if success:
-                    atomic_json(output, candidate)
+                    try:
+                        validate_candidate(root, plan, shard, kind, candidate)
+                    except (ValueError, KeyError, TypeError, AttributeError) as error:
+                        state['error'] = f'invalid_candidate:{type(error).__name__}'
+                        success = False
+                    else:
+                        atomic_json(output, candidate)
         else:
             events = []
             for line in stdout.read_text().splitlines():
@@ -387,6 +411,33 @@ def retry(config, kind, shard_id):
     return launch(config, kind, shard_id, resume_session=resume_session)
 
 
+def validate_candidate(root, plan, shard, kind, payload):
+    inputs = json.loads(Path(shard['input']).read_text())
+    if kind == 'audience_finalize':
+        from .audience_crm import digest, validate_state
+        material = json.loads((root / 'material.json').read_text())
+        if digest(material) != plan['id'] or digest(inputs) != shard['input_sha256']:
+            raise ValueError('观众冻结材料或输入发生变化')
+        return validate_state(material['people'][shard['person_id']], payload, material)
+    rows = payload.get('reviews', [])
+    expected = {w['seq']: w for w in inputs['windows'] if w['seq'] in inputs['target_seqs']}
+    if (payload.get('plan_id') != plan['id'] or len(rows) != len(expected)
+            or {r.get('seq') for r in rows} != set(expected)):
+        raise ValueError('分片目标覆盖不符')
+    for row in rows:
+        window = expected[row['seq']]
+        if (row.get('fingerprint') != window['fingerprint']
+                or row.get('correction_id') != window.get('correction_id')):
+            raise ValueError('原文指纹或校正身份不符')
+        if kind == 'finalize' and (row.get('investigation_version') != 2
+                or row.get('label') not in ('singing', 'speaking')
+                or row.get('music_source') not in ('probable_live', 'recording', 'uncertain', 'none')):
+            raise ValueError('音乐分片格式不符')
+        if kind == 'talk_finalize' and (not row.get('corrected_text') or not row.get('reason')):
+            raise ValueError('杂谈分片格式不符')
+    return payload
+
+
 def accept(config, kind, shard_id):
     """总协调完成语义审查后调用；程序再验回执、输入身份与基本覆盖。"""
     root, plan, shard = context(config, kind, shard_id)
@@ -403,35 +454,8 @@ def accept(config, kind, shard_id):
         if (not legacy and state.get('backend') != 'legacy_result' and state.get('exit_code') != 0
                 or state.get('plan_id') != plan['id']):
             raise ValueError('退出码或冻结身份无效')
-        inputs = json.loads(Path(shard['input']).read_text())
         candidate = Path(shard['result']) if legacy or state.get('backend') == 'legacy_result' else runs / f'{shard_id}.result.json'
-        payload = json.loads(candidate.read_text())
-        if kind == 'audience_finalize':
-            from .audience_crm import digest, validate_state
-            material = json.loads((root / 'material.json').read_text())
-            if digest(material) != plan['id'] or digest(inputs) != shard['input_sha256']:
-                raise ValueError('观众冻结材料或输入发生变化')
-            payload = validate_state(material['people'][shard['person_id']], payload, material)
-            atomic_json(Path(shard['result']), payload)
-            state.update(state='accepted', accepted_at=time.time())
-            atomic_json(path, state)
-            return state
-        rows = payload.get('reviews', [])
-        expected = {w['seq']: w for w in inputs['windows'] if w['seq'] in inputs['target_seqs']}
-        if (payload.get('plan_id') != plan['id'] or len(rows) != len(expected)
-                or {r.get('seq') for r in rows} != set(expected)):
-            raise ValueError('分片目标覆盖不符')
-        for row in rows:
-            window = expected[row['seq']]
-            if (row.get('fingerprint') != window['fingerprint']
-                    or row.get('correction_id') != window.get('correction_id')):
-                raise ValueError('原文指纹或校正身份不符')
-            if kind == 'finalize' and (row.get('investigation_version') != 2
-                    or row.get('label') not in ('singing', 'speaking')
-                    or row.get('music_source') not in ('probable_live', 'recording', 'uncertain', 'none')):
-                raise ValueError('音乐分片格式不符')
-            if kind == 'talk_finalize' and (not row.get('corrected_text') or not row.get('reason')):
-                raise ValueError('杂谈分片格式不符')
+        payload = validate_candidate(root, plan, shard, kind, json.loads(candidate.read_text()))
         atomic_json(Path(shard['result']), payload)
         state.update(state='accepted', accepted_at=time.time())
         atomic_json(path, state)
