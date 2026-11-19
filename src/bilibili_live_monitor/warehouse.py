@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS meta_source_cursors (
 CREATE TABLE IF NOT EXISTS dim_rooms (
     room_id           TEXT PRIMARY KEY,
     anchor_uid        INTEGER,
+    short_room_id     TEXT,
     room_label        TEXT,
     track_category    TEXT,
     allows_ext_medal  INTEGER NOT NULL DEFAULT 0,
@@ -360,6 +361,9 @@ def open_warehouse(path: Path) -> sqlite3.Connection:
     resolved.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(resolved, timeout=60.0)
     conn.executescript(WAREHOUSE_DDL)
+    room_cols = {row[1] for row in conn.execute('PRAGMA table_info(dim_rooms)')}
+    if 'short_room_id' not in room_cols:
+        conn.execute('ALTER TABLE dim_rooms ADD COLUMN short_room_id TEXT')
     cols = {row[1] for row in conn.execute('PRAGMA table_info(dim_users)')}
     if 'latest_uname_ts' not in cols:
         conn.execute('ALTER TABLE dim_users ADD COLUMN latest_uname_ts REAL')
@@ -368,6 +372,308 @@ def open_warehouse(path: Path) -> sqlite3.Connection:
         conn.execute('ALTER TABLE meta_source_cursors ADD COLUMN extractor_version INTEGER NOT NULL DEFAULT 1')
     conn.execute('PRAGMA foreign_keys = ON')
     return conn
+
+
+_TRACK_ALIAS_MAP: dict[str, str] = {
+    'core_singing_chat': 'virtual_music',
+    'gaming_sentinel': 'virtual_gaming',
+}
+
+
+def _clean_room_id(value: Any) -> str | None:
+    if value is None or isinstance(value, bool):
+        return None
+    text = str(value).strip()
+    if not text or text == '0':
+        return None
+    return text
+
+
+def _is_alias_annotated_label(label: str) -> bool:
+    return '(短号' in label or '（短号' in label
+
+
+def _clean_room_label(label: Any) -> str | None:
+    if not isinstance(label, str):
+        return None
+    text = label.strip()
+    if not text or text.startswith('匿名房间 '):
+        return None
+    return text
+
+
+def _choose_best_label(labels: Iterable[Any]) -> str | None:
+    cleaned = [c for raw in labels if (c := _clean_room_label(raw)) is not None]
+    if not cleaned:
+        for raw in labels:
+            if isinstance(raw, str) and raw.strip():
+                return raw.strip()
+        return None
+    for cand in cleaned:
+        if not _is_alias_annotated_label(cand):
+            return cand
+    return cleaned[0]
+
+
+def _pick_canonical_room_id(room_ids: Iterable[str]) -> str:
+    unique = []
+    seen: set[str] = set()
+    for rid in room_ids:
+        c = _clean_room_id(rid)
+        if c and c not in seen:
+            seen.add(c)
+            unique.append(c)
+    if not unique:
+        raise ValueError('缺少有效 room_id')
+    if len(unique) == 1:
+        return unique[0]
+    numeric = [r for r in unique if r.isascii() and r.isdigit()]
+    if numeric:
+        # B 站靓号短房号恒小于底层自增规范长房号（如 555 < 9900555、123 < 123456）
+        return max(numeric, key=lambda r: (int(r), r))
+    return unique[0]
+
+
+def _pick_short_room_id(canonical_rid: str, candidates: Iterable[str | None]) -> str | None:
+    aliases = []
+    seen: set[str] = set()
+    for raw in candidates:
+        c = _clean_room_id(raw)
+        if c and c != canonical_rid and c not in seen:
+            seen.add(c)
+            aliases.append(c)
+    if not aliases:
+        return None
+    numeric = [r for r in aliases if r.isascii() and r.isdigit()]
+    if numeric:
+        return min(numeric, key=lambda r: (int(r), r))
+    return aliases[0]
+
+
+def _normalize_registry_track(entry: dict[str, Any]) -> tuple[str | None, bool]:
+    if 'track_category' in entry and entry['track_category'] is None:
+        return None, True
+    explicit = entry.get('track_category')
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit.strip(), False
+    raw_track = entry.get('track')
+    if isinstance(raw_track, str) and raw_track.strip():
+        t = raw_track.strip()
+        return _TRACK_ALIAS_MAP.get(t, t), False
+    if entry.get('content_mode') == 'music':
+        return 'virtual_music', False
+    return None, False
+
+
+class _RoomMeta:
+    def __init__(
+        self,
+        *,
+        canonical_room_id: str,
+        has_explicit_canonical: bool = False,
+        anchor_uid: int | None = None,
+        short_room_id: str | None = None,
+        alias_room_ids: set[str] | None = None,
+        room_label: str | None = None,
+        track_category: str | None = None,
+        clear_track_category: bool = False,
+    ) -> None:
+        self.canonical_room_id = canonical_room_id
+        self.has_explicit_canonical = has_explicit_canonical
+        self.anchor_uid = anchor_uid
+        self.alias_room_ids: set[str] = set(alias_room_ids or ())
+        if short_room_id and short_room_id != canonical_room_id:
+            self.alias_room_ids.add(short_room_id)
+        self.short_room_id = short_room_id if short_room_id != canonical_room_id else _pick_short_room_id(
+            canonical_room_id, self.alias_room_ids
+        )
+        self.room_label = room_label
+        self.track_category = track_category
+        self.clear_track_category = clear_track_category
+
+    def all_room_ids(self) -> list[str]:
+        out = [self.canonical_room_id]
+        for r in sorted(self.alias_room_ids):
+            if r and r != self.canonical_room_id:
+                out.append(r)
+        return out
+
+    def merge_from(self, other: _RoomMeta, *, prefer_other_canonical: bool = False) -> None:
+        all_ids = {self.canonical_room_id, other.canonical_room_id, *self.alias_room_ids, *other.alias_room_ids}
+        if (prefer_other_canonical or (other.has_explicit_canonical and not self.has_explicit_canonical)) and other.canonical_room_id:
+            new_canon = other.canonical_room_id
+        elif self.has_explicit_canonical and not other.has_explicit_canonical:
+            new_canon = self.canonical_room_id
+        else:
+            new_canon = _pick_canonical_room_id(all_ids)
+        self.canonical_room_id = new_canon
+        self.has_explicit_canonical = self.has_explicit_canonical or other.has_explicit_canonical
+        self.alias_room_ids = {r for r in all_ids if r and r != new_canon}
+        self.short_room_id = _pick_short_room_id(
+            new_canon, [other.short_room_id, self.short_room_id, *self.alias_room_ids]
+        )
+        if other.anchor_uid:
+            self.anchor_uid = other.anchor_uid
+        best_label = _choose_best_label([other.room_label, self.room_label])
+        if best_label:
+            self.room_label = best_label
+        if other.clear_track_category:
+            self.track_category = None
+            self.clear_track_category = True
+        elif other.track_category:
+            self.track_category = other.track_category
+            self.clear_track_category = False
+
+
+class _RoomRegistry:
+    """只读外部房间台账（支持独立台账 JSON、扩房规划 selected_candidates 与 automation.json）。"""
+
+    def __init__(self) -> None:
+        self.entries: list[_RoomMeta] = []
+        self.by_anchor_uid: dict[int, _RoomMeta] = {}
+        self.by_room_id: dict[str, _RoomMeta] = {}
+
+    def _reindex(self) -> None:
+        self.by_anchor_uid.clear()
+        self.by_room_id.clear()
+        for meta in self.entries:
+            if meta.anchor_uid and meta.anchor_uid > 0:
+                self.by_anchor_uid[meta.anchor_uid] = meta
+            self.by_room_id[meta.canonical_room_id] = meta
+            for alias in meta.alias_room_ids:
+                self.by_room_id[alias] = meta
+
+    def add_entry(self, entry: dict[str, Any], *, key_room_id: str | None = None) -> None:
+        anchor_uid = pos_int(entry.get('anchor_uid') or entry.get('uid'))
+        canon_explicit_field = (
+            _clean_room_id(entry.get('canonical_room_id'))
+            or _clean_room_id(entry.get('platform_room_id'))
+        )
+        entry_rid = _clean_room_id(entry.get('room_id'))
+        explicit_canon = canon_explicit_field or entry_rid
+        key_clean = _clean_room_id(key_room_id)
+        short_field = _clean_room_id(entry.get('short_room_id') or entry.get('short_id'))
+        aliases: set[str] = set()
+        for field in ('short_id', 'short_room_id', 'capture_room_id'):
+            val = _clean_room_id(entry.get(field))
+            if val:
+                aliases.add(val)
+        raw_aliases = entry.get('alias_room_ids') or entry.get('aliases')
+        if isinstance(raw_aliases, list):
+            for item in raw_aliases:
+                val = _clean_room_id(item)
+                if val:
+                    aliases.add(val)
+        if key_clean:
+            aliases.add(key_clean)
+
+        has_explicit_canonical = bool(
+            canon_explicit_field
+            or (entry_rid and short_field and entry_rid != short_field)
+            or (entry_rid and key_clean and entry_rid != key_clean)
+        )
+        all_candidates = [x for x in (explicit_canon, *aliases) if x]
+        if not all_candidates:
+            return
+        canon = explicit_canon if has_explicit_canonical and explicit_canon else _pick_canonical_room_id(all_candidates)
+        aliases = {x for x in all_candidates if x != canon}
+        short_rid = short_field if short_field and short_field != canon else _pick_short_room_id(canon, aliases)
+        label = _choose_best_label([entry.get('room_label'), entry.get('uname'), entry.get('label')])
+        track, clear_track = _normalize_registry_track(entry)
+
+        meta = _RoomMeta(
+            canonical_room_id=canon,
+            has_explicit_canonical=has_explicit_canonical,
+            anchor_uid=anchor_uid,
+            short_room_id=short_rid,
+            alias_room_ids=aliases,
+            room_label=label,
+            track_category=track,
+            clear_track_category=clear_track,
+        )
+
+        matched: list[_RoomMeta] = []
+        if anchor_uid and anchor_uid in self.by_anchor_uid:
+            matched.append(self.by_anchor_uid[anchor_uid])
+        for rid in (canon, *aliases):
+            hit = self.by_room_id.get(rid)
+            if hit is not None and hit not in matched:
+                matched.append(hit)
+
+        if not matched:
+            self.entries.append(meta)
+        else:
+            primary = matched[0]
+            for extra in matched[1:]:
+                primary.merge_from(extra)
+                if extra in self.entries:
+                    self.entries.remove(extra)
+            primary.merge_from(meta, prefer_other_canonical=has_explicit_canonical)
+        self._reindex()
+
+    def lookup(
+        self,
+        *,
+        anchor_uid: int | None = None,
+        room_ids: Iterable[str | None] = (),
+    ) -> _RoomMeta | None:
+        matched: list[_RoomMeta] = []
+        if anchor_uid and anchor_uid in self.by_anchor_uid:
+            matched.append(self.by_anchor_uid[anchor_uid])
+        for rid in room_ids:
+            clean = _clean_room_id(rid)
+            if clean and clean in self.by_room_id:
+                hit = self.by_room_id[clean]
+                if hit not in matched:
+                    matched.append(hit)
+        if not matched:
+            return None
+        if len(matched) == 1:
+            return matched[0]
+        combined = _RoomMeta(
+            canonical_room_id=matched[0].canonical_room_id,
+            has_explicit_canonical=matched[0].has_explicit_canonical,
+            anchor_uid=matched[0].anchor_uid,
+            short_room_id=matched[0].short_room_id,
+            alias_room_ids=set(matched[0].alias_room_ids),
+            room_label=matched[0].room_label,
+            track_category=matched[0].track_category,
+            clear_track_category=matched[0].clear_track_category,
+        )
+        for extra in matched[1:]:
+            combined.merge_from(extra)
+        return combined
+
+
+def load_room_registries(paths: Iterable[Path] | None) -> _RoomRegistry:
+    registry = _RoomRegistry()
+    for raw_path in paths or ():
+        path = Path(raw_path).resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f'房间台账文件不存在：{path}')
+        payload = json.loads(path.read_text(encoding='utf-8'))
+        if isinstance(payload, list):
+            for item in payload:
+                if isinstance(item, dict):
+                    registry.add_entry(item)
+        elif isinstance(payload, dict):
+            selected = payload.get('selected_candidates')
+            if isinstance(selected, dict):
+                for items in selected.values():
+                    if isinstance(items, list):
+                        for item in items:
+                            if isinstance(item, dict):
+                                registry.add_entry(item)
+            rooms_obj = payload.get('rooms')
+            if isinstance(rooms_obj, list):
+                for item in rooms_obj:
+                    if isinstance(item, dict):
+                        registry.add_entry(item)
+            elif isinstance(rooms_obj, dict):
+                for key_rid, item in rooms_obj.items():
+                    if isinstance(item, dict):
+                        registry.add_entry(item, key_room_id=str(key_rid))
+    return registry
 
 
 class _IdentityBatch:
@@ -426,7 +732,7 @@ class _IdentityBatch:
                 if ts > fspan[1]:
                     fspan[1] = ts
 
-    def flush(self, wh: sqlite3.Connection) -> tuple[int, int]:
+    def flush(self, wh: sqlite3.Connection, registry: _RoomRegistry | None = None) -> tuple[int, int]:
         if self.users:
             wh.executemany(
                 """
@@ -480,16 +786,49 @@ class _IdentityBatch:
             )
         for rid, span in self.room_times.items():
             anchor = self.room_anchors.get(rid)
+            reg_meta = registry.lookup(anchor_uid=anchor, room_ids=(rid,)) if registry else None
+            if reg_meta is not None:
+                anchor = anchor or reg_meta.anchor_uid
+            existing_anchor_rows: list[str] = []
+            if anchor:
+                existing_anchor_rows = [
+                    row[0]
+                    for row in wh.execute(
+                        'SELECT room_id FROM dim_rooms WHERE anchor_uid = ?',
+                        (anchor,),
+                    ).fetchall()
+                ]
+            short_owner = wh.execute(
+                'SELECT room_id, anchor_uid FROM dim_rooms WHERE short_room_id = ? LIMIT 1',
+                (rid,),
+            ).fetchone()
+            if short_owner and not anchor:
+                anchor = short_owner[1]
+            candidate_rids: list[str] = [rid, *existing_anchor_rows]
+            if short_owner:
+                candidate_rids.append(short_owner[0])
+            if reg_meta is not None:
+                candidate_rids.extend(reg_meta.all_room_ids())
+            if reg_meta is not None and reg_meta.has_explicit_canonical:
+                target_rid = reg_meta.canonical_room_id
+            else:
+                target_rid = _pick_canonical_room_id(candidate_rids)
+            short_rid = (
+                reg_meta.short_room_id
+                if reg_meta and reg_meta.short_room_id and reg_meta.short_room_id != target_rid
+                else _pick_short_room_id(target_rid, candidate_rids)
+            )
             wh.execute(
                 """
-                INSERT INTO dim_rooms (room_id, anchor_uid, first_seen_ts, last_seen_ts)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO dim_rooms (room_id, anchor_uid, short_room_id, first_seen_ts, last_seen_ts)
+                VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(room_id) DO UPDATE SET
                     anchor_uid = COALESCE(dim_rooms.anchor_uid, excluded.anchor_uid),
+                    short_room_id = COALESCE(dim_rooms.short_room_id, excluded.short_room_id),
                     first_seen_ts = MIN(dim_rooms.first_seen_ts, excluded.first_seen_ts),
                     last_seen_ts = MAX(dim_rooms.last_seen_ts, excluded.last_seen_ts)
                 """,
-                (rid, anchor, span[0], span[1]),
+                (target_rid, anchor, short_rid, span[0], span[1]),
             )
         return len(self.users), len(self.faces)
 
@@ -498,7 +837,12 @@ def _source_tables(src: sqlite3.Connection) -> set[str]:
     return {row[0] for row in src.execute("SELECT name FROM sqlite_master WHERE type='table'")}
 
 
-def _scan_single_source(wh: sqlite3.Connection, source_name: str, db_path: Path) -> dict[str, Any]:
+def _scan_single_source(
+    wh: sqlite3.Connection,
+    source_name: str,
+    db_path: Path,
+    registry: _RoomRegistry | None = None,
+) -> dict[str, Any]:
     resolved_db = db_path.resolve()
     cur_row = wh.execute(
         'SELECT db_path, last_raw_event_id, last_guard_snapshot_id, last_timeline_id, extractor_version '
@@ -633,7 +977,7 @@ def _scan_single_source(wh: sqlite3.Connection, source_name: str, db_path: Path)
                 last_tl_id = max_tl_id
 
     with wh:
-        touched_users, touched_faces = batch.flush(wh)
+        touched_users, touched_faces = batch.flush(wh, registry)
         wh.execute(
             """
             INSERT INTO meta_source_cursors (
@@ -698,6 +1042,7 @@ def _ingest_completed_session(
     session_dir: Path,
     source_by_db: dict[Path, str],
     force_reingest: bool,
+    registry: _RoomRegistry | None = None,
 ) -> dict[str, Any]:
     wf_path = session_dir / 'workflow.json'
     cfg_path = session_dir / 'config.json'
@@ -822,8 +1167,56 @@ def _ingest_completed_session(
     norm_events = extract_session_events(room_id, start_ts, cutoff_ts, raw_rows, tl_rows)
     metric_rows = extract_room_metrics(room_id, start_ts, cutoff_ts, raw_rows)
 
-    room_row = wh.execute('SELECT anchor_uid FROM dim_rooms WHERE room_id = ?', (room_id,)).fetchone()
-    known_anchor = batch.room_anchors.get(room_id) or (room_row[0] if room_row and room_row[0] else None)
+    reg_meta = registry.lookup(
+        anchor_uid=pos_int(config.get('anchor_uid')) or batch.room_anchors.get(room_id),
+        room_ids=(platform_room_id, room_id),
+    ) if registry else None
+
+    existing_room_rows = wh.execute(
+        'SELECT room_id, anchor_uid, short_room_id, room_label, track_category FROM dim_rooms '
+        'WHERE room_id IN (?, ?) OR short_room_id IN (?, ?)',
+        (room_id, platform_room_id, room_id, platform_room_id),
+    ).fetchall()
+    db_anchor = next((int(r[1]) for r in existing_room_rows if r[1]), None)
+    known_anchor = (
+        batch.room_anchors.get(room_id)
+        or batch.room_anchors.get(platform_room_id)
+        or (reg_meta.anchor_uid if reg_meta and reg_meta.anchor_uid else None)
+        or pos_int(config.get('anchor_uid'))
+        or db_anchor
+    )
+    if known_anchor:
+        anchor_rows = wh.execute(
+            'SELECT room_id, anchor_uid, short_room_id, room_label, track_category FROM dim_rooms WHERE anchor_uid = ?',
+            (known_anchor,),
+        ).fetchall()
+        for r in anchor_rows:
+            if r not in existing_room_rows:
+                existing_room_rows.append(r)
+        if registry:
+            reg_meta = registry.lookup(
+                anchor_uid=known_anchor,
+                room_ids=(platform_room_id, room_id, *(r[0] for r in existing_room_rows), *(r[2] for r in existing_room_rows)),
+            )
+
+    all_candidate_rids = [
+        platform_room_id,
+        room_id,
+        *(r[0] for r in existing_room_rows),
+        *(r[2] for r in existing_room_rows if r[2]),
+        *(reg_meta.all_room_ids() if reg_meta else ()),
+    ]
+    canonical_room_id = (
+        reg_meta.canonical_room_id
+        if reg_meta and reg_meta.has_explicit_canonical and reg_meta.canonical_room_id
+        else _pick_canonical_room_id(all_candidate_rids)
+    )
+    short_room_id = (
+        reg_meta.short_room_id
+        if reg_meta and reg_meta.short_room_id and reg_meta.short_room_id != canonical_room_id
+        else _pick_short_room_id(canonical_room_id, all_candidate_rids)
+    )
+
     cohost_rows = extract_cohost_intervals(
         room_id,
         start_ts,
@@ -833,36 +1226,85 @@ def _ingest_completed_session(
         anchor_uid=known_anchor,
     )
     observed_medal_ruids = {ev['medal_ruid'] for ev in norm_events if ev.get('medal_ruid')}
+    self_room_aliases = {x for x in (room_id, platform_room_id, canonical_room_id, short_room_id, '0') if x}
     allows_ext = 0
     if known_anchor and any(ruid != known_anchor for ruid in observed_medal_ruids):
         allows_ext = 1
     elif len(observed_medal_ruids) >= 2:
         allows_ext = 1
     elif any(
-        ev.get('medal_room_id') and ev['medal_room_id'] not in (room_id, platform_room_id, '0')
+        ev.get('medal_room_id') and ev['medal_room_id'] not in self_room_aliases
         for ev in norm_events
     ):
         allows_ext = 1
 
-    track_cat = 'virtual_music' if config.get('content_mode', 'music') == 'music' else 'virtual_talk'
+    cfg_track = config.get('track_category')
+    cfg_track_clean = cfg_track.strip() if isinstance(cfg_track, str) and cfg_track.strip() else None
+    existing_track = next((r[4] for r in existing_room_rows if r[4]), None)
+    clear_track = bool(reg_meta and reg_meta.clear_track_category)
+    if clear_track:
+        track_cat: str | None = None
+    elif reg_meta and reg_meta.track_category:
+        track_cat = reg_meta.track_category
+    elif cfg_track_clean:
+        track_cat = cfg_track_clean
+    elif config.get('content_mode') == 'music':
+        track_cat = 'virtual_music'
+    elif existing_track:
+        track_cat = existing_track
+    else:
+        track_cat = None
+
+    room_label = _choose_best_label([
+        reg_meta.room_label if reg_meta else None,
+        config.get('label'),
+        *(r[3] for r in existing_room_rows),
+    ])
+
     basis = _transcript_basis(config, has_verified_reviews=has_verified_reviews)
     now_str = utc_now_iso()
 
     with wh:
-        batch.flush(wh)
+        batch.flush(wh, registry)
         wh.execute(
             """
-            INSERT INTO dim_rooms (room_id, anchor_uid, room_label, track_category, allows_ext_medal, first_seen_ts, last_seen_ts)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO dim_rooms (
+                room_id, anchor_uid, short_room_id, room_label, track_category,
+                allows_ext_medal, first_seen_ts, last_seen_ts
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(room_id) DO UPDATE SET
                 anchor_uid = COALESCE(dim_rooms.anchor_uid, excluded.anchor_uid),
-                room_label = COALESCE(excluded.room_label, dim_rooms.room_label),
-                track_category = COALESCE(dim_rooms.track_category, excluded.track_category),
+                short_room_id = COALESCE(excluded.short_room_id, dim_rooms.short_room_id),
+                room_label = CASE
+                    WHEN excluded.room_label IS NOT NULL AND excluded.room_label NOT LIKE '匿名房间 %'
+                         AND (dim_rooms.room_label IS NULL
+                              OR dim_rooms.room_label LIKE '匿名房间 %'
+                              OR ((dim_rooms.room_label LIKE '%(短号%' OR dim_rooms.room_label LIKE '%（短号%')
+                                  AND excluded.room_label NOT LIKE '%(短号%'
+                                  AND excluded.room_label NOT LIKE '%（短号%'))
+                    THEN excluded.room_label
+                    ELSE COALESCE(dim_rooms.room_label, excluded.room_label)
+                END,
+                track_category = CASE
+                    WHEN ? = 1 THEN NULL
+                    ELSE COALESCE(excluded.track_category, dim_rooms.track_category)
+                END,
                 allows_ext_medal = MAX(dim_rooms.allows_ext_medal, excluded.allows_ext_medal),
                 first_seen_ts = MIN(dim_rooms.first_seen_ts, excluded.first_seen_ts),
                 last_seen_ts = MAX(dim_rooms.last_seen_ts, excluded.last_seen_ts)
             """,
-            (room_id, known_anchor, config.get('label'), track_cat, allows_ext, start_ts, cutoff_ts),
+            (
+                canonical_room_id,
+                known_anchor,
+                short_room_id,
+                room_label,
+                track_cat,
+                allows_ext,
+                start_ts,
+                cutoff_ts,
+                1 if clear_track else 0,
+            ),
         )
         wh.execute('DELETE FROM fact_cohost_intervals WHERE session_key = ?', (skey,))
         wh.execute('DELETE FROM fact_room_metrics WHERE session_key = ?', (skey,))
@@ -879,7 +1321,7 @@ def _ingest_completed_session(
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                skey, room_id, known_anchor, config.get('label'), track_cat, source_instance,
+                skey, canonical_room_id, known_anchor, room_label, track_cat, source_instance,
                 str(resolved_db), str(workspace.resolve()), start_ts, cutoff_ts,
                 basis, EXTRACTOR_VERSION, now_str,
             ),
@@ -914,7 +1356,7 @@ def _ingest_completed_session(
                 """,
                 [
                     (
-                        skey, idx + 1, ev['room_id'], ev['event_ts'], ev['time_source'], ev['kind'],
+                        skey, idx + 1, canonical_room_id, ev['event_ts'], ev['time_source'], ev['kind'],
                         ev['is_mystery'], ev['raw_uid'], ev['raw_uname'], ev['clue_first_char'],
                         ev['clue_md5'], ev['clue_face_sha1'], ev['clue_crc32'],
                         ev['inferred_uid'], ev['inference_method'], ev['wealth_level'], ev['guard_level'],
@@ -934,7 +1376,7 @@ def _ingest_completed_session(
                 """,
                 [
                     (
-                        skey, m['minute_ts'], m['room_id'],
+                        skey, m['minute_ts'], canonical_room_id,
                         m['online_count'], m['watched_count'], m['fans_count'], m['fans_club_count'],
                     )
                     for m in metric_rows
@@ -950,7 +1392,7 @@ def _ingest_completed_session(
                 """,
                 [
                     (
-                        skey, idx + 1, row['room_id'], row['kind'], row['start_ts'], row['end_ts'],
+                        skey, idx + 1, canonical_room_id, row['kind'], row['start_ts'], row['end_ts'],
                         row['battle_id'], row['opponent_uid'], row['opponent_room_id'],
                         row['opponent_uname'], row['raw_summary_json'],
                     )
@@ -1119,16 +1561,293 @@ def _resolve_danmaku_crc32_and_presence(wh: sqlite3.Connection) -> dict[str, int
     }
 
 
+def _reconcile_rooms_and_metadata(
+    wh: sqlite3.Connection,
+    registry: _RoomRegistry | None = None,
+) -> dict[str, int]:
+    """按 anchor_uid 与外部房间台账归并短/长房号分裂行，并统一回填赛道分类与主播名称。"""
+    rows = wh.execute(
+        'SELECT room_id, anchor_uid, short_room_id, room_label, track_category, '
+        'allows_ext_medal, first_seen_ts, last_seen_ts FROM dim_rooms ORDER BY room_id'
+    ).fetchall()
+
+    parent = list(range(len(rows)))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    by_anchor: dict[int, int] = {}
+    by_rid: dict[str, list[int]] = {}
+    for idx, row in enumerate(rows):
+        rid, auid, short_rid = row[0], row[1], row[2]
+        if auid and int(auid) > 0:
+            a_int = int(auid)
+            if a_int in by_anchor:
+                union(by_anchor[a_int], idx)
+            else:
+                by_anchor[a_int] = idx
+        for prev_idx in by_rid.get(rid, ()):
+            union(prev_idx, idx)
+        by_rid.setdefault(rid, []).append(idx)
+        if short_rid:
+            for prev_idx in by_rid.get(short_rid, ()):
+                union(prev_idx, idx)
+            by_rid.setdefault(short_rid, []).append(idx)
+
+    if registry and registry.entries:
+        for meta in registry.entries:
+            matched_indices: list[int] = []
+            if meta.anchor_uid and meta.anchor_uid in by_anchor:
+                matched_indices.append(by_anchor[meta.anchor_uid])
+            for cand_rid in (meta.canonical_room_id, *meta.alias_room_ids):
+                matched_indices.extend(by_rid.get(cand_rid, ()))
+            if len(matched_indices) > 1:
+                first_idx = matched_indices[0]
+                for other_idx in matched_indices[1:]:
+                    union(first_idx, other_idx)
+
+    groups: dict[int, list[tuple[Any, ...]]] = {}
+    for idx, row in enumerate(rows):
+        groups.setdefault(find(idx), []).append(row)
+
+    merged_alias_rooms = 0
+    updated_rooms = 0
+    updated_sessions = 0
+
+    with wh:
+        for comp in groups.values():
+            comp_anchors = [int(r[1]) for r in comp if r[1] and int(r[1]) > 0]
+            comp_rids = [r[0] for r in comp]
+            comp_shorts = [r[2] for r in comp if r[2]]
+            reg_meta = (
+                registry.lookup(
+                    anchor_uid=comp_anchors[0] if comp_anchors else None,
+                    room_ids=[*comp_rids, *comp_shorts],
+                )
+                if registry and registry.entries
+                else None
+            )
+
+            all_group_rids = [
+                *comp_rids,
+                *comp_shorts,
+                *(reg_meta.all_room_ids() if reg_meta else ()),
+            ]
+            target_rid = (
+                reg_meta.canonical_room_id
+                if reg_meta and reg_meta.has_explicit_canonical and reg_meta.canonical_room_id
+                else _pick_canonical_room_id(all_group_rids)
+            )
+            merged_anchor = (
+                (reg_meta.anchor_uid if reg_meta and reg_meta.anchor_uid else None)
+                or (comp_anchors[0] if comp_anchors else None)
+            )
+            merged_short = (
+                reg_meta.short_room_id
+                if reg_meta and reg_meta.short_room_id and reg_meta.short_room_id != target_rid
+                else _pick_short_room_id(target_rid, all_group_rids)
+            )
+            merged_label = _choose_best_label([
+                reg_meta.room_label if reg_meta else None,
+                *(r[3] for r in comp),
+            ])
+            comp_tracks = [r[4] for r in comp if isinstance(r[4], str) and r[4].strip()]
+            non_talk_tracks = [t for t in comp_tracks if t != 'virtual_talk']
+            if reg_meta and reg_meta.clear_track_category:
+                merged_track: str | None = None
+            elif reg_meta and reg_meta.track_category:
+                merged_track = reg_meta.track_category
+            elif non_talk_tracks:
+                merged_track = non_talk_tracks[0]
+            elif comp_tracks:
+                merged_track = comp_tracks[0]
+            else:
+                merged_track = None
+
+            merged_ext = max(int(r[5] or 0) for r in comp)
+            min_ts = min(float(r[6]) for r in comp)
+            max_ts = max(float(r[7]) for r in comp)
+
+            desired_tuple = (
+                target_rid,
+                merged_anchor,
+                merged_short,
+                merged_label,
+                merged_track,
+                merged_ext,
+                min_ts,
+                max_ts,
+            )
+            if len(comp) > 1 or tuple(comp[0]) != desired_tuple:
+                wh.execute(
+                    """
+                    INSERT INTO dim_rooms (
+                        room_id, anchor_uid, short_room_id, room_label, track_category,
+                        allows_ext_medal, first_seen_ts, last_seen_ts
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(room_id) DO UPDATE SET
+                        anchor_uid = excluded.anchor_uid,
+                        short_room_id = excluded.short_room_id,
+                        room_label = excluded.room_label,
+                        track_category = excluded.track_category,
+                        allows_ext_medal = excluded.allows_ext_medal,
+                        first_seen_ts = excluded.first_seen_ts,
+                        last_seen_ts = excluded.last_seen_ts
+                    """,
+                    desired_tuple,
+                )
+                updated_rooms += 1
+
+            alias_rids = {
+                x
+                for x in (*comp_rids, *comp_shorts, merged_short)
+                if x and x != target_rid
+            }
+            for old_rid in sorted(alias_rids):
+                moved = 0
+                for table in (
+                    'dim_sessions',
+                    'fact_events',
+                    'fact_room_metrics',
+                    'fact_cohost_intervals',
+                    'fact_session_presence',
+                ):
+                    cur = wh.execute(f'UPDATE {table} SET room_id = ? WHERE room_id = ?', (target_rid, old_rid))
+                    moved += cur.rowcount
+                cur_del = wh.execute('DELETE FROM dim_rooms WHERE room_id = ?', (old_rid,))
+                if cur_del.rowcount > 0 or moved > 0:
+                    merged_alias_rooms += 1
+
+        if registry and registry.entries:
+            for s_rid, min_start, max_cutoff in wh.execute(
+                'SELECT room_id, MIN(start_ts), MAX(cutoff_ts) FROM dim_sessions GROUP BY room_id'
+            ).fetchall():
+                reg_meta = registry.lookup(room_ids=(s_rid,))
+                if reg_meta is None:
+                    continue
+                cand_rids = [s_rid, *reg_meta.all_room_ids()]
+                target_rid = (
+                    reg_meta.canonical_room_id
+                    if reg_meta.has_explicit_canonical and reg_meta.canonical_room_id
+                    else _pick_canonical_room_id(cand_rids)
+                )
+                if target_rid != s_rid:
+                    short_rid = reg_meta.short_room_id or _pick_short_room_id(target_rid, cand_rids)
+                    wh.execute(
+                        """
+                        INSERT INTO dim_rooms (
+                            room_id, anchor_uid, short_room_id, room_label, track_category,
+                            allows_ext_medal, first_seen_ts, last_seen_ts
+                        ) VALUES (?, ?, ?, ?, ?, 0, ?, ?)
+                        ON CONFLICT(room_id) DO UPDATE SET
+                            anchor_uid = COALESCE(dim_rooms.anchor_uid, excluded.anchor_uid),
+                            short_room_id = COALESCE(dim_rooms.short_room_id, excluded.short_room_id),
+                            room_label = COALESCE(dim_rooms.room_label, excluded.room_label),
+                            track_category = COALESCE(dim_rooms.track_category, excluded.track_category),
+                            first_seen_ts = MIN(dim_rooms.first_seen_ts, excluded.first_seen_ts),
+                            last_seen_ts = MAX(dim_rooms.last_seen_ts, excluded.last_seen_ts)
+                        """,
+                        (
+                            target_rid,
+                            reg_meta.anchor_uid,
+                            short_rid,
+                            reg_meta.room_label,
+                            None if reg_meta.clear_track_category else reg_meta.track_category,
+                            float(min_start or 0.0),
+                            float(max_cutoff or 0.0),
+                        ),
+                    )
+                    for table in (
+                        'dim_sessions',
+                        'fact_events',
+                        'fact_room_metrics',
+                        'fact_cohost_intervals',
+                        'fact_session_presence',
+                    ):
+                        wh.execute(f'UPDATE {table} SET room_id = ? WHERE room_id = ?', (target_rid, s_rid))
+                    merged_alias_rooms += 1
+
+        final_rooms = wh.execute(
+            'SELECT room_id, anchor_uid, short_room_id, room_label, track_category FROM dim_rooms'
+        ).fetchall()
+        for rid, auid, short_rid, rlabel, rtrack in final_rooms:
+            reg_meta = registry.lookup(anchor_uid=auid, room_ids=(rid, short_rid)) if registry and registry.entries else None
+            if auid:
+                cur = wh.execute(
+                    'UPDATE dim_sessions SET anchor_uid = ? WHERE room_id = ? AND COALESCE(anchor_uid, -1) != ?',
+                    (auid, rid, auid),
+                )
+                updated_sessions += cur.rowcount
+            if reg_meta and reg_meta.clear_track_category:
+                cur = wh.execute(
+                    'UPDATE dim_sessions SET track_category = NULL WHERE room_id = ? AND track_category IS NOT NULL',
+                    (rid,),
+                )
+                updated_sessions += cur.rowcount
+            elif reg_meta and reg_meta.track_category:
+                cur = wh.execute(
+                    "UPDATE dim_sessions SET track_category = ? WHERE room_id = ? AND COALESCE(track_category, '') != ?",
+                    (reg_meta.track_category, rid, reg_meta.track_category),
+                )
+                updated_sessions += cur.rowcount
+            elif rtrack:
+                cur = wh.execute(
+                    'UPDATE dim_sessions SET track_category = ? WHERE room_id = ? '
+                    "AND (track_category IS NULL OR (track_category = 'virtual_talk' AND ? != 'virtual_talk'))",
+                    (rtrack, rid, rtrack),
+                )
+                updated_sessions += cur.rowcount
+            clean_lbl = _clean_room_label(reg_meta.room_label if reg_meta and reg_meta.room_label else rlabel)
+            if clean_lbl:
+                if reg_meta and reg_meta.room_label:
+                    cur = wh.execute(
+                        'UPDATE dim_sessions SET room_label = ? WHERE room_id = ? '
+                        "AND (room_label IS NULL OR room_label LIKE '匿名房间 %' "
+                        "     OR room_label LIKE '%(短号%' OR room_label LIKE '%（短号%')",
+                        (clean_lbl, rid),
+                    )
+                elif not _is_alias_annotated_label(clean_lbl):
+                    cur = wh.execute(
+                        'UPDATE dim_sessions SET room_label = ? WHERE room_id = ? '
+                        "AND (room_label IS NULL OR room_label LIKE '匿名房间 %' "
+                        "     OR room_label LIKE '%(短号%' OR room_label LIKE '%（短号%')",
+                        (clean_lbl, rid),
+                    )
+                else:
+                    cur = wh.execute(
+                        'UPDATE dim_sessions SET room_label = ? WHERE room_id = ? '
+                        "AND (room_label IS NULL OR room_label LIKE '匿名房间 %')",
+                        (clean_lbl, rid),
+                    )
+                updated_sessions += cur.rowcount
+
+    return {
+        'merged_alias_rooms': merged_alias_rooms,
+        'updated_rooms': updated_rooms,
+        'updated_session_metadata_rows': updated_sessions,
+    }
+
+
 def sync_warehouse(
     warehouse_path: Path,
     sources: list[tuple[str, Path]],
     session_roots: list[Path] | None = None,
     reingest: set[str] | None = None,
+    room_registries: Iterable[Path] | None = None,
 ) -> dict[str, Any]:
     """执行增量源库扫描、已完成场次标准化入库与跨房身份双向消解。"""
     started = time.monotonic()
     reingest_set = set(reingest or ())
     reingest_all = '*' in reingest_set
+    registry = load_room_registries(room_registries)
 
     # 打开数仓前先校验全部显式源库及场次引用的源库，严防误写任何源 monitor.sqlite3
     session_dbs = collect_session_databases(session_roots or [])
@@ -1144,7 +1863,7 @@ def sync_warehouse(
 
         source_reports = []
         for name, db_path in sources:
-            source_reports.append(_scan_single_source(wh, name, db_path))
+            source_reports.append(_scan_single_source(wh, name, db_path, registry=registry))
 
         session_stats = {
             'ingested': 0,
@@ -1170,7 +1889,7 @@ def sync_warehouse(
                     except Exception:
                         pass
                 res = _ingest_completed_session(
-                    wh, warehouse_path, entry, source_by_db, force_reingest=force
+                    wh, warehouse_path, entry, source_by_db, force_reingest=force, registry=registry
                 )
                 status = res['status']
                 session_stats[status] = session_stats.get(status, 0) + 1
@@ -1179,6 +1898,8 @@ def sync_warehouse(
                     session_stats['ingested_events'] += res['events']
                     session_stats['ingested_room_metric_rows'] += res['room_metric_rows']
                     session_stats['ingested_cohost_intervals'] += res['cohost_intervals']
+
+        room_reconciliation = _reconcile_rooms_and_metadata(wh, registry=registry)
 
         any_growth = any(r['touched_users'] > 0 or r['touched_faces'] > 0 for r in source_reports)
         presence_stale = wh.execute(
@@ -1204,7 +1925,14 @@ def sync_warehouse(
             '    AND e.resolved_crc32_uid IS NULL AND e.crc32_status IS NULL LIMIT 1'
             ')'
         ).fetchone()[0]
-        if any_growth or session_stats['ingested'] > 0 or bool(reingest_set) or presence_stale or unindexed_danmaku:
+        if (
+            any_growth
+            or session_stats['ingested'] > 0
+            or room_reconciliation['merged_alias_rooms'] > 0
+            or bool(reingest_set)
+            or presence_stale
+            or unindexed_danmaku
+        ):
             resolution = _resolve_danmaku_crc32_and_presence(wh)
         else:
             presence_count = wh.execute('SELECT COUNT(*) FROM fact_session_presence').fetchone()[0]
@@ -1231,6 +1959,7 @@ def sync_warehouse(
         'cohost_intervals': cohost_intervals,
         'sources': source_reports,
         'sessions': session_stats,
+        'room_reconciliation': room_reconciliation,
         'resolution': resolution,
     }
 
@@ -1413,6 +2142,8 @@ def configure_parser(commands) -> argparse.ArgumentParser:
                       help='源数据库映射 <name>=<monitor.sqlite3>，可重复指定')
     sync.add_argument('--session-root', type=Path, action='append', default=[],
                       help='场次工作区根目录，可重复指定')
+    sync.add_argument('--room-registry', type=Path, action='append', default=[],
+                      help='只读外部房间台账 JSON（含赛道分类 track_category 与短/长房号映射），可重复指定')
     sync.add_argument('--reingest', action='append', default=[],
                       help='强制事务重入指定 session_key（传 * 重入全部已完成场次）')
 
@@ -1437,6 +2168,7 @@ def main(args) -> int:
                 sources=args.source,
                 session_roots=args.session_root,
                 reingest=set(args.reingest or ()),
+                room_registries=args.room_registry,
             )
         elif args.warehouse_command == 'backfill-pages':
             from .warehouse_backfill import backfill_local_pages

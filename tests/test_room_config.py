@@ -352,3 +352,28 @@ async def test_capture_hot_reload_updates_runtime_settings_and_rejects_non_reloa
     await plat2.close()
     await mon2.close()
     store2.close()
+
+
+def test_room_track_category_and_asr_concurrency_hot_reload_validation():
+    base = {
+        'rooms': {'123456': {'label': '示例主播', 'intro': '欢迎'}},
+        'session_workflow': {'enabled': False},
+    }
+    valid = deepcopy(base)
+    valid['rooms']['123456']['track_category'] = 'virtual_music'
+    valid['session_workflow']['asr_max_concurrent'] = 3
+    valid['session_workflow']['asr_lock_dir'] = '/tmp/synthetic_asr_locks'
+    assert reload_plan(base, valid) == valid
+
+    for bad_mut in (
+        lambda c: c['rooms']['123456'].update(track_category=''),
+        lambda c: c['rooms']['123456'].update(track_category=123),
+        lambda c: c['session_workflow'].update(asr_max_concurrent=0),
+        lambda c: c['session_workflow'].update(asr_max_concurrent=True),
+        lambda c: c['session_workflow'].update(asr_max_concurrent=64),
+        lambda c: c['session_workflow'].update(asr_lock_dir='relative/locks'),
+    ):
+        broken = deepcopy(base)
+        bad_mut(broken)
+        with pytest.raises(ValueError):
+            reload_plan(base, broken)
