@@ -53,6 +53,8 @@ PK录屏花屏、视频剪辑读取及压缩前的参数检查见[PK编码参数
 
 需要基于数仓大中小 R 观众做分层滚雪球扩房、免登录核验候选主播近 14 天活跃度与舰长规模档位，并生成跨赛道均衡抽样方案时，见[扩房发现与分层采样](room-discovery.md)：使用 `bili-live room-discovery pull-followings/screen-candidates/sample-plan`，对数仓严格只读，带登录态拉取默认 `--dry-run`。
 
+需要在不迁移匿名直连采集的前提下，复用本机已登录小号 Chrome 在目标房间确认开播时短驻静音发送一条授权打卡弹幕并立即关页退出时，见[开播短驻静音打卡助手](live-checkin.md)：使用 `bili-live checkin --config ... --dry-run` 预检并挂载逐房 `notification_command` 热加载接入。
+
 需要从整场直播制作2–3分钟引流预告时，见[直播引流预告片](trailer.md)：事件选择、源时间映射、隐私裁剪、`trailer render/verify`、剪点与独立审阅。真实精剪表和媒体留在私有输出目录。
 
 ## 环境与安装
@@ -86,7 +88,7 @@ python -m bilibili_live_monitor run --until 2030-01-01T22:00:00-08:00
 
 默认RECORD_MODE=audio、ASR_ENABLED=0、PREVIEW_ENABLED=0，新增房间可覆盖record_mode/asr_enabled/preview_enabled三个独立字段。ASR关闭时不加载模型、不提交识别队列；看板显示禁用。采集后端由 `CAPTURE_BACKEND` 控制，默认 `cdp`（实名与网页采音模式保持不变）：audio复用网页16kHz、16bit单声道PCM，保存到DATA_DIR/recordings/<room_id>/的.wav，即使ASR关闭也保持网页播放；不额外请求媒体下载地址。video继续由ffmpeg复制原始音视频压缩包到.mkv。默认300秒分段，RECORDING_SEGMENT_SECONDS可配置。所有活动场次固定每300秒纯程序健康巡检，无房间关闭开关，规则见session-workflow.md。
 
-匿名纯离线采集可设置 `CAPTURE_BACKEND=direct`（免Chrome直连模式，强制 `anonymous` 未登录态，禁止启用 `welcome` / `like` 浏览器互动及实时网页ASR/预览，`run`/`platform` 与 `Accounts` 均不启动或检查Chrome进程）：程序缓存游客 `buvid3`/`buvid4` 与 WBI 签名，经全局 `DIRECT_HANDSHAKE_INTERVAL`（默认2.5秒）限速锁连接弹幕WebSocket并拉取直播流；`AUDIO_FORMAT` 在 `direct` 模式下默认 `opus`（`AUDIO_BITRATE=32k`，48kHz单声道VBR分段写入 `<prefix>-%05d.opus`，也可设为 `mka`），下播后由 `session_offline` 与 `offline-asr` 统一完成离线转写及终审。
+匿名纯离线采集可设置 `CAPTURE_BACKEND=direct`（免Chrome直连模式，强制 `anonymous` 未登录态，禁止启用 `welcome` / `like` 浏览器互动及实时网页ASR/预览，`run`/`platform` 与 `Accounts` 均不启动或检查Chrome进程）：程序缓存游客 `buvid3`/`buvid4` 与 WBI 签名，经全局 `DIRECT_HANDSHAKE_INTERVAL`（默认2.5秒）限速锁连接弹幕WebSocket并拉取直播流；纯音频模式默认请求最低视频码率档位 `DIRECT_AUDIO_QN=80`（服务端存在低档位转码时进一步向 `v1/Room/playUrl` 协商低码率音画复合流以节省下行带宽，视频模式保持 `DIRECT_VIDEO_QN=10000`）；`AUDIO_FORMAT` 在 `direct` 模式下默认 `opus`（`AUDIO_BITRATE=32k`，48kHz单声道VBR分段写入 `<prefix>-%05d.opus`，也可设为 `mka`），支持通过 `POST /api/automation/reload` 热加载 `automation.json` 中 `capture` 的 `direct_audio_qn`、`direct_video_qn`、`direct_handshake_interval`、`audio_bitrate`、`recording_segment_seconds` 与 `max_rooms`，下播后由 `session_offline` 与 `offline-asr` 统一完成离线转写及终审。
 
 实时ASR只使用千问流式：每5秒送入新PCM，每房间保留独立的最长30秒音频上下文。当前窗口以同一条时间线记录持续修订，`transcript_version=realtime`、`stable_text`与`is_final`区分实时稿状态；窗结束不代表识别准确性已经核验。音频缺口或worker重启必须重建上下文，不拼接成无缝录音。原始录制不依赖这些实时稿；`offline-asr`继续独立从媒体转写并写入自己的输出目录，不覆盖实时记录。旧30路独立切片验收不代表流式容量。
 

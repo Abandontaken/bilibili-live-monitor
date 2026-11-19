@@ -8,6 +8,8 @@ from urllib.request import Request, urlopen
 
 from .browser import Browser, room_url
 
+REFUSED_CODES = (-101, -111, -352, -403, -412, 401, 403, 412, 429)
+
 
 class RoomStatusRefused(RuntimeError):
     """调度器应锁止后续巡检，等待人工检查。"""
@@ -15,7 +17,10 @@ class RoomStatusRefused(RuntimeError):
 
 def index_rooms(payload):
     if payload.get('code') != 0:
-        raise RoomStatusRefused(f'房间状态接口拒绝：code={payload.get("code")}')
+        code = payload.get('code')
+        # 业务层服务错误（例如 -500）不是权限拒绝，必须允许下一轮查播恢复。
+        error = RoomStatusRefused if code in REFUSED_CODES else RuntimeError
+        raise error(f'房间状态接口{"拒绝" if error is RoomStatusRefused else "失败"}：code={code}')
     rows = payload.get('data', {}).get('by_room_ids')
     if not isinstance(rows, dict):
         raise RuntimeError('房间状态响应缺少by_room_ids')

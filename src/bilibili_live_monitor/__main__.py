@@ -12,6 +12,8 @@ from .gift_assets import configure_parser as configure_gift_assets
 from .gift_assets import main as gift_assets_main
 from .gift_render import configure_parser as configure_gift_render
 from .gift_render import main as gift_render_main
+from .live_checkin import configure_parser as configure_checkin
+from .live_checkin import main as checkin_main
 from .live_share_control import configure_parser as configure_live_share
 from .live_share_control import main as live_share_main
 from .media_codec import configure_parser as configure_media_codec
@@ -56,7 +58,10 @@ def main():
     configure_pk_bar(commands)
     configure_warehouse(commands)
     configure_room_discovery(commands)
+    configure_checkin(commands)
     args = parser.parse_args()
+    if args.command == 'checkin':
+        return checkin_main(args)
     if args.command == 'room-discovery':
         return room_discovery_main(args)
     if args.command == 'warehouse':

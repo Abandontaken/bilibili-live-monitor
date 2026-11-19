@@ -94,6 +94,80 @@ async def test_unknown_does_not_confirm_offline_and_refusal_persists(tmp_path, m
     platform.store.close()
 
 
+async def test_business_500_does_not_latch_and_next_poll_recovers(tmp_path, monkeypatch):
+    from bilibili_live_monitor.rotation import index_rooms
+
+    platform = fixture(tmp_path)
+    platform.monitor.browser = object()
+    platform.import_candidates([Candidate(url='123456')])
+    platform.configure(Policy(mode='fixed', enabled=True, target_rooms=1))
+    calls = 0
+
+    async def read(*args):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return index_rooms({'code': -500})
+        return {'123456': {'room_id': 123456, 'uid': 654321, 'live_status': 1}}
+
+    async def no_guards():
+        pass
+
+    monkeypatch.setattr('bilibili_live_monitor.platform.room_statuses', read)
+    platform.refresh_guards = no_guards
+    await platform.tick()
+    await platform.status_task
+    assert platform.status_refused is None
+    candidate = next(iter(platform.candidates.values()))
+    assert candidate['live_status'] is None and candidate['status_checked_utc']
+    platform.next_status_check = 0
+    await platform.tick()
+    await platform.status_task
+    await settled(platform)
+    assert calls == 2 and platform.active
+    assert candidate['attempts'] == 0 and candidate['status_error'] is None
+    await platform.close()
+    platform.store.close()
+
+
+async def test_direct_offline_return_waits_without_budget_and_can_start_next_session(tmp_path, monkeypatch):
+    from bilibili_live_monitor.direct_client import RoomNotLive
+
+    platform = fixture(tmp_path, capture_backend='direct')
+    platform.monitor.direct = object()
+    platform.import_candidates([Candidate(url='123456')])
+    platform.configure(Policy(mode='fixed', enabled=True, target_rooms=1))
+    c = next(iter(platform.candidates.values()))
+    c.update(room_id='123456', live_status=1)
+    add = platform.monitor.add
+
+    async def offline(*args, **kwargs):
+        raise RoomNotLive(2)
+
+    platform.monitor.add = offline
+    await platform.launch(c)
+    assert c['attempts'] == 0 and not c['blocked'] and c['live_status'] == 2
+    platform.monitor.add = add
+    await platform.launch(c)
+    platform.monitor.tasks.clear()
+    room = platform.store.rooms()[0]
+    room.update(status='stopped', capture_live_status=0)
+    platform.store.room(room)
+    platform.next_status_check = float('inf')
+
+    async def no_guards():
+        pass
+
+    platform.refresh_guards = no_guards
+    await platform.tick()
+    assert not platform.active and c['attempts'] == 0 and not c['blocked']
+    await status(platform, monkeypatch, 1)
+    await settled(platform)
+    assert platform.active and c['attempts'] == 0
+    await platform.close()
+    platform.store.close()
+
+
 async def test_status_response_cannot_overwrite_new_policy(tmp_path, monkeypatch):
     platform = fixture(tmp_path)
     platform.monitor.browser = object()
@@ -230,9 +304,10 @@ async def test_fixed_does_not_replace_with_unpinned_candidate(tmp_path, monkeypa
 async def test_guard_snapshot_retains_unresolved_and_retries_502():
     class Response:
         status = 200
+        payload = {'code': 0, 'data': {'info': {'num': 1, 'page': 1}, 'top3': [],
+                                       'list': [{'uid': 0}, {'uid': 10}]}}
         async def json(self):
-            return {'code': 0, 'data': {'info': {'num': 1, 'page': 1}, 'top3': [],
-                                      'list': [{'uid': 0}, {'uid': 10}]}}
+            return self.payload
     response = Response()
     async def get(*args, **kwargs):
         return response
@@ -248,6 +323,64 @@ async def test_guard_snapshot_retains_unresolved_and_retries_502():
         assert isinstance(error, RuntimeError) and not isinstance(error, RoomStatusRefused)
     else:
         raise AssertionError('502应报告暂时失败')
+    response.status = 200
+    response.payload = {'code': -500}
+    try:
+        await guard_snapshot(SimpleNamespace(connect=connect), '123456', '654321')
+    except Exception as error:
+        assert isinstance(error, RuntimeError) and not isinstance(error, RoomStatusRefused)
+    else:
+        raise AssertionError('业务-500应报告暂时失败而非永久拒绝')
+    response.payload = {'code': -412}
+    try:
+        await guard_snapshot(SimpleNamespace(connect=connect), '123456', '654321')
+    except RoomStatusRefused:
+        pass
+    else:
+        raise AssertionError('明确风控-412应保持RoomStatusRefused')
+
+
+async def test_status_refusal_enters_cooldown_and_auto_heals_after_probe(tmp_path, monkeypatch):
+    platform = fixture(tmp_path)
+    platform.monitor.browser = object()
+    platform.import_candidates([Candidate(url='123456')])
+    platform.configure(Policy(mode='fixed', enabled=True, target_rooms=1))
+    calls = 0
+
+    async def read(*args):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RoomStatusRefused('房间状态接口拒绝：code=-412')
+        return {'123456': {'room_id': 123456, 'uid': 654321, 'live_status': 1}}
+
+    async def no_guards():
+        pass
+
+    monkeypatch.setattr('bilibili_live_monitor.platform.room_statuses', read)
+    platform.refresh_guards = no_guards
+    await platform.tick()
+    await platform.status_task
+    assert platform.status_refused == '房间状态接口拒绝：code=-412'
+    assert platform.status_refused_attempts == 1
+    assert platform.status_refused_until > 0
+    # 冷却期内即使重置 next_status_check 也不提前查播或启动新录制
+    platform.next_status_check = 0
+    await platform.tick()
+    assert calls == 1 and not platform.active
+    # 冷却到期后自动发起低频探测，成功后清除 status_refused 并恢复录制
+    platform.status_refused_until = 1
+    platform.next_status_check = 0
+    await platform.tick()
+    await platform.status_task
+    await settled(platform)
+    assert calls == 2
+    assert platform.status_refused is None
+    assert platform.status_refused_attempts == 0
+    assert platform.status_refused_until == 0
+    assert list(platform.active.values()) == ['123456']
+    await platform.close()
+    platform.store.close()
 
 
 def test_guard_api_resolves_alias_and_omits_raw_pages(tmp_path):

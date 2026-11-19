@@ -2,6 +2,7 @@
 from copy import deepcopy
 
 from .browser import room_url
+from .config import HOT_RELOADABLE_CAPTURE_KEYS, parse_capture_overrides
 
 
 def validate_rooms(rooms):
@@ -42,11 +43,20 @@ def reload_plan(previous, incoming):
     incoming = deepcopy(incoming)
     rooms = incoming.get('rooms', {})
     validate_rooms(rooms)
+    parse_capture_overrides(incoming)
     if set(previous.get('rooms', {})) - set(rooms):
         raise ValueError('热加载不删除房间；停止守候请修改platform policy')
     def fixed(config):
         result = deepcopy(config)
         result.pop('rooms', None)
+        if 'capture' in result:
+            capture = result.get('capture')
+            if not isinstance(capture, dict):
+                raise ValueError('automation.capture须为JSON对象')
+            for key in HOT_RELOADABLE_CAPTURE_KEYS:
+                capture.pop(key, None)
+            if not capture:
+                result.pop('capture', None)
         workflow = result.get('session_workflow', {})
         if not isinstance(workflow, dict):
             raise ValueError('session_workflow必须是对象')
@@ -55,8 +65,9 @@ def reload_plan(previous, incoming):
             workflow.pop(key, None)
         return result
     if fixed(previous) != fixed(incoming):
-        raise ValueError('热加载只支持rooms及未来场次的publish/model/final_model/final_subagent/final_concurrency；'
-                         '其他设置需要重启')
+        raise ValueError('热加载只支持rooms、可动态采集参数（direct_audio_qn/direct_video_qn/'
+                         'direct_handshake_interval/audio_bitrate/recording_segment_seconds/max_rooms）'
+                         '及未来场次的publish/model/final_model/final_subagent/final_concurrency；其他设置需要重启')
     from .session_workflow import validate_settings
     workflow = incoming.get('session_workflow', {})
     publish = workflow.get('publish', {})

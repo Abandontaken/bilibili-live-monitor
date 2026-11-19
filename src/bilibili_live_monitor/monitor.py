@@ -13,7 +13,7 @@ from .audio_queue import AudioQueue
 from .browser import Browser, close_page, ensure_playing, room_url
 from .capture import close_pcm, read_pcm, start_pcm
 from .capture_recovery import CaptureRecovery, PageRecoveryRequired
-from .direct_client import DirectClient
+from .direct_client import DirectClient, RoomNotLive
 from .pcm_recording import PCMRecording
 from .preview import Previews
 from .recording import Recording
@@ -283,6 +283,8 @@ class Monitor:
             if delay := remaining_delay(saved.get('next_retry_utc')):
                 await asyncio.sleep(delay)
             meta = await self.direct.resolve_room(url)
+            if meta['live_status'] in (0, 2):
+                raise RoomNotLive(meta['live_status'])
             room_id = meta['capture_room_id']
             canonical = meta['url']
             async with self.lock:
@@ -358,7 +360,10 @@ class Monitor:
                     await self.direct.acquire_handshake_slot()
                     danmu_info = await self.direct.fetch_danmu_info(real_room_id)
                     if room.get('record_mode', 'none') != 'none':
-                        stream_url = await self.direct.fetch_stream_url(real_room_id)
+                        qn = (getattr(self.settings, 'direct_audio_qn', 80)
+                              if room.get('record_mode') == 'audio'
+                              else getattr(self.settings, 'direct_video_qn', 10000))
+                        stream_url = await self.direct.fetch_stream_url(real_room_id, qn=qn)
                         recorder = Recording(self.settings, room)
                         await recorder.start(stream_url)
                     ws_task = asyncio.create_task(
@@ -387,6 +392,13 @@ class Monitor:
                         await asyncio.wait({ws_task}, timeout=3)
                 except asyncio.CancelledError:
                     raise
+                except RoomNotLive as error:
+                    self.failures[room_id] = 0
+                    room.update(status='stopped', error=None, reconnect_attempts=0,
+                                next_retry_utc=None, capture_live_status=error.live_status,
+                                recording_status='stopped')
+                    self.store.room(room)
+                    break
                 except Exception as error:
                     self.failures[room_id] += 1
                     exhausted = ('recording_refused' in str(error) or

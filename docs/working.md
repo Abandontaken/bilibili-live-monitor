@@ -1,5 +1,36 @@
 # 工作记录
 
+## 直连音频模式低码率流画质协商与动态采集参数热加载（2026-11-18）
+
+- **直连模式按录制模式分离请求画质档位**：`config.py` 新增 `DIRECT_AUDIO_QN`（默认 `80`）与 `DIRECT_VIDEO_QN`（默认 `10000`），`Monitor.capture_direct` 在 `record_mode == 'audio'` 时默认请求最低码率档位以降低多路并发下行带宽，在 `record_mode == 'video'` 时保持原画请求。
+- **保留 `v2` 开播状态门禁并按需协商低档位流**：`DirectClient.fetch_stream_url` 先经 `v2/index/getRoomPlayInfo` 校验 `live_status`（防止误录未开播或轮播回放）；当游客态 `v2` 响应将 `current_qn` 钳制在较高档位（如 `250`）且 `accept_qn` 明确存在更低转码档位（如 `150`/`80`）时，再向 `v1/Room/playUrl` 请求对应低档位 HTTP-FLV 流，失败或异常时无缝回退 `v2` 已取得的流地址。
+- **`automation.capture` 动态参数热加载**：`room_config.reload_plan` 与 `Automation.reload_rooms` 支持通过 `POST /api/automation/reload` 原子热更新 `direct_audio_qn`、`direct_video_qn`、`direct_handshake_interval`（同步更新在线 `DirectClient.handshake_interval`）、`audio_bitrate`、`recording_segment_seconds` 与 `max_rooms`（禁止小于当前 `platform.policy.target_rooms`），非动态字段（如 `capture_backend`、`audio_format`、`queue_size`）变更或越界值均在生效前原子拒绝。
+- **验证**：Python 全套测试 `1463 passed`，`ruff check src tests scripts` 通过。
+
+## 舰队快照错误分类、拒绝退避自愈与查播单轮快速重试（2026-11-18）
+
+- **统一 `REFUSED_CODES` 覆盖舰队快照**：`room_status.guard_snapshot` 与 `DirectClient.guard_snapshot` 复用 `rotation.REFUSED_CODES`（仅 `-101/-111/-352/-403/-412/401/403/412/429` 抛出 `RoomStatusRefused`），业务 `code=-500` 等临时服务错误改为抛出普通 `RuntimeError`，60 秒后自动恢复，不再永久置位 `guard_refused`。
+- **`status_refused` 指数退避探测自愈**：`Platform.refresh_statuses` 遇 `RoomStatusRefused` 时记录 `status_refused_attempts` 与 `status_refused_until`（按 `900s → 1800s → 3600s` 封顶退避），冷却期内保持锁止不启动新房间，冷却到期后允许低频探测一次，探测成功即自动清零 `status_refused` 恢复常规轮询；人工 `resume` 立即清零保持不变。
+- **`DirectClient.room_statuses` 批内单次快速重试**：`getRoomBaseInfo` 出现非 `RoomStatusRefused` 的临时故障（如 `code=-500` 或网络抖动）时，先原地等待 `2s` 重试一次，降低单次网关 30 秒慢超时造成的巡检盲区。
+
+## 固定守候的查播故障与正常下播恢复（2026-11-18）
+
+- **区分状态查询临时故障与永久拒绝**：`getRoomBaseInfo` 返回业务 `code=-500` 等服务错误时不再抛出 `RoomStatusRefused`，记录本次尝试时间并留待下一轮恢复；仅明确认证、权限或风控错误继续触发永久停止全局查播，保留短号映射及拒绝后需显式 `resume` 的边界。
+- **新增 `RoomNotLive` 回退守候**：`room_init` 或拉流确认 `live_status=0/2` 时停止当前采集并回到 fixed 守候，不消耗重连预算；轮播即使携带 `playurl` 也不采集，下一场确认开播后自动启动。
+- **回归验证与审阅（尚未部署）**：新增 `-500` 恢复、明确拒绝继续锁止、正常下播不耗预算及下一场自动启动回归用例；Python 全套测试 `1459 passed`，Ruff `src` 与 `tests` 检查通过，独立 GPT-6.1 SOL Fast 审阅 `APPROVE`。
+
+## 转写校正层阅读契约（2026-11-18）
+
+- `skills/bilibili-live-monitor/session-workflow.md` 终审纠错段新增阅读契约：终审之外任何对话、事后汇总或复盘若复述本场转写，落笔前必须按窗口 seq 与原稿指纹叠加 `transcript_corrections.json` 的有效校正版（`corrected_text`），引文一律用校正版；原始 `text` 只作定位与指纹锚点，不得未经叠加直接复述。
+- 背景：事后拉取某场内容汇总时直接读取原始 ASR 窗口，把终审已校正的错字（歌名同音转写错字等）原样呈现给用户，造成「校正层未生效」的误判。程序侧 `corrections` 命令、needs_review 闭环与完成标记绑定已正常工作，缺口在终审流程之外的旁路读取场景；本契约补齐该场景的最小规则，无代码改动。
+
+## 开播事件驱动的短驻静音浏览器打卡助手（2026-11-18）
+
+- 新增 `live_checkin.py` 与 `bili-live checkin` CLI 子命令（同时支持 `python -m bilibili_live_monitor.live_checkin` 独立入口），配套公开子 skill `skills/bilibili-live-monitor/live-checkin.md` 与根 `SKILL.md` 路由：复用 `Automation` 逐房 `notification_command` 的 `stdin`/`stdout` JSON 契约，在不改动匿名直连采集与实名常驻槽位的前提下完成开播短驻静音打卡。
+- 进房前安全门禁：仅允许本机回环 `cdp_url`，业务阶段共享统一单调时钟预算（封顶 `64s`，独立分配取消收敛 `2s`、单页保活 `3s`、双级关页 `11.5s`、空白页撤离 `2s` 及 Playwright 断连 `3s`，累计最坏 `85.5s` 另留 `4.5s` 进程启动与输出余量，对齐 `Automation.send_notification` 的 `90s` 上限，并为 `browser.close_page` 的 `session.detach()` 补齐 2 秒超时保护）；在调用 `context.new_page()` 前先通过 `context.request.get` 核验 `/x/web-interface/nav` 的 `isLogin` 与 `expected_uid` 严格一致，并核验 `Room/get_info` 的规范房号与 `live_status == 1`，避免账号切回大号或房间下播时误开标签页产生进房记录。
+- 短驻静音与幂等账本：新建独立页面先注入 `MUTE_SCRIPT` 再导航，复用 `welcome.send_chat`（同步补齐发送前草稿/字数/建连异常的 `send_attempted = False` 标记）精准校验发送，在 `finally` 中先独立尝试关闭临时页，单页、关页报错或关页超时后再独立执行空白页导航撤离（回执暴露 `cleanup_failed` 与 `cleanup_evacuated` 且不回滚已发送账本），随后有界调用 `pw.stop()` 断开，绝不调用 `browser.close()`；基于 `flock` 文件锁与原子状态文件实现同 `live_start`、自然日 `once_per_day` 与 `min_interval_seconds` 三重防重，并提供零开页、零写入的 `--dry-run` 预检模式。
+- 验证：Python 全套 1443 passed（含 `test_live_checkin.py` 16 项安全门禁、真实 `welcome.send_chat` 发送前失败回退、关页超时独立撤离、调用方取消与子进程契约回归），Ruff `src/tests/scripts` 通过，独立 GPT-6.1 SOL Fast 代码与隐私审阅通过。
+
 ## 免 Chrome 匿名直连采集、Opus 32kbps 离线链路与弹幕实名叠加（2026-11-17）
 
 - `config.py` 新增实例级 `CAPTURE_BACKEND`（`'cdp'` | `'direct'`，默认 `'cdp'` 保持实名与网页采音行为不变）、`AUDIO_FORMAT`（`'wav'` | `'mka'` | `'opus'`，`direct` 下默认 `'opus'`，`cdp` 下默认 `'wav'`）、`AUDIO_BITRATE`（默认 `'32k'`）及全局异步建连限速 `DIRECT_HANDSHAKE_INTERVAL`（默认 `2.5` 秒）。`direct` 模式强制仅用于 `anonymous` 未登录只读采集，拒绝 `welcome` / `like` 浏览器互动及实时网页 ASR/预览，`runtime.py`、`accounts.py` 与 `automation.py` 均不启动、不管理或连接 Chrome 进程。

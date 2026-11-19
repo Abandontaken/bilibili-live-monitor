@@ -26,6 +26,19 @@ def test_refused_or_invalid_status_response_aborts(payload):
         index_rooms(payload)
 
 
+@pytest.mark.parametrize('code', [-500, -502, -503, -400, None])
+def test_service_errors_are_retryable_not_permanent_refusals(code):
+    with pytest.raises(RuntimeError) as error:
+        index_rooms({'code': code})
+    assert not isinstance(error.value, rotation.RoomStatusRefused)
+
+
+@pytest.mark.parametrize('code', [-101, -352, -403, -412, 429])
+def test_explicit_rejections_remain_permanent(code):
+    with pytest.raises(rotation.RoomStatusRefused):
+        index_rooms({'code': code})
+
+
 def test_blocked_alias_cannot_be_reimported_under_canonical_id():
     statuses = index_rooms({'code': 0, 'data': {'by_room_ids': {
         '123456': {'room_id': 123456, 'short_id': 42, 'live_status': 1}}}})

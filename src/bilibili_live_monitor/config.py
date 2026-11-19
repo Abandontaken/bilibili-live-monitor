@@ -2,7 +2,7 @@ import json
 import math
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -15,6 +15,8 @@ class Settings:
     record_mode: str = field(default_factory=lambda: os.getenv('RECORD_MODE', 'audio'))
     audio_format: str = field(default_factory=lambda: os.getenv('AUDIO_FORMAT', '').strip().lower())
     audio_bitrate: str = field(default_factory=lambda: os.getenv('AUDIO_BITRATE', '32k').strip().lower() or '32k')
+    direct_audio_qn: int = field(default_factory=lambda: int(os.getenv('DIRECT_AUDIO_QN', '80')))
+    direct_video_qn: int = field(default_factory=lambda: int(os.getenv('DIRECT_VIDEO_QN', '10000')))
     direct_handshake_interval: float = field(default_factory=lambda: float(os.getenv('DIRECT_HANDSHAKE_INTERVAL', '2.5')))
     asr_enabled: bool = field(default_factory=lambda: os.getenv('ASR_ENABLED', '0').lower() in ('1', 'true', 'yes'))
     preview_enabled: bool = field(default_factory=lambda: os.getenv('PREVIEW_ENABLED', '0').lower() in ('1', 'true', 'yes'))
@@ -51,6 +53,10 @@ class Settings:
             raise ValueError('音频保存格式需为wav、mka或opus')
         if not re.fullmatch(r'[1-9]\d{0,3}k', self.audio_bitrate):
             raise ValueError('音频码率格式无效，例如32k')
+        if type(self.direct_audio_qn) is not int or not 1 <= self.direct_audio_qn <= 30000:
+            raise ValueError('直连音频流画质档位direct_audio_qn须为1～30000的整数')
+        if type(self.direct_video_qn) is not int or not 1 <= self.direct_video_qn <= 30000:
+            raise ValueError('直连视频流画质档位direct_video_qn须为1～30000的整数')
         if not math.isfinite(self.direct_handshake_interval) or self.direct_handshake_interval < 0:
             raise ValueError('直连建连间隔不得为负数')
         if self.capture_backend == 'direct':
@@ -81,6 +87,8 @@ CAPTURE_CONFIG_TYPES = {
     'record_mode': str,
     'audio_format': str,
     'audio_bitrate': str,
+    'direct_audio_qn': int,
+    'direct_video_qn': int,
     'direct_handshake_interval': (int, float),
     'asr_enabled': bool,
     'preview_enabled': bool,
@@ -89,15 +97,17 @@ CAPTURE_CONFIG_TYPES = {
     'queue_size': int,
 }
 
+HOT_RELOADABLE_CAPTURE_KEYS = (
+    'direct_audio_qn',
+    'direct_video_qn',
+    'direct_handshake_interval',
+    'audio_bitrate',
+    'recording_segment_seconds',
+    'max_rooms',
+)
 
-def _automation_capture_overrides(automation_config: str) -> dict:
-    path_str = (automation_config or '').strip()
-    if not path_str:
-        return {}
-    path = Path(path_str)
-    if not path.is_file():
-        return {}
-    data = json.loads(path.read_text(encoding='utf-8'))
+
+def parse_capture_overrides(data: dict) -> dict:
     if not isinstance(data, dict) or 'capture' not in data:
         return {}
     raw = data['capture']
@@ -124,10 +134,85 @@ def _automation_capture_overrides(automation_config: str) -> dict:
             if not isinstance(value, str):
                 raise ValueError(f'automation.capture.{key}须为字符串')
             overrides[key] = value.strip().lower() if key in ('capture_backend', 'audio_format', 'audio_bitrate') else value
+    if overrides:
+        backend = overrides.get(
+            'capture_backend',
+            'direct'
+            if overrides.get('audio_format') in ('opus', 'mka')
+            and not overrides.get('asr_enabled')
+            and not overrides.get('preview_enabled')
+            else 'cdp',
+        )
+        neutral = _neutral_settings_kwargs(backend)
+        neutral.update(overrides)
+        Settings(**neutral)
     return overrides
+
+
+def _neutral_settings_kwargs(backend: str = 'cdp') -> dict:
+    return {
+        'capture_backend': backend,
+        'record_mode': 'audio',
+        'audio_format': '',
+        'audio_bitrate': '32k',
+        'direct_audio_qn': 80,
+        'direct_video_qn': 10000,
+        'direct_handshake_interval': 2.5,
+        'asr_enabled': False,
+        'preview_enabled': False,
+        'recording_segment_seconds': 300,
+        'max_rooms': 10,
+        'queue_size': 20,
+        'silence_dbfs': -55.0,
+        'max_reconnects': 20,
+        'retry_delay': 2.0,
+        'retry_max_delay': 300.0,
+        'watch_poll_seconds': 30.0,
+        'guard_poll_seconds': 3600.0,
+        'babysitter_command': [],
+        'babysitter_interval_seconds': 300.0,
+        'babysitter_timeout_seconds': 120.0,
+    }
+
+
+def _safe_env_capture_baseline() -> dict:
+    defaults = Settings(**_neutral_settings_kwargs('cdp'))
+    baseline = {k: getattr(defaults, k) for k in HOT_RELOADABLE_CAPTURE_KEYS}
+    env_parsers = (
+        ('direct_audio_qn', 'DIRECT_AUDIO_QN', int),
+        ('direct_video_qn', 'DIRECT_VIDEO_QN', int),
+        ('direct_handshake_interval', 'DIRECT_HANDSHAKE_INTERVAL', float),
+        ('audio_bitrate', 'AUDIO_BITRATE', lambda s: s.strip().lower() or '32k'),
+        ('recording_segment_seconds', 'RECORDING_SEGMENT_SECONDS', int),
+        ('max_rooms', 'MAX_ROOMS', int),
+    )
+    for key, env_name, parser in env_parsers:
+        raw = os.getenv(env_name)
+        if raw is None or not raw.strip():
+            continue
+        try:
+            val = parser(raw)
+            replace(defaults, **{key: val})
+            baseline[key] = val
+        except ValueError:
+            pass
+    return baseline
+
+
+def _automation_capture_overrides(automation_config: str) -> dict:
+    path_str = (automation_config or '').strip()
+    if not path_str:
+        return {}
+    path = Path(path_str)
+    if not path.is_file():
+        return {}
+    data = json.loads(path.read_text(encoding='utf-8'))
+    return parse_capture_overrides(data)
 
 
 def load_settings():
     load_dotenv()
     automation_config = os.getenv('AUTOMATION_CONFIG', '')
-    return Settings(**_automation_capture_overrides(automation_config))
+    settings = Settings(**_automation_capture_overrides(automation_config))
+    settings._capture_baseline = _safe_env_capture_baseline()
+    return settings

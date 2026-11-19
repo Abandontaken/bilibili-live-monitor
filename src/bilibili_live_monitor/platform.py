@@ -9,6 +9,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .browser import room_url
+from .direct_client import RoomNotLive
 from .retry import backoff_delay, remaining_delay
 from .room_status import guard_snapshot, room_statuses
 from .store import utc_now
@@ -105,6 +106,8 @@ class Platform:
         self.status_task = self.guard_task = None
         self.next_status_check = 0
         self.status_refused = saved.get('status_refused')
+        self.status_refused_attempts = int(saved.get('status_refused_attempts') or 0)
+        self.status_refused_until = float(saved.get('status_refused_until') or 0)
         self.session_workflow_rooms = set()
         self.room_capture_overrides = {}
         self.session_asr = saved.get('session_asr', {})
@@ -122,7 +125,9 @@ class Platform:
                                             'candidates': self.candidates,
                                              'discovery_blocked': self.discovery_blocked,
                                              'session_asr': self.session_asr,
-                                            'status_refused': self.status_refused})
+                                            'status_refused': self.status_refused,
+                                            'status_refused_attempts': self.status_refused_attempts,
+                                            'status_refused_until': self.status_refused_until})
 
     def event(self, action, **data):
         self.store.event('platform_action', {'at_utc': utc_now(), 'action': action, **data})
@@ -216,6 +221,8 @@ class Platform:
                 room.update(reconnect_attempts=0, next_retry_utc=None)
                 self.store.room(room)
         self.status_refused = None
+        self.status_refused_attempts = 0
+        self.status_refused_until = 0
         self.next_status_check = 0
         self.revision += 1
         self.save()
@@ -255,17 +262,26 @@ class Platform:
             if self.revision != revision:
                 return
             self.event('status_check_failed', error=str(error))
-            # 明确拒绝持久停查；网络异常下轮恢复，不把未知当下播。
+            # 明确拒绝进入低频退避探测；网络异常下轮恢复，不把未知当下播。
             from .rotation import RoomStatusRefused
             if isinstance(error, RoomStatusRefused):
                 self.status_refused = str(error)
+                self.status_refused_attempts += 1
+                cooldown = backoff_delay(self.status_refused_attempts, base=900, maximum=3600)
+                self.status_refused_until = time.time() + cooldown
+                self.next_status_check = max(self.next_status_check, self.status_refused_until)
             for c in candidates:
                 self.candidates[c['url']].update(status_error=str(error), offline_checks=0,
-                                                  live_status=None, watch_state='unknown')
+                                                  live_status=None, watch_state='unknown',
+                                                  status_checked_utc=utc_now())
             self.save()
             return
         if self.revision != revision or self.policy.mode != 'fixed' or not self.policy.enabled:
             return
+        if self.status_refused is not None or self.status_refused_attempts or self.status_refused_until:
+            self.status_refused = None
+            self.status_refused_attempts = 0
+            self.status_refused_until = 0
         for c in unresolved_aliases:
             row = statuses.get(c['url'].rsplit('/', 1)[-1])
             if row:
@@ -408,6 +424,18 @@ class Platform:
         self.save()
         self.event('source_failed', url=candidate['url'], error=error, blocked=candidate['blocked'])
 
+    def wait_for_broadcast(self, candidate, live_status):
+        candidate.update(selected=False, attempts=0, next_attempt=0, last_error=None,
+                         live_status=live_status, offline_checks=1, watch_state='confirming_offline')
+        room = self.retry_room(candidate)
+        if room:
+            room.update(status='stopped', error=None, reconnect_attempts=0,
+                        next_retry_utc=None, recording_status='stopped')
+            self.store.room(room)
+        self.next_status_check = 0
+        self.save()
+        self.event('broadcast_waiting', url=candidate['url'], live_status=live_status)
+
     def capture_options(self, candidate):
         options = self.policy.model_dump(exclude={'enabled', 'target_rooms', 'mode', 'fixed_rooms'})
         rid = candidate.get('room_id')
@@ -447,6 +475,8 @@ class Platform:
             candidate['selected'] = False
             self.save()
             raise
+        except RoomNotLive as error:
+            self.wait_for_broadcast(candidate, error.live_status)
         except Exception as error:
             self.failed(candidate, f'{type(error).__name__}: {error}')
 
@@ -479,7 +509,9 @@ class Platform:
         fixed = self.policy.mode == 'fixed'
         if fixed and target:
             if self.status_task is None or self.status_task.done():
-                if not self.status_refused and time.time() >= self.next_status_check:
+                cooldown_passed = (not self.status_refused
+                                   or (self.status_refused_until > 0 and time.time() >= self.status_refused_until))
+                if cooldown_passed and time.time() >= self.next_status_check:
                     self.next_status_check = time.time() + self.settings.watch_poll_seconds
                     self.status_task = asyncio.create_task(self.refresh_statuses())
             if self.guard_task is None or self.guard_task.done():
@@ -516,8 +548,11 @@ class Platform:
                 self.event('broadcast_finished', url=url, room_id=rid)
             elif rid not in self.monitor.tasks:
                 self.active.pop(url)
-                self.failed(candidate, rooms.get(rid, {}).get('error') or 'capture_ended',
-                            already_counted=bool(rooms.get(rid, {}).get('reconnect_attempts')))
+                if self._is_direct() and current.get('capture_live_status') in (0, 2):
+                    self.wait_for_broadcast(candidate, current['capture_live_status'])
+                else:
+                    self.failed(candidate, current.get('error') or 'capture_ended',
+                                already_counted=bool(current.get('reconnect_attempts')))
             # 媒体无进度由每次Recording实例自己的40秒检查处理；外层不以旧启动时刻抢停恢复。
         # 先取消多余启动，再停止多余任务；不停止非平台拥有的手工任务。
         excess = max(0, len(self.monitor.tasks)+len(self.launching)-target)

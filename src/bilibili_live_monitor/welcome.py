@@ -178,19 +178,9 @@ async def message_limit(page):
 
 
 async def send_chat(page, text, *, room_id, allowed=None):
-    if allowed is not None and not allowed():
-        raise RuntimeError('发送已暂停')
-    if not correct_page(page.url, room_id):
-        raise RuntimeError('目标页面已经切换，停止发送')
-    field = page.locator('.chat-input:visible')
-    if await field.count() != 1 or await field.input_value():
-        raise RuntimeError('输入框不唯一或含已有草稿，停止发送')
-    if await page.locator('button.send-btn:visible').count() != 1:
-        raise RuntimeError('发送按钮不唯一')
-    if text_length(text) > await message_limit(page):
-        raise RuntimeError('文案超出当前页面字数限制')
     accepted = None
     diagnostics = []
+
     async def guard(route):
         nonlocal accepted
         permitted = (accepted is None and correct_page(page.url, room_id)
@@ -204,7 +194,24 @@ async def send_chat(page, text, *, room_id, allowed=None):
         else:
             accepted = route.request
             await route.continue_()
-    cdp = await page.context.new_cdp_session(page)
+
+    try:
+        if allowed is not None and not allowed():
+            raise RuntimeError('发送已暂停')
+        if not correct_page(page.url, room_id):
+            raise RuntimeError('目标页面已经切换，停止发送')
+        field = page.locator('.chat-input:visible')
+        if await field.count() != 1 or await field.input_value():
+            raise RuntimeError('输入框不唯一或含已有草稿，停止发送')
+        if await page.locator('button.send-btn:visible').count() != 1:
+            raise RuntimeError('发送按钮不唯一')
+        if text_length(text) > await message_limit(page):
+            raise RuntimeError('文案超出当前页面字数限制')
+        cdp = await page.context.new_cdp_session(page)
+    except BaseException as error:
+        error.send_attempted = False
+        error.send_diagnostics = diagnostics
+        raise
     routed = False
     try:
         # 页面已有Service Worker会绕过Playwright route；仅本次发送临时走原生网络。
