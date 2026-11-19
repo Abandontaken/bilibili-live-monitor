@@ -251,7 +251,138 @@ def _args(action, source, out, **extra):
         argv.extend(['--start-timeout', str(extra['start_timeout'])])
     if extra.get('infer_timeout'):
         argv.extend(['--infer-timeout', str(extra['infer_timeout'])])
+    if extra.get('max_concurrent') is not None:
+        argv.extend(['--max-concurrent', str(extra['max_concurrent'])])
+    if extra.get('global_lock_dir'):
+        argv.extend(['--global-lock-dir', str(extra['global_lock_dir'])])
+    if extra.get('slot_timeout') is not None:
+        argv.extend(['--slot-timeout', str(extra['slot_timeout'])])
     return parser.parse_args(argv)
+
+
+def test_global_semaphore_caps_concurrent_workers_and_releases_cleanly(tmp_path):
+    """4 路并发 offline-asr 进程共享 max_concurrent=2 全局锁时，同时活跃 worker 峰值严格不超过 2 且全部排队完成。"""
+    lock_dir = tmp_path / 'shared_asr_locks'
+    tracker_file = tmp_path / 'concurrency_tracker.json'
+    tracker_lock = tmp_path / 'concurrency_tracker.lock'
+    tracker_file.write_text(json.dumps({'active': 0, 'peak': 0, 'completed': 0}))
+
+    worker = tmp_path / 'counting_worker.py'
+    worker.write_text(
+        'import fcntl, json, signal, sys, time\n'
+        'from pathlib import Path\n'
+        f't_file = Path({str(tracker_file)!r})\n'
+        f't_lock = Path({str(tracker_lock)!r})\n'
+        'def bump(delta, done=False):\n'
+        '    with t_lock.open("a+") as lk:\n'
+        '        fcntl.flock(lk, fcntl.LOCK_EX)\n'
+        '        st = json.loads(t_file.read_text())\n'
+        '        st["active"] += delta\n'
+        '        if st["active"] > st["peak"]:\n'
+        '            st["peak"] = st["active"]\n'
+        '        if done:\n'
+        '            st["completed"] += 1\n'
+        '        t_file.write_text(json.dumps(st))\n'
+        'signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))\n'
+        'bump(1)\n'
+        'try:\n'
+        '    print(json.dumps({"ready": True}), flush=True)\n'
+        '    for line in sys.stdin:\n'
+        '        req = json.loads(line)\n'
+        '        time.sleep(0.35)\n'
+        '        print(json.dumps({"req_id": req["req_id"], "text": "ok", "infer_ms": 5, '
+        '"truncated": False, "error": None}), flush=True)\n'
+        'finally:\n'
+        '    bump(-1, done=True)\n'
+    )
+
+    src_root = str(Path(__file__).resolve().parents[1] / 'src')
+    env = {**os.environ, 'PYTHONPATH': src_root}
+    procs = []
+    outputs = []
+    for idx in range(4):
+        in_dir = tmp_path / f'in_{idx}' / '100001'
+        _tone(in_dir / 'seg.wav')
+        out_dir = tmp_path / f'out_{idx}'
+        outputs.append(out_dir)
+        cmd = [
+            sys.executable, '-m', 'bilibili_live_monitor', 'offline-asr', 'run',
+            '--input', str(in_dir.parent),
+            '--output', str(out_dir),
+            '--max-files', '1',
+            '--asr-python', sys.executable,
+            '--worker-script', str(worker),
+            '--max-concurrent', '2',
+            '--global-lock-dir', str(lock_dir),
+        ]
+        procs.append(subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
+
+    try:
+        for p in procs:
+            out_s, err_s = p.communicate(timeout=20)
+            assert p.returncode == 0, f'worker failed: stdout={out_s} stderr={err_s}'
+    finally:
+        for p in procs:
+            if p.poll() is None:
+                p.kill()
+                p.wait()
+
+    stats = json.loads(tracker_file.read_text())
+    assert stats['completed'] == 4
+    assert stats['active'] == 0
+    assert stats['peak'] == 2
+    for out_dir in outputs:
+        slot_state = json.loads((out_dir / 'state' / 'global_slot.json').read_text())
+        assert slot_state['status'] == 'released'
+        assert slot_state['slot'] in (0, 1)
+
+
+def test_global_semaphore_slot_timeout_and_budget_pause(tmp_path):
+    """槽位全部被占用时，CLI slot-timeout 抛出 TimeoutError，session_offline 截止预算到期转为 BudgetPaused。"""
+    import fcntl
+    from types import SimpleNamespace
+
+    from bilibili_live_monitor.session_budget import BudgetPaused
+
+    lock_dir = tmp_path / 'busy_locks'
+    lock_dir.mkdir()
+    held = (lock_dir / 'slot-00.lock').open('a+')
+    fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        source = tmp_path / 'recordings'
+        _tone(source / '123456' / 'a.wav')
+        with pytest.raises(TimeoutError):
+            main(_args(
+                'run', source, tmp_path / 'wait_cli', max_files=1,
+                asr_python=sys.executable, worker_script=str(Path(offline_asr.__file__).with_name('asr_worker.py')),
+                max_concurrent=1, global_lock_dir=lock_dir, slot_timeout=0.1,
+            ))
+        wait_state = json.loads((tmp_path / 'wait_cli' / 'state' / 'global_slot.json').read_text())
+        assert wait_state['status'] == 'waiting'
+
+        with pytest.raises(BudgetPaused):
+            with offline_asr._global_asr_slot(
+                tmp_path / 'wait_session',
+                SimpleNamespace(
+                    max_concurrent=1,
+                    global_lock_dir=str(lock_dir),
+                    slot_deadline=time.time() + 0.05,
+                    budget_on_slot_timeout=True,
+                ),
+            ):
+                pass
+    finally:
+        held.close()
+
+    # 非法参数校验须在创建输出目录与 run.lock 之前拦截
+    bad_out = tmp_path / 'never_created_out'
+    assert offline_asr._cli([
+        'offline-asr', 'run',
+        '--input', str(tmp_path / 'recordings'),
+        '--output', str(bad_out),
+        '--max-concurrent', '0',
+    ]) == 2
+    assert not bad_out.exists()
 
 
 def _python():
