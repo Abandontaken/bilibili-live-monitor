@@ -1,5 +1,12 @@
 # 工作记录
 
+## 礼物目录兼容与奇数尺寸裁切（2026-11-19）
+
+- 素材 CLI 接受 giftConfig `data.list` 蛇形字段及显式配套的 effects 快照；数量档位仍精确匹配，零值回退默认动画。缺资源或重复礼物版本不猜测。
+- RGB 和 alpha 区域先转 RGB 再裁切，避免 YUV 色度采样将奇数尺寸向下取整。
+- skill 补充主播端已烧录效果、逐场景 PK 墙钟、显式缺帧定格及盲盒独立结果动画的覆盖边界。原片窗口编排仍由操作者核对，不声称已新增自动视觉识别。
+- 定向验证：gift render 与 API catalog 共 18 项通过，相关 Ruff 通过；包括实际 ffmpeg 奇数尺寸合成回归。
+
 ## 直连音频模式低码率流画质协商与动态采集参数热加载（2026-11-18）
 
 - **直连模式按录制模式分离请求画质档位**：`config.py` 新增 `DIRECT_AUDIO_QN`（默认 `80`）与 `DIRECT_VIDEO_QN`（默认 `10000`），`Monitor.capture_direct` 在 `record_mode == 'audio'` 时默认请求最低码率档位以降低多路并发下行带宽，在 `record_mode == 'video'` 时保持原画请求。

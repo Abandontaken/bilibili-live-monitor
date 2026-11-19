@@ -143,6 +143,21 @@ def test_real_render_transparency_timing_and_readonly_sources(tmp_path, media_fi
         gift_render.render(plan, output)
 
 
+def test_odd_rgb_and_alpha_rectangles_render_without_chroma_rounding(tmp_path, media_fixture, monkeypatch):
+    args, _ = media_fixture
+    previous = gift_assets.load_asset(args.asset)
+    odd = config()
+    odd['info'].update(w=63, h=63, rgbFrame=[0, 0, 63, 63], aFrame=[64, 0, 31, 31])
+    source = tmp_path / 'odd-catalog.json'
+    source.write_text(json.dumps(catalog()))
+    monkeypatch.setattr(gift_assets, 'download', lambda url, limit:
+                        json.dumps(odd).encode() if url.endswith('.json')
+                        else Path(previous['media']['path']).read_bytes())
+    args.asset = Path(gift_assets.fetch(tmp_path / 'odd-cache', 123456, 123, catalog=source)['asset'])
+    result = gift_render.render(gift_render.make_plan(args), tmp_path / 'odd-render')
+    assert result['verified']
+
+
 def test_legacy_pk_archive_requires_explicit_aspect(tmp_path, media_fixture, monkeypatch):
     args, base = media_fixture
     archive = tmp_path / 'archive'
