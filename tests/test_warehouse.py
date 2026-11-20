@@ -1764,6 +1764,243 @@ def test_v1_to_v2_schema_migration_and_auto_reingest(tmp_path: Path):
     assert again['sessions']['skipped_already_ingested'] == 1
 
 
+def test_warehouse_merges_short_and_canonical_rooms_by_anchor_uid_and_applies_registry_tracks(tmp_path):
+    """验证短/长房号按 anchor_uid 归并至规范长房号，且外部房间台账准确写入 track_category（不把 talk 硬编码为 virtual_talk）。"""
+    db_path = tmp_path / 'monitor.sqlite3'
+    _create_source_db(db_path)
+    sessions_dir = tmp_path / 'sessions'
+    sessions_dir.mkdir()
+    wh_path = tmp_path / 'warehouse.sqlite3'
+
+    # 房间 A：拥有靓号短房号 555 与规范长房号 9900555（anchor_uid = 880001）
+    # 房间 B：游戏哨兵房间 6600111（anchor_uid = 880002），采用 content_mode='talk' 离线转写
+    # 房间 C：无外部台账的新接入房间 7700222（anchor_uid = 880003），采用 content_mode='talk'，不应谎报为 virtual_talk
+    with sqlite3.connect(db_path) as db:
+        # 模拟源库先在规范长房号 9900555 上留下空壳房间观测（类似勋章或候选预检）
+        db.execute(
+            'INSERT INTO rooms(room_id, data) VALUES (?, ?)',
+            ('9900555', json.dumps({'room_id': '9900555', 'uid': 880001, 'updated_at': iso(1791000000)})),
+        )
+        # 采集期实际落在短房号 555
+        _insert_raw(db, '555', 1791000010, {
+            'cmd': 'ENTRY_EFFECT',
+            'data': {
+                'uid': 900101,
+                'target_id': 880001,
+                'copy_writing': '欢迎 <%示例舰长%> 进入直播间',
+                'uinfo': {'uid': 900101, 'base': {'name': '示例舰长'}, 'wealth': {'level': 35}},
+            },
+        })
+        _insert_raw(db, '555', 1791000020, _pb_gift_packet(
+            uid=900101, uname='示例舰长', gift_name='小花花', price=100, total_coin=100,
+            tid='2000000000000000001', timestamp=1791000020,
+        ))
+        _insert_raw(db, '555', 1791000030, {'cmd': 'ONLINE_RANK_COUNT', 'data': {'online_count': 42}})
+
+        # 游戏哨兵房间 6600111
+        _insert_raw(db, '6600111', 1791001010, {
+            'cmd': 'ENTRY_EFFECT',
+            'data': {
+                'uid': 900102,
+                'target_id': 880002,
+                'copy_writing': '欢迎 <%示例观众%> 进入直播间',
+                'uinfo': {'uid': 900102, 'base': {'name': '示例观众'}, 'wealth': {'level': 22}},
+            },
+        })
+
+        # 未登记台账的 talk 模式房间 7700222
+        _insert_raw(db, '7700222', 1791002010, {
+            'cmd': 'ENTRY_EFFECT',
+            'data': {
+                'uid': 900103,
+                'target_id': 880003,
+                'copy_writing': '欢迎 <%路人甲%> 进入直播间',
+                'uinfo': {'uid': 900103, 'base': {'name': '路人甲'}, 'wealth': {'level': 12}},
+            },
+        })
+
+    # 先创建短房号场次（模拟历史带 "(短号别名555)" 标签与 talk 模式切流），验证无台账时也能按 anchor_uid + platform_room_id 合并
+    s_short = _create_completed_session(
+        sessions_dir, 'sess_short_555', db_path, '555', 1791000000, 1791000060,
+    )
+    cfg_short = json.loads((s_short / 'config.json').read_text())
+    cfg_short.update(platform_room_id='9900555', content_mode='talk', label='示例歌姬(短号别名555)')
+    atomic_json(s_short / 'config.json', cfg_short)
+
+    s_game = _create_completed_session(
+        sessions_dir, 'sess_game_6600111', db_path, '6600111', 1791001000, 1791001060,
+    )
+    cfg_game = json.loads((s_game / 'config.json').read_text())
+    cfg_game.update(content_mode='talk', label='示例游戏主播')
+    atomic_json(s_game / 'config.json', cfg_game)
+
+    s_untyped = _create_completed_session(
+        sessions_dir, 'sess_untyped_7700222', db_path, '7700222', 1791002000, 1791002060,
+    )
+    cfg_untyped = json.loads((s_untyped / 'config.json').read_text())
+    cfg_untyped.update(content_mode='talk', label='匿名房间 7700222')
+    atomic_json(s_untyped / 'config.json', cfg_untyped)
+
+    # 第一轮：不传台账，验证短号 555 与长号 9900555 自动归并为单条 9900555，且 talk 模式未登记房间 track_category 保持 NULL
+    res1 = sync_warehouse(wh_path, sources=[('anon', db_path)], session_roots=[sessions_dir])
+    assert res1['sessions']['ingested'] == 3
+    with sqlite3.connect(wh_path) as wh:
+        rooms_a = wh.execute(
+            'SELECT room_id, anchor_uid, short_room_id, track_category FROM dim_rooms WHERE anchor_uid = 880001'
+        ).fetchall()
+        assert rooms_a == [('9900555', 880001, '555', None)]
+        assert wh.execute("SELECT COUNT(*) FROM dim_rooms WHERE room_id = '555'").fetchone()[0] == 0
+        assert wh.execute("SELECT room_id FROM dim_sessions WHERE session_key = 'sess_short_555'").fetchone()[0] == '9900555'
+        assert wh.execute("SELECT DISTINCT room_id FROM fact_events WHERE session_key = 'sess_short_555'").fetchall() == [('9900555',)]
+        assert wh.execute("SELECT DISTINCT room_id FROM fact_room_metrics WHERE session_key = 'sess_short_555'").fetchall() == [('9900555',)]
+        assert wh.execute("SELECT DISTINCT room_id FROM fact_session_presence WHERE session_key = 'sess_short_555'").fetchall() == [('9900555',)]
+        # 未传台账时，content_mode='talk' 不会误标为 virtual_talk
+        assert wh.execute("SELECT track_category FROM dim_rooms WHERE room_id = '6600111'").fetchone()[0] is None
+        assert wh.execute("SELECT track_category FROM dim_rooms WHERE room_id = '7700222'").fetchone()[0] is None
+
+        # 模拟旧版历史遗留裂行与误标 virtual_talk（如升级前已入库的分裂记录）
+        wh.execute(
+            "INSERT INTO dim_rooms(room_id, anchor_uid, room_label, track_category, allows_ext_medal, first_seen_ts, last_seen_ts) "
+            "VALUES ('555', 880001, '示例歌姬(短号别名555)', 'virtual_talk', 1, 1790999000, 1791000060)"
+        )
+        wh.execute("UPDATE dim_sessions SET room_id = '555', track_category = 'virtual_talk' WHERE session_key = 'sess_short_555'")
+        wh.execute("UPDATE fact_events SET room_id = '555' WHERE session_key = 'sess_short_555'")
+        wh.execute("UPDATE dim_rooms SET track_category = 'virtual_talk' WHERE room_id = '6600111'")
+        wh.execute("UPDATE dim_sessions SET track_category = 'virtual_talk' WHERE session_key = 'sess_game_6600111'")
+
+    # 第二轮：传入外部台账（同时兼容 selected_candidates 与 rooms 清单），无需 --reingest 即可归并裂行并修正赛道与主播名
+    registry_path = tmp_path / 'room_registry.json'
+    registry_path.write_text(json.dumps({
+        'selected_candidates': {
+            'core_head': [
+                {
+                    'anchor_uid': 880001,
+                    'room_id': 9900555,
+                    'short_id': 555,
+                    'capture_room_id': '555',
+                    'uname': '示例歌姬',
+                    'track': 'core_singing_chat',
+                },
+            ],
+            'gaming_sentinels': [
+                {
+                    'anchor_uid': 880002,
+                    'room_id': 6600111,
+                    'short_id': 0,
+                    'capture_room_id': '6600111',
+                    'uname': '示例游戏主播',
+                    'track': 'gaming_sentinel',
+                },
+            ],
+        },
+        'rooms': [
+            {
+                'anchor_uid': 880003,
+                'room_id': '7700222',
+                'room_label': '示例杂谈主播',
+                'track_category': 'virtual_talk',
+            },
+        ],
+    }, ensure_ascii=False))
+
+    code = cli_main_helper([
+        'warehouse', 'sync',
+        '--warehouse', str(wh_path),
+        '--source', f'anon={db_path}',
+        '--session-root', str(sessions_dir),
+        '--room-registry', str(registry_path),
+    ])
+    assert code == 0
+
+    with sqlite3.connect(wh_path) as wh:
+        all_rooms = wh.execute(
+            'SELECT room_id, anchor_uid, short_room_id, room_label, track_category, allows_ext_medal, first_seen_ts '
+            'FROM dim_rooms ORDER BY room_id'
+        ).fetchall()
+        assert all_rooms == [
+            ('6600111', 880002, None, '示例游戏主播', 'virtual_gaming', 0, 1791001000.0),
+            ('7700222', 880003, None, '示例杂谈主播', 'virtual_talk', 0, 1791002000.0),
+            ('9900555', 880001, '555', '示例歌姬', 'virtual_music', 1, 1790999000.0),
+        ]
+        sess_rows = wh.execute(
+            'SELECT session_key, room_id, anchor_uid, room_label, track_category FROM dim_sessions ORDER BY session_key'
+        ).fetchall()
+        assert sess_rows == [
+            ('sess_game_6600111', '6600111', 880002, '示例游戏主播', 'virtual_gaming'),
+            ('sess_short_555', '9900555', 880001, '示例歌姬', 'virtual_music'),
+            ('sess_untyped_7700222', '7700222', 880003, '示例杂谈主播', 'virtual_talk'),
+        ]
+        assert wh.execute("SELECT COUNT(*) FROM fact_events WHERE room_id = '555'").fetchone()[0] == 0
+        assert wh.execute("SELECT COUNT(*) FROM fact_session_presence WHERE room_id = '555'").fetchone()[0] == 0
+
+    # 第三轮：传入 automation.json（单短号键与双键别名、无 anchor_uid）作为 --room-registry，绝不将 9900555 降级回 555
+    auto_single = tmp_path / 'automation_single.json'
+    auto_single.write_text(json.dumps({
+        'rooms': {
+            '555': {
+                'label': '示例歌姬',
+                'content_mode': 'music',
+            },
+        },
+    }, ensure_ascii=False))
+    assert cli_main_helper([
+        'warehouse', 'sync',
+        '--warehouse', str(wh_path),
+        '--source', f'anon={db_path}',
+        '--session-root', str(sessions_dir),
+        '--room-registry', str(auto_single),
+    ]) == 0
+
+    auto_dual = tmp_path / 'automation_dual.json'
+    auto_dual.write_text(json.dumps({
+        'rooms': {
+            '555': {
+                'label': '示例歌姬',
+                'content_mode': 'music',
+                'track_category': 'virtual_music',
+            },
+            '9900555': {
+                'label': '示例歌姬(短号别名555)',
+                'content_mode': 'talk',
+            },
+        },
+    }, ensure_ascii=False))
+    assert cli_main_helper([
+        'warehouse', 'sync',
+        '--warehouse', str(wh_path),
+        '--source', f'anon={db_path}',
+        '--session-root', str(sessions_dir),
+        '--room-registry', str(auto_dual),
+    ]) == 0
+
+    with sqlite3.connect(wh_path) as wh:
+        canon_row = wh.execute(
+            'SELECT room_id, anchor_uid, short_room_id, room_label, track_category '
+            'FROM dim_rooms WHERE anchor_uid = 880001'
+        ).fetchall()
+        assert canon_row == [('9900555', 880001, '555', '示例歌姬', 'virtual_music')]
+        assert wh.execute("SELECT COUNT(*) FROM dim_rooms WHERE room_id = '555'").fetchone()[0] == 0
+        assert wh.execute("SELECT room_id FROM dim_sessions WHERE session_key = 'sess_short_555'").fetchone()[0] == '9900555'
+
+        # 第四轮：验证字典序下长号 '19000555' < 短号 '555' 且缺 anchor_uid 时，并查集仍按 short_room_id 正确归并
+        wh.execute(
+            "INSERT INTO dim_rooms(room_id, anchor_uid, short_room_id, room_label, track_category, allows_ext_medal, first_seen_ts, last_seen_ts) "
+            "VALUES ('19000555', NULL, '556', '字典序歌姬', 'virtual_music', 0, 1791003000, 1791003060)"
+        )
+        wh.execute(
+            "INSERT INTO dim_rooms(room_id, anchor_uid, short_room_id, room_label, track_category, allows_ext_medal, first_seen_ts, last_seen_ts) "
+            "VALUES ('556', NULL, NULL, '字典序歌姬(短号556)', 'virtual_talk', 1, 1791002500, 1791003090)"
+        )
+
+    sync_warehouse(wh_path, sources=[('anon', db_path)], session_roots=[sessions_dir])
+    with sqlite3.connect(wh_path) as wh:
+        merged_lex = wh.execute(
+            "SELECT room_id, short_room_id, room_label, track_category, allows_ext_medal, first_seen_ts, last_seen_ts "
+            "FROM dim_rooms WHERE room_id IN ('19000555', '556')"
+        ).fetchall()
+        assert merged_lex == [('19000555', '556', '字典序歌姬', 'virtual_music', 1, 1791002500.0, 1791003090.0)]
+
+
 def cli_main_helper(argv: list[str]) -> int:
     import sys
     old_argv = sys.argv

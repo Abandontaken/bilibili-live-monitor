@@ -30,7 +30,7 @@
   - 付费与内容载荷：`paid_milli_yuan`（消费者实付千分元；银瓜子恒为 `0`，盲盒取原盒投入价×数量，大航海优先取 `USER_TOAST_MSG_V2` 实付折扣价）、`output_milli_yuan`（开出或展示面值千分元，对齐 `gift-output-v1`）、`coin_type`（`'gold'` / `'silver'`）、`gift_id`、`gift_name`、`blind_orig_name`、`quantity`、`content_text`（弹幕正文或 SC 留言）、`source_ref`（如 `raw:1024:0`）。
 - **`dim_users` 与 `v_unique_face_uid`（全局跨房用户字典）**
   - `dim_users`：`uid`（主键）、`uid_md5`、`uid_crc32`、`latest_uname`、`first_char`、`max_wealth_level`（跨房历史最高荣耀等级）、`first_seen_ts`、`last_seen_ts`。
-  - `dim_rooms`：`room_id`、`anchor_uid`（本房主播 UID）、`allows_ext_medal`（`1`=实测允许展示外房粉丝牌，`0`=服务端已剥离外房牌或未观测到外房牌）。
+  - `dim_rooms`：`room_id`（规范长房号主键）、`anchor_uid`（本房主播 UID）、`short_room_id`（B 站靓号短房号，无短号时为 `NULL`）、`room_label`（主播名称）、`track_category`（赛道分类，如 `'virtual_music'` / `'virtual_gaming'` / `'virtual_talk'`，未分类为 `NULL`）、`allows_ext_medal`（`1`=实测允许展示外房粉丝牌，`0`=服务端已剥离外房牌或未观测到外房牌）。
   - `v_unique_face_uid`：从 `dim_user_faces` 聚合筛出全局仅绑定唯一 1 个 `uid` 的 `face_sha1`。
 - **`fact_transcripts`（终审语音与演唱分段表）**
   - 主键 `(session_key, seq)`；`start_ts`、`end_ts`（UTC 秒）；`activity_label`（`'singing'` / `'speaking'` / `'mixed'` / `'unknown'`）；`music_source`（`'probable_live'` 现场演唱 / `'recording'` 播放录音 / `'uncertain'` / `'none'`）；`song_title`（已核验曲名）；`text`（优先取音乐或杂谈终审精修后的 `corrected_text`）。

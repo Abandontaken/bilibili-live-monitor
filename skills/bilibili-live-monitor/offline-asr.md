@@ -72,7 +72,7 @@ python -m bilibili_live_monitor offline-asr status \
 3. **`run` 显式规模与恢复校验**：
    - **防误触全量护栏**：调用 `run` 时若未提供 `--sample N`、`--max-files N` 或 `--full` 之一，CLI 直接拒绝执行；`--dry-run` 仅做流程演练，不加载模型。
    - **四元组恢复身份**：文件恢复身份定义为 `路径 + 文件大小 + mtime + sha256`。在真正处理每个文件前，必须再次核对磁盘实际文件是否仍与 `inventory.jsonl` 一致；一旦发现文件被修改或替换，立即拒绝处理该项并要求重新 `scan`。
-   - **单持有者互斥（Single-holder Lock）**：同一 `--output` 目录同一时刻仅允许一个 `run` 进程持有运行锁；当 `run` 正在执行时，`scan` 与 `plan` 禁止重写正在运行的队列。
+   - **单持有者互斥与跨场全局并发信号量**：同一 `--output` 目录同一时刻仅允许一个 `run` 进程持有 `run.lock`；同时 `run_files`（含自动逐场收尾 `session_offline` 与命令行 `offline-asr run`）通过全局多槽位 `flock` 信号量限制整机同时启动的本地 ASR 模型子进程数（默认上限 `3`，可通过 `--max-concurrent`、`session_workflow.asr_max_concurrent` 或 `BILI_ASR_MAX_CONCURRENT` 配置），超额场次在槽位外轻量排队等待而不抢占统一内存。当 `run` 正在执行时，`scan` 与 `plan` 禁止重写正在运行的队列。
    - **失败保留与非零退出**：执行中出现的任何文件或切块失败均须落盘保留错误原因，且进程以**非零退出码**结束，严禁将“部分失败（partial failure）”静默视为“全部通过”。
 
 ---

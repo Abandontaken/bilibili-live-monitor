@@ -53,11 +53,21 @@ def values(value):
 
 def normalize_catalog(payload):
     source = payload.get('assets', payload)
-    gifts = values(source.get('gifts', source.get('giftAssets', [])))
+    api = source.get('data', source)
+    gifts = values(source.get('gifts', source.get('giftAssets', api.get('list', []))))
     effects = values(source.get('effects', source.get('effectAssetsList', [])))
     if not isinstance(gifts, list) or not isinstance(effects, list):
         raise ValueError('目录需要gifts/effects列表或网页giftAssets/effectAssetsList快照')
-    return {'gifts': gifts, 'effects': effects}
+    normalized = []
+    for gift in gifts:
+        gift = dict(gift)
+        if 'effectId' not in gift and 'effect_id' in gift:
+            gift['effectId'] = gift['effect_id']
+        if 'countMap' not in gift and 'count_map' in gift:
+            gift['countMap'] = [{**tier, 'effectId': tier.get('effect_id', 0)}
+                                for tier in gift['count_map']]
+        normalized.append(gift)
+    return {'gifts': normalized, 'effects': effects}
 
 
 def select_effect(catalog, gift_id, count):

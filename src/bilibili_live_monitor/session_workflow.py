@@ -34,9 +34,9 @@ def validate_settings(config, rooms):
         raise ValueError('final_concurrency须为1到10的整数')
     if not isinstance(config.get('final_subagent', 'general'), str) or not config.get('final_subagent', 'general').strip():
         raise ValueError('final_subagent须为非空agent名称')
-    if config.get('final_subagent') == 'cursor_cli_grok':
+    if config.get('final_subagent') in ('cursor_cli_grok', 'grok_build_cli'):
         if 'final_model' not in config:
-            raise ValueError('cursor_cli_grok须显式设置final_model，禁止继承实时模型')
+            raise ValueError('CLI终审须显式设置final_model，禁止继承实时模型')
         if config.get('finalize_parallel', True) is not True:
             raise ValueError('Cursor分片须启用finalize_parallel')
     if 'warehouse_database' in config and config['warehouse_database'] is not None:
@@ -49,6 +49,14 @@ def validate_settings(config, rooms):
             raise ValueError('session_workflow.talk_shard_max_windows须为1到500的整数')
     if 'talk_revert_non_high_edits' in config and type(config['talk_revert_non_high_edits']) is not bool:
         raise ValueError('session_workflow.talk_revert_non_high_edits须为布尔值')
+    if 'asr_max_concurrent' in config and config['asr_max_concurrent'] is not None:
+        asr_conc = config['asr_max_concurrent']
+        if type(asr_conc) is not int or not 1 <= asr_conc <= 32:
+            raise ValueError('session_workflow.asr_max_concurrent须为1到32的整数')
+    if 'asr_lock_dir' in config and config['asr_lock_dir'] is not None:
+        lock_dir = config['asr_lock_dir']
+        if not isinstance(lock_dir, str) or not lock_dir.strip() or not Path(lock_dir).is_absolute():
+            raise ValueError('session_workflow.asr_lock_dir须为绝对路径')
     if not config.get('enabled'):
         return
     if type(config.get('finalize_parallel', True)) is not bool:
@@ -109,14 +117,39 @@ class SessionWorkflows:
         path = directory / 'config.json'
         if path.exists() and json.loads(path.read_text()).get('workflow_key') == record['key']:
             current = json.loads(path.read_text())
-            local_only = self.automation.rooms[record['room_id']].get('local_only', self.config.get('local_only', False))
+            dirty = False
+            room_cfg = self.automation.rooms[record['room_id']]
+            local_only = room_cfg.get('local_only', self.config.get('local_only', False))
             if current.get('local_only') != local_only:
                 current['local_only'] = local_only
-                atomic_json(path, current)
-            if (record.get('stage') not in ('completed', 'attention')
-                    and self.automation.rooms[record['room_id']].get('content_mode', 'music') == 'talk'
-                    and current.get('content_mode', 'music') != 'talk'):
-                current.update(content_mode='talk', ai_enabled=False)
+                dirty = True
+            if record.get('stage') not in ('completed', 'attention'):
+                if room_cfg.get('content_mode', 'music') == 'talk' and current.get('content_mode', 'music') != 'talk':
+                    current.update(content_mode='talk', ai_enabled=False)
+                    dirty = True
+                asr_cap = self.config.get('asr_max_concurrent')
+                if asr_cap is not None and current.get('asr_max_concurrent') != asr_cap:
+                    current['asr_max_concurrent'] = asr_cap
+                    dirty = True
+                elif asr_cap is None and 'asr_max_concurrent' in current:
+                    current.pop('asr_max_concurrent', None)
+                    dirty = True
+                asr_ldir = self.config.get('asr_lock_dir')
+                if asr_ldir and current.get('asr_lock_dir') != asr_ldir:
+                    current['asr_lock_dir'] = asr_ldir
+                    dirty = True
+                elif not asr_ldir and 'asr_lock_dir' in current:
+                    current.pop('asr_lock_dir', None)
+                    dirty = True
+                room_track = room_cfg.get('track_category')
+                clean_track = room_track.strip() if isinstance(room_track, str) and room_track.strip() else None
+                if clean_track and current.get('track_category') != clean_track:
+                    current['track_category'] = clean_track
+                    dirty = True
+                elif not clean_track and 'track_category' in current:
+                    current.pop('track_category', None)
+                    dirty = True
+            if dirty:
                 atomic_json(path, current)
             return path
         cfg = self.config
@@ -179,6 +212,13 @@ class SessionWorkflows:
             config['talk_shard_max_windows'] = cfg['talk_shard_max_windows']
         if 'talk_revert_non_high_edits' in cfg:
             config['talk_revert_non_high_edits'] = cfg['talk_revert_non_high_edits']
+        if cfg.get('asr_max_concurrent') is not None:
+            config['asr_max_concurrent'] = cfg['asr_max_concurrent']
+        if cfg.get('asr_lock_dir'):
+            config['asr_lock_dir'] = cfg['asr_lock_dir']
+        room_track = self.automation.rooms[rid].get('track_category')
+        if isinstance(room_track, str) and room_track.strip():
+            config['track_category'] = room_track.strip()
         audience = cfg.get('audience_crm', {}).get(rid)
         if audience:
             if not isinstance(audience, str) or not Path(audience).is_absolute():

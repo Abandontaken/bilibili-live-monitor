@@ -8,10 +8,14 @@ import hashlib
 import json
 import math
 import os
+import random
 import signal
 import sqlite3
 import subprocess
 import sys
+import tempfile
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,6 +25,7 @@ from .asr import ASR
 
 MEDIA_SUFFIXES = {'.mka', '.mkv', '.wav', '.opus', '.flac', '.mp3', '.ogg'}
 DEFAULT_MODEL = 'Qwen/Qwen3-ASR-1.7B'
+DEFAULT_MAX_CONCURRENT = 3
 QUIET_RMS_DBFS = -45.0
 SAMPLE_RATE = 16000
 
@@ -41,12 +46,38 @@ def configure_parser(subparsers):
     parser.add_argument('--probe-jobs', type=int, default=4)
     parser.add_argument('--start-timeout', type=float, default=180)
     parser.add_argument('--infer-timeout', type=float, default=180)
+    parser.add_argument('--max-concurrent', type=int, default=None,
+                        help='跨场次全局离线 ASR 最大并发进程数（默认读取 BILI_ASR_MAX_CONCURRENT 或 3）')
+    parser.add_argument('--global-lock-dir', help='跨场次全局并发信号量锁目录（默认系统临时目录下按 UID 隔离）')
+    parser.add_argument('--slot-timeout', type=float, default=None, help='等待全局并发槽位的最长秒数（默认不限）')
     return parser
+
+
+def _validate_common_args(args) -> str | None:
+    if _bad_model(args.model):
+        return '拒绝非本地模型 id'
+    if (not math.isfinite(args.chunk_seconds) or args.chunk_seconds <= 0 or args.probe_jobs < 1
+            or args.sample is not None and args.sample < 1):
+        return 'chunk-seconds 与 probe-jobs 必须为正'
+    try:
+        _resolve_max_concurrent(args)
+    except ValueError as error:
+        return str(error)
+    if getattr(args, 'slot_timeout', None) is not None and (
+        not math.isfinite(args.slot_timeout) or args.slot_timeout <= 0
+    ):
+        return 'slot-timeout 必须为正'
+    return None
 
 
 def main(args):
     if args.action == 'status' or not args.output or not args.input:
         return _main(args)
+    err = _validate_common_args(args)
+    if err is not None:
+        return _fail(err)
+    if not Path(args.input).resolve().is_dir():
+        return _fail('input 不是目录')
     out = Path(args.output).resolve()
     out.mkdir(parents=True, exist_ok=True)
     meta = out/'inventory_meta.json'
@@ -77,11 +108,9 @@ def _main(args):
         return cmd_status(Path(args.output))
     if not args.input or not args.output:
         return _fail('scan/plan/run 需要 --input 与 --output')
-    if _bad_model(args.model):
-        return _fail('拒绝非本地模型 id')
-    if (not math.isfinite(args.chunk_seconds) or args.chunk_seconds <= 0 or args.probe_jobs < 1
-            or args.sample is not None and args.sample < 1):
-        return _fail('chunk-seconds 与 probe-jobs 必须为正')
+    err = _validate_common_args(args)
+    if err is not None:
+        return _fail(err)
     root = Path(args.input).resolve()
     out = Path(args.output).resolve()
     if not root.is_dir():
@@ -227,40 +256,55 @@ def run_files(out, selected, python, worker, args):
     if not selected:
         _write_status(out, _db(out))
         return 0
-    session = None
-    failures = 0
+    install_sigterm = (
+        threading.current_thread() is threading.main_thread()
+        and signal.getsignal(signal.SIGTERM) == signal.SIG_DFL
+    )
+    previous_handler = signal.getsignal(signal.SIGTERM) if install_sigterm else None
+    if install_sigterm:
+        signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(SystemExit(143)))
     try:
-        session = Worker(python, worker, args.model, out / 'logs' / 'asr_worker.stderr', args.start_timeout, args.infer_timeout)
-        session.start()
-        db = _db(out)
-        for row in selected:
-            db.execute(
-                "UPDATE jobs SET status='running', started_utc=? WHERE path=?",
-                (_now(), row['path']),
-            )
-            db.commit()
+        with _global_asr_slot(out, args):
+            session = None
+            failures = 0
             try:
-                payload = transcribe_file(session, out, row, args.chunk_seconds)
-                dest = _transcript_path(out, row)
-                _atomic_json(dest, payload)
-                db.execute(
-                    """UPDATE jobs SET status='done', error=NULL, audio_sec=?, infer_sec=?, transcript_path=?, finished_utc=?
-                       WHERE path=?""",
-                    (payload['decoded_sec'], payload['infer_sec'], str(dest), _now(), row['path']),
+                session = Worker(
+                    python, worker, args.model, out / 'logs' / 'asr_worker.stderr',
+                    args.start_timeout, args.infer_timeout,
                 )
-            except Exception as exc:
-                failures += 1
-                db.execute(
-                    "UPDATE jobs SET status='failed', error=?, finished_utc=? WHERE path=?",
-                    (f'{type(exc).__name__}: {exc}', _now(), row['path']),
-                )
-            db.commit()
-            _write_status(out, db)
-        _write_status(out, db)
-        return 1 if failures else 0
+                session.start()
+                db = _db(out)
+                for row in selected:
+                    db.execute(
+                        "UPDATE jobs SET status='running', started_utc=? WHERE path=?",
+                        (_now(), row['path']),
+                    )
+                    db.commit()
+                    try:
+                        payload = transcribe_file(session, out, row, args.chunk_seconds)
+                        dest = _transcript_path(out, row)
+                        _atomic_json(dest, payload)
+                        db.execute(
+                            """UPDATE jobs SET status='done', error=NULL, audio_sec=?, infer_sec=?, transcript_path=?, finished_utc=?
+                               WHERE path=?""",
+                            (payload['decoded_sec'], payload['infer_sec'], str(dest), _now(), row['path']),
+                        )
+                    except Exception as exc:
+                        failures += 1
+                        db.execute(
+                            "UPDATE jobs SET status='failed', error=?, finished_utc=? WHERE path=?",
+                            (f'{type(exc).__name__}: {exc}', _now(), row['path']),
+                        )
+                    db.commit()
+                    _write_status(out, db)
+                _write_status(out, db)
+                return 1 if failures else 0
+            finally:
+                if session:
+                    session.close()
     finally:
-        if session:
-            session.close()
+        if install_sigterm and previous_handler is not None:
+            signal.signal(signal.SIGTERM, previous_handler)
 
 
 def transcribe_file(session, out, row, chunk_seconds):
@@ -565,6 +609,147 @@ def _release_lock(handle):
         handle.close()  # 不unlink持锁文件，避免等待者持有旧inode后出现双持有者。
 
 
+def _resolve_max_concurrent(args=None) -> int:
+    raw = getattr(args, 'max_concurrent', None)
+    if raw is None:
+        env_val = os.getenv('BILI_ASR_MAX_CONCURRENT')
+        if env_val is not None and env_val.strip():
+            try:
+                raw = int(env_val.strip())
+            except ValueError as exc:
+                raise ValueError('BILI_ASR_MAX_CONCURRENT 必须为正整数') from exc
+        else:
+            raw = DEFAULT_MAX_CONCURRENT
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 1 or raw > 32:
+        raise ValueError('max-concurrent 必须为 1 到 32 的整数')
+    return raw
+
+
+def _resolve_global_lock_dir(args=None) -> Path:
+    raw = getattr(args, 'global_lock_dir', None) or os.getenv('BILI_ASR_LOCK_DIR')
+    if raw and str(raw).strip():
+        return Path(str(raw).strip()).resolve()
+    return Path(tempfile.gettempdir()).resolve() / f'bilibili-live-monitor-asr-locks-{os.getuid()}'
+
+
+@contextlib.contextmanager
+def _global_asr_slot(out: Path, args=None):
+    """跨场次全局离线 ASR 并发信号量锁：防止下播高峰同时拉起过多本地 ASR 模型抢占统一内存。"""
+    max_concurrent = _resolve_max_concurrent(args)
+    lock_dir = _resolve_global_lock_dir(args)
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        lock_dir.chmod(0o700)
+
+    state_file = Path(out) / 'state' / 'global_slot.json'
+    wait_started = time.monotonic()
+    wait_started_utc = _now()
+    slot_timeout = getattr(args, 'slot_timeout', None)
+    slot_deadline = getattr(args, 'slot_deadline', None)
+    respect_pause = bool(getattr(args, 'respect_session_pause', False))
+    budget_on_timeout = bool(getattr(args, 'budget_on_slot_timeout', False))
+
+    mono_deadline: float | None = None
+    if slot_timeout is not None:
+        mono_deadline = wait_started + float(slot_timeout)
+
+    wrote_waiting = False
+    acquired_slot: int | None = None
+    acquired_handle = None
+
+    while True:
+        for slot_idx in range(max_concurrent):
+            slot_path = lock_dir / f'slot-{slot_idx:02d}.lock'
+            handle = slot_path.open('a+')
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                handle.close()
+                continue
+            except BaseException:
+                handle.close()
+                raise
+            try:
+                handle.seek(0)
+                handle.truncate()
+                handle.write(json.dumps({
+                    'pid': os.getpid(),
+                    'slot': slot_idx,
+                    'output': str(Path(out).resolve()),
+                    'acquired_utc': _now(),
+                }, ensure_ascii=False))
+                handle.flush()
+            except BaseException:
+                handle.close()
+                raise
+            acquired_slot = slot_idx
+            acquired_handle = handle
+            break
+
+        if acquired_handle is not None:
+            break
+
+        if respect_pause:
+            from .deployment import MaintenancePaused, paused
+            if paused('sessions'):
+                raise MaintenancePaused('deployment_maintenance_paused:sessions')
+
+        now_wall = time.time()
+        now_mono = time.monotonic()
+        if slot_deadline is not None and now_wall >= float(slot_deadline):
+            if budget_on_timeout:
+                from .session_budget import BudgetPaused
+                raise BudgetPaused('离线收尾自动推进预算已用尽，保留现场等待人工处理')
+            raise TimeoutError('等待全局离线 ASR 并发槽位已超过截止时间')
+        if mono_deadline is not None and now_mono >= mono_deadline:
+            raise TimeoutError('等待全局离线 ASR 并发槽位超时')
+
+        if not wrote_waiting:
+            wrote_waiting = True
+            with contextlib.suppress(OSError):
+                _atomic_json(state_file, {
+                    'status': 'waiting',
+                    'pid': os.getpid(),
+                    'max_concurrent': max_concurrent,
+                    'lock_dir': str(lock_dir),
+                    'waiting_since_utc': wait_started_utc,
+                    'updated_utc': _now(),
+                })
+
+        sleep_sec = 0.15 + random.uniform(0.0, 0.15)
+        if mono_deadline is not None:
+            sleep_sec = min(sleep_sec, max(0.01, mono_deadline - now_mono))
+        if slot_deadline is not None:
+            sleep_sec = min(sleep_sec, max(0.01, float(slot_deadline) - now_wall))
+        time.sleep(sleep_sec)
+
+    waited_sec = round(time.monotonic() - wait_started, 3)
+    with contextlib.suppress(OSError):
+        _atomic_json(state_file, {
+            'status': 'acquired',
+            'pid': os.getpid(),
+            'slot': acquired_slot,
+            'max_concurrent': max_concurrent,
+            'lock_dir': str(lock_dir),
+            'waited_sec': waited_sec,
+            'updated_utc': _now(),
+        })
+    try:
+        yield acquired_slot
+    finally:
+        _release_lock(acquired_handle)
+        with contextlib.suppress(OSError):
+            _atomic_json(state_file, {
+                'status': 'released',
+                'pid': os.getpid(),
+                'slot': acquired_slot,
+                'max_concurrent': max_concurrent,
+                'lock_dir': str(lock_dir),
+                'waited_sec': waited_sec,
+                'updated_utc': _now(),
+            })
+
+
 def _transcript_path(out, row):
     digest = hashlib.sha256((row['path']+':'+row['sha256']).encode()).hexdigest()
     return out / 'transcripts' / digest[:2] / f'{digest}.json'
@@ -622,7 +807,10 @@ def _cli(argv=None):
     commands = parser.add_subparsers(dest='command', required=True)
     configure_parser(commands)
     args = parser.parse_args(argv)
-    return main(args)
+    try:
+        return main(args)
+    except TimeoutError as error:
+        return _fail(str(error))
 
 
 if __name__ == '__main__':

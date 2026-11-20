@@ -6,10 +6,16 @@
 bili-live pk-bar plan --database /PRIVATE/monitor.sqlite3 --room 123456 \
   --pk-id 789 --video /PRIVATE/base.mp4 --video-start 2030-01-01T12:00:00+08:00 \
   --font /PRIVATE/font.ttf --connection-start 0 --connection-end 600 \
+  --style-assets /PRIVATE/verified-style \
+  --score-font /PRIVATE/score-bold-italic.ttf --timer-font /PRIVATE/timer-regular.ttf \
   --output /PRIVATE/pk-plan.json
 bili-live pk-bar render --plan /PRIVATE/pk-plan.json --output /PRIVATE/new-render
 bili-live pk-bar verify --output /PRIVATE/new-render
 ```
+
+用户要求沿用已认可的 PK 动画版本时，先查历史会话和那版 `plan.json`，复用其中 `style_assets`、`font`、`score_font`、`timer_font` 并核对对应 SHA256。**省略 `--style-assets` 会走基础渐变条，不包含原网页流动箭头、交界光效和胜负表情；基础条不能作为动画版的等价替代。** 沿用既有 CLI 参数即可，不需要新建渲染框架或修改默认基础模式。
+
+每个连续片段从未烧录旧 PK 条的输入重新渲染，按该片段第零秒的墙钟生成计划，再拼接；不要把新样式盖在旧比分条上。验收至少查看相隔数帧的顶部画面，确认箭头相位、光效、比分字形和倒计时底图；适用时再查冲刺和结果阶段。最终总片末端固定30fps。只修视觉时，优先复用前一版总片已验证的原音轨，逐包哈希校验一致；音频不应随更换 PK 样式而漂移。
 
 - `video-start` 是视频第零秒对应的带时区墙钟，须由调用者核对。`connection-start/end` 是人工确认的视频相对秒数，仅用于非比赛期间的“连线中”；不能把 PK 结束当成断开连线。
 - 消息按本地接收时间更新；倒计时用服务器绝对截止时间。阶段包括准备、对战、最后冲刺、等待结算、结果、惩罚、结束后连线。原始消息缺失时不猜比分。

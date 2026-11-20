@@ -91,8 +91,17 @@ def run(config, *, cutoff=None, dry_run=False):
         atomic_json(path, manifest)
         for row in rows:
             offline_asr._verify_identity(row)
-        args = SimpleNamespace(full=True, sample=None, max_files=None, model=config['asr_model'],
-                               chunk_seconds=30.1, start_timeout=180, infer_timeout=180)
+        args = SimpleNamespace(
+            full=True,
+            sample=None,
+            max_files=None,
+            model=config['asr_model'],
+            chunk_seconds=30.1,
+            start_timeout=180,
+            infer_timeout=180,
+            max_concurrent=config.get('asr_max_concurrent'),
+            global_lock_dir=config.get('asr_lock_dir'),
+        )
         offline_asr._sync(out, rows, offline_asr.build_plan(rows, None))
         pending = offline_asr.pending_rows(out, rows, args)
         result = offline_asr.run_files(out, pending, config['asr_python'],

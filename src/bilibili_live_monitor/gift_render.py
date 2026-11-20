@@ -299,8 +299,8 @@ def render(plan, output):
             rx, ry, rw, rh = info['rgbFrame']
             ax, ay, aw, ah = info['aFrame']
             unpack = (f'[{i+1}:v]split=2[r{i}0][a{i}0];'
-                      f'[r{i}0]crop={rw}:{rh}:{rx}:{ry},format=rgb24[r{i}];'
-                      f'[a{i}0]crop={aw}:{ah}:{ax}:{ay},scale={rw}:{rh}:flags=bilinear,format=gray[a{i}];'
+                      f'[r{i}0]format=rgb24,crop={rw}:{rh}:{rx}:{ry}[r{i}];'
+                      f'[a{i}0]format=rgb24,crop={aw}:{ah}:{ax}:{ay},scale={rw}:{rh}:flags=bilinear,format=gray[a{i}];'
                       f'[r{i}][a{i}]alphamerge,')
         overlay = candidate['overlay']
         x, y, w, h = overlay['region']

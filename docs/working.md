@@ -1,5 +1,30 @@
 # 工作记录
 
+## Grok Build CLI 终审分片（2026-11-19）
+
+- 新增可选 `grok_build_cli` 后端，复用现有分片托管、候选审核与验收。逐场路由从单场配置读取，观众终审路由在计划标记中冻结。
+- 以 `grok-4.7` 请求，终态用量必须报告 `grok-4.7-build`；缺失候选、终态不符或非零退出均不验收。Cursor 继续读取原回执格式。
+
+## PK 动画版复用流程纠正（2026-11-19）
+
+- 修正礼物重渲染工作流遗漏样式参数而退回基础 PK 条的问题。PK skill 示例明确列出原网页动画素材、比分粗斜体和倒计时正体参数；沿用已验收版本前核对历史计划及素材/字体指纹。
+- CLI 帮助明确未传 `--style-assets` 只有基础渐变条，不改变基础模式和现有渲染实现；不新增框架。
+- 验收要求检查多时刻箭头/光效/字体，从无旧 PK 条的底片重渲染；只改画面时复用已验证总音轨并核对音频包哈希。
+
+## 数仓短长房号按主播 UID 归并、外部赛道台账接入与离线 ASR 全局并发信号量（2026-11-19）
+
+- **数仓短/长房号按 `anchor_uid` 归并**：`warehouse.py` 为 `dim_rooms` 增加 `short_room_id` 平滑迁移列，并在源库增量扫描（`_IdentityBatch.flush`）、已完成场次入库（`_ingest_completed_session`）与入库后对账（`_reconcile_rooms_and_metadata`）三处统一按 `anchor_uid`、`platform_room_id` 及 `short_room_id` 正反向并查集归并靓号短房号与平台规范长房号，自动将历史分裂记录在单事务内合并至规范长房号并同步更新 `dim_sessions`、`fact_events`、`fact_room_metrics`、`fact_cohost_intervals` 与 `fact_session_presence`。
+- **移除 `track_category` 的 `virtual_talk` 硬编码并支持 `--room-registry`**：修复 `content_mode != 'music'` 被一律硬编码为 `'virtual_talk'` 的失真问题；`bili-live warehouse sync` 新增可重复 `--room-registry <json>` 参数（只读兼容独立房间台账、扩房规划 `selected_candidates` 及 `automation.json` 单短号键/双键结构），支持在不重跑全量转写的前提下回填准确的 `track_category` 与主播名称，同时在 `room_config.py` 与 `session_workflow.py` 支持逐房 `track_category` 热加载同步至在途场次。
+- **离线 ASR 跨场次全局多槽位 `flock` 并发信号量**：`offline_asr.run_files` 新增 `_global_asr_slot` 全局文件锁信号量（默认上限 `3` 路，支持 CLI `--max-concurrent`、`session_workflow.asr_max_concurrent` 热加载与环境变量 `BILI_ASR_MAX_CONCURRENT` 配置），覆盖 `session_offline`、`session_backfill` 与 `offline-asr run` 全部入口，防止下播高峰同时拉起过多本地 `Qwen3-ASR-1.7B` 抢占统一内存；支持 `SIGTERM` 先回收 `asr_worker` 再释放槽位锁、等待期感知 `sessions` 维护暂停与场次 `finish_deadline` 预算，并在 `state/global_slot.json` 留存槽位状态。
+- **验证**：Python 全套测试 `1471 passed`，前端 `8 node + 71 vitest` 通过，`ruff check src tests scripts` 通过。
+
+## 礼物目录兼容与奇数尺寸裁切（2026-11-19）
+
+- 素材 CLI 接受 giftConfig `data.list` 蛇形字段及显式配套的 effects 快照；数量档位仍精确匹配，零值回退默认动画。缺资源或重复礼物版本不猜测。
+- RGB 和 alpha 区域先转 RGB 再裁切，避免 YUV 色度采样将奇数尺寸向下取整。
+- skill 补充主播端已烧录效果、逐场景 PK 墙钟、显式缺帧定格及盲盒独立结果动画的覆盖边界。原片窗口编排仍由操作者核对，不声称已新增自动视觉识别。
+- 定向验证：gift render 与 API catalog 共 18 项通过，相关 Ruff 通过；包括实际 ffmpeg 奇数尺寸合成回归。
+
 ## 直连音频模式低码率流画质协商与动态采集参数热加载（2026-11-18）
 
 - **直连模式按录制模式分离请求画质档位**：`config.py` 新增 `DIRECT_AUDIO_QN`（默认 `80`）与 `DIRECT_VIDEO_QN`（默认 `10000`），`Monitor.capture_direct` 在 `record_mode == 'audio'` 时默认请求最低码率档位以降低多路并发下行带宽，在 `record_mode == 'video'` 时保持原画请求。

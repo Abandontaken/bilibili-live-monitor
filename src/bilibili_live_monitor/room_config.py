@@ -18,6 +18,9 @@ def validate_rooms(rooms):
             raise ValueError('welcome_enabled必须是布尔值')
         if room.get('content_mode', 'music') not in ('music', 'talk'):
             raise ValueError('content_mode必须是music或talk')
+        if 'track_category' in room and room['track_category'] is not None:
+            if not isinstance(room['track_category'], str) or not room['track_category'].strip():
+                raise ValueError('track_category必须是非空字符串')
         if 'record_mode' in room and room['record_mode'] not in ('none', 'audio', 'video'):
             raise ValueError('record_mode必须是none、audio或video')
         if 'local_only' in room and type(room['local_only']) is not bool:
@@ -61,13 +64,16 @@ def reload_plan(previous, incoming):
         if not isinstance(workflow, dict):
             raise ValueError('session_workflow必须是对象')
         for key in ('publish', 'model', 'final_model', 'final_subagent', 'final_concurrency',
-                    'warehouse_database', 'talk_shard_max_windows', 'talk_revert_non_high_edits'):
+                    'warehouse_database', 'talk_shard_max_windows', 'talk_revert_non_high_edits',
+                    'asr_max_concurrent', 'asr_lock_dir'):
             workflow.pop(key, None)
         return result
     if fixed(previous) != fixed(incoming):
         raise ValueError('热加载只支持rooms、可动态采集参数（direct_audio_qn/direct_video_qn/'
                          'direct_handshake_interval/audio_bitrate/recording_segment_seconds/max_rooms）'
-                         '及未来场次的publish/model/final_model/final_subagent/final_concurrency；其他设置需要重启')
+                         '及session_workflow的可热加载字段（publish/model/final_model/final_subagent/'
+                         'final_concurrency/warehouse_database/talk_shard_max_windows/'
+                         'talk_revert_non_high_edits/asr_max_concurrent/asr_lock_dir）；其他设置需要重启')
     from .session_workflow import validate_settings
     workflow = incoming.get('session_workflow', {})
     publish = workflow.get('publish', {})
