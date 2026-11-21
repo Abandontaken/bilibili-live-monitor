@@ -51,6 +51,8 @@ PK录屏花屏、视频剪辑读取及压缩前的参数检查见[PK编码参数
 
 编写 SQL 或 Python 脚本查询 `live_warehouse.sqlite3` 与 `monitor.sqlite3`、解读弹幕/盲盒/荣耀等级/粉丝牌/在线人数/PK 连麦字段时，先读[数据库解析与口径防坑指南](data-interpretation.md)，避免外房勋章剥离、短长房号不一致、盲盒双账本与成对广播重复记账等口径误判。
 
+需要基于数仓录音转写、弹幕与礼物流水对单个主播做数据化诊断，定位留存/变现瓶颈并给出可复测改进方案与止损清单时，见[B 站直播间诊断与改进](streamer-diagnosis.md)：严格只读查询数仓、按同规模档位基线对照、每条结论绑定量化证据与语音弹幕切片。
+
 需要基于数仓大中小 R 观众做分层滚雪球扩房、免登录核验候选主播近 14 天活跃度与舰长规模档位，并生成跨赛道均衡抽样方案时，见[扩房发现与分层采样](room-discovery.md)：使用 `bili-live room-discovery pull-followings/screen-candidates/sample-plan`，对数仓严格只读，带登录态拉取默认 `--dry-run`。
 
 需要在不迁移匿名直连采集的前提下，复用本机已登录小号 Chrome 在目标房间确认开播时短驻静音发送一条授权打卡弹幕并立即关页退出时，见[开播短驻静音打卡助手](live-checkin.md)：使用 `bili-live checkin --config ... --dry-run` 预检并挂载逐房 `notification_command` 热加载接入。
