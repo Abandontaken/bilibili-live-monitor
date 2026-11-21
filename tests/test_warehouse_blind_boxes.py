@@ -60,6 +60,16 @@ def test_native_identity_is_preserved_and_blocks_contaminated_window():
     assert gifts[1]['raw_uid'] == 42
 
 
+def test_competing_score_before_competitor_drops_off_board_blocks_attribution():
+    tail = _rank(5, 22, 590)
+    tail[3]['data']['online_list'].pop()
+    gifts = _extract([
+        _rank(1, 1, 100), _gift(2, 10, 9000), _rank(3, 15, 100, other=120),
+        _gift(4, 20, 40000), tail,
+    ])
+    assert all(g['inferred_uid'] is None for g in gifts)
+
+
 def test_duplicate_transaction_does_not_create_an_inferred_gift():
     gifts = _extract([
         _rank(1, 1, 100), _gift(2, 10, 40000, tid='repeat'),

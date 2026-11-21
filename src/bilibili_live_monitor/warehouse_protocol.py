@@ -973,8 +973,9 @@ def _apply_blind_box_rank_windows(
                         continue
                     if any(
                         other != uid and value > old.get(other, 0)
-                        and names.get(other, '').casefold().startswith(mask)
-                        for other, value in scores.items()
+                        and (frame_names.get(other, '') or old_names.get(other, '')).casefold().startswith(mask)
+                        for _, frame_scores, frame_names in ranks[lo + 1:bisect_right(rank_times, after)]
+                        for other, value in frame_scores.items()
                     ):
                         continue
                     possible.add(uid)
