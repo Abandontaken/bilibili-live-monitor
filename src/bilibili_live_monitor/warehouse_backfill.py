@@ -51,18 +51,22 @@ def _load_identity_dictionary(warehouse_path: Path) -> tuple[dict[int, str | Non
     return users_by_uid, uid_by_md5, uid_by_unique_face
 
 
-def _load_blind_box_assignments(warehouse_path: Path, config: dict[str, Any]) -> dict[tuple[str, int], int]:
+def _load_blind_box_assignments(
+    warehouse_path: Path, config: dict[str, Any], cutoff: float,
+) -> dict[tuple[str, int], int] | None:
     """看板只复用数仓已归属结果；通过原始包 ID 还原看板使用的交易键。"""
     db_path = Path(config['database']).resolve()
     with open_readonly_sqlite(warehouse_path) as wh:
         rows = wh.execute('''
-            SELECT source_ref, resolved_uid FROM v_resolved_events JOIN dim_sessions USING(session_key)
+            SELECT source_ref, resolved_uid, start_ts, cutoff_ts FROM v_resolved_events JOIN dim_sessions USING(session_key)
              WHERE session_key=? AND source_db_path=? AND resolution_basis='blind_box_rank_window'
         ''', (_compute_session_key(config), str(db_path))).fetchall()
     if not rows:
         return {}
     refs = {}
-    for ref, uid in rows:
+    for ref, uid, start_ts, cutoff_ts in rows:
+        if (start_ts, cutoff_ts) != (epoch(config['start_utc']), cutoff):
+            return None
         tag, raw_id, index = ref.split(':')
         if tag != 'raw':
             raise ValueError('盲盒归因来源必须为原始礼物包')
@@ -289,10 +293,13 @@ def _process_single_session(
 
     _, cutoff, source = source_at_cutoff(config)
     existing_snapshot = json.loads(snap_path.read_text())
+    blind_box_assignments = _load_blind_box_assignments(warehouse_path, config, cutoff)
+    if blind_box_assignments is None:
+        return {'status': 'skipped_warehouse_window_mismatch', 'session': session_dir.name}
 
     resolved_source, counters = overlay_session_gift_identities(
         source, users_by_uid, uid_by_md5, uid_by_unique_face,
-        _load_blind_box_assignments(warehouse_path, config),
+        blind_box_assignments,
     )
     new_gift_summary, new_activity_summary = _recompute_summaries(existing_snapshot, resolved_source, cutoff)
 
@@ -338,9 +345,12 @@ def _process_single_session(
 
         locked_config = load_config(cfg_path)
         _, locked_cutoff, locked_source = source_at_cutoff(locked_config)
+        locked_assignments = _load_blind_box_assignments(warehouse_path, locked_config, locked_cutoff)
+        if locked_assignments is None:
+            return {'status': 'skipped_warehouse_window_mismatch', 'session': session_dir.name}
         locked_resolved, locked_counters = overlay_session_gift_identities(
             locked_source, users_by_uid, uid_by_md5, uid_by_unique_face,
-            _load_blind_box_assignments(warehouse_path, locked_config),
+            locked_assignments,
         )
         locked_gift_summary, locked_activity_summary = _recompute_summaries(
             locked_snapshot, locked_resolved, locked_cutoff

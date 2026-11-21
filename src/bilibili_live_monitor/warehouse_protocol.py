@@ -704,7 +704,7 @@ def extract_raw_gift_clues(
                     'coin_type': coin_type,
                     'paid_milli_yuan': paid,
                     'output_milli_yuan': out_val if out_val is not None else 0,
-                    'tid': str(item.tid) if item.tid else None,
+                    'tid': str(item.tid) if item.tid not in ('', '0') else None,
                     'batch_index': idx if len(msg.items) > 1 else 0,
                     'inferred_uid': None,
                     'inference_method': None,
@@ -928,6 +928,12 @@ def _apply_blind_box_rank_windows(
             before, old, old_names = ranks[lo]
             group_ids = set(group)
             points = sum(g['output_milli_yuan'] for rid in group for g in packets[rid]) // 100
+            arrivals = sorted((max(receipts[rid], g['event_ts']), g['output_milli_yuan'] // 100)
+                              for rid in group for g in packets[rid])
+            arrival_times = [t for t, _ in arrivals]
+            budgets = [0]
+            for _, value in arrivals:
+                budgets.append(budgets[-1] + value)
             latest_event = max(g['event_ts'] for rid in group for g in packets[rid])
             after_lo = bisect_right(rank_times, max(last, latest_event))
             after_hi = bisect_right(rank_times, last + 35)
@@ -955,6 +961,11 @@ def _apply_blind_box_rank_windows(
                         continue
                     samples = [frame[1][uid] for frame in ranks[lo:bisect_right(rank_times, after)] if uid in frame[1]]
                     if any(y < x for x, y in zip(samples, samples[1:])):
+                        continue
+                    # 同毫秒广播可能先到榜单。只给极短收包乱序余量，尾帧仍须在最后一条礼物之后。
+                    if any(frame_scores[uid] - old[uid] > budgets[bisect_right(arrival_times, t + 0.1)]
+                           for t, frame_scores, _ in ranks[lo:bisect_right(rank_times, after)]
+                           if uid in frame_scores):
                         continue
                     if not names.get(uid, '').casefold().startswith(mask) or not old_names.get(
                         uid, ''

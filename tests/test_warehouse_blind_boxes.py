@@ -69,7 +69,7 @@ def test_duplicate_transaction_does_not_create_an_inferred_gift():
     assert gifts[0]['inferred_uid'] is None
 
 
-@pytest.mark.parametrize('case', ['preexisting_jump', 'reset', 'bad_packet', 'unknown_face', 'missing_box_name'])
+@pytest.mark.parametrize('case', ['preexisting_jump', 'reset', 'bad_packet', 'unknown_face', 'missing_box_name', 'early_total'])
 def test_unclean_window_is_not_assigned(case):
     gift = _gift(4, 20, 40000)
     rows = [_rank(1, 1, 100)]
@@ -85,6 +85,9 @@ def test_unclean_window_is_not_assigned(case):
         other[3]['data']['uname'] = '花***'
         del other[3]['data']['price']
         rows.append(other)
+    elif case == 'early_total':
+        rows.extend([_gift(2, 10, 9000), _rank(3, 15, 590)])
+        after = 590
     else:
         del gift[3]['data']['blind_gift']['original_gift_name']
         after = 250
@@ -99,12 +102,14 @@ def test_page_overlay_loads_same_assignment_from_warehouse(tmp_path):
         db.execute('CREATE TABLE raw_events(id, room_id, received_utc, command, data)')
         db.execute('INSERT INTO raw_events VALUES (2, ?, ?, ?, ?)', ('1', at, cmd, json.dumps(packet)))
     with sqlite3.connect(warehouse) as db:
-        db.execute('CREATE TABLE dim_sessions(session_key, source_db_path)')
+        db.execute('CREATE TABLE dim_sessions(session_key, source_db_path, start_ts, cutoff_ts)')
         db.execute('CREATE TABLE v_resolved_events(session_key, source_ref, resolved_uid, resolution_basis)')
-        db.execute('INSERT INTO dim_sessions VALUES (?, ?)', ('s1', str(source_db.resolve())))
+        db.execute('INSERT INTO dim_sessions VALUES (?, ?, ?, ?)', ('s1', str(source_db.resolve()), START, START + 60))
         db.execute("INSERT INTO v_resolved_events VALUES ('s1', 'raw:2:0', 42, 'blind_box_rank_window')")
-    config = {'workflow_key': 's1', 'database': str(source_db), 'room_id': '1'}
-    identities = _load_blind_box_assignments(warehouse, config)
+    config = {'workflow_key': 's1', 'database': str(source_db), 'room_id': '1',
+              'start_utc': datetime.fromtimestamp(START, timezone.utc).isoformat()}
+    assert _load_blind_box_assignments(warehouse, config, START + 25) is None
+    identities = _load_blind_box_assignments(warehouse, config, START + 60)
     assert identities == {('test-2', 0): 42}
     item = {'author': '灰***', 'gift': {'event_id': 'test-2', 'event_type': 'SEND_GIFT'}}
     source = {'raw': [(at, cmd, packet)], 'items': [('gift', at, item)]}
