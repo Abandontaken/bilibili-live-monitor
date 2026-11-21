@@ -6,6 +6,8 @@ import hashlib
 import json
 import re
 import zlib
+from bisect import bisect_left, bisect_right
+from collections import defaultdict
 from typing import Any
 
 from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
@@ -546,13 +548,18 @@ def _parse_entry_time(ts_sec: int | None, ts_ms: int | None, received_ts: float)
     return received_ts, 'received'
 
 
-def extract_raw_gift_clues(raw_rows: list[tuple[Any, ...]]) -> dict[str, Any]:
+def extract_raw_gift_clues(
+    raw_rows: list[tuple[Any, ...]], *, session_bounds: tuple[float, float] | None = None,
+) -> dict[str, Any]:
     """从单场 raw_events 构建礼物线索索引，供数仓事件入库与本地网页回填共用。"""
     combo_map: dict[str, dict[str, Any]] = {}
     by_tid_batch: dict[tuple[str, int], dict[str, Any]] = {}
     by_fallback: list[dict[str, Any]] = []
     rank_frames: list[tuple[float, dict[int, int]]] = []
-    all_gold_gift_times: list[tuple[float, int]] = []
+    named_ranks: list[tuple[float, dict[int, int], dict[int, str]]] = []
+    all_gold_gift_times: list[tuple[int, float, int]] = []
+    receipts: dict[int, float] = {}
+    other_paid_receipts: list[float] = []
 
     for row in raw_rows:
         if len(row) == 4:
@@ -598,12 +605,17 @@ def extract_raw_gift_clues(raw_rows: list[tuple[Any, ...]]) -> dict[str, Any]:
         cmd = str(command or packet.get('cmd') or '')
         data = packet.get('data')
         rec_ts = epoch(received_utc)
+        if raw_id is not None and cmd in ('SEND_GIFT_V2', 'SEND_GIFT'):
+            receipts[raw_id] = rec_ts
 
         if cmd == 'ONLINE_RANK_V3' and isinstance(data, dict):
             try:
-                _, scores = parse_online_rank_v3(data)
+                identities, scores = parse_online_rank_v3(data)
                 if scores:
                     rank_frames.append((rec_ts, scores))
+                    if session_bounds and session_bounds[0] <= rec_ts <= session_bounds[1]:
+                        names = {uid: name for uid, name, _, _ in identities if name and not is_masked_name(name)}
+                        named_ranks.append((rec_ts, scores, names))
             except Exception:
                 continue
 
@@ -762,7 +774,10 @@ def extract_raw_gift_clues(raw_rows: list[tuple[Any, ...]]) -> dict[str, Any]:
                 by_tid_batch.setdefault((tid, 0), clue)
             by_fallback.append(clue)
 
-        elif cmd in ('GUARD_BUY', 'SUPER_CHAT_MESSAGE') and isinstance(data, dict):
+        elif cmd in ('GUARD_BUY', 'SUPER_CHAT_MESSAGE', 'USER_TOAST_MSG_V2') and isinstance(data, dict):
+            other_paid_receipts.append(rec_ts)
+            if cmd == 'USER_TOAST_MSG_V2':
+                continue
             paid = nonneg_int(data.get('price')) or 0
             if cmd == 'SUPER_CHAT_MESSAGE':
                 paid *= 1000
@@ -771,6 +786,8 @@ def extract_raw_gift_clues(raw_rows: list[tuple[Any, ...]]) -> dict[str, Any]:
                 all_gold_gift_times.append((-1, ev_ts, paid))
 
     _apply_rank_delta_inference(by_fallback, rank_frames, all_gold_gift_times)
+    if session_bounds:
+        _apply_blind_box_rank_windows(by_fallback, named_ranks, receipts, other_paid_receipts, session_bounds)
     return {'by_tid_batch': by_tid_batch, 'all_gifts': by_fallback, 'combo_map': combo_map}
 
 
@@ -784,7 +801,7 @@ def _apply_rank_delta_inference(
         return
     rank_frames = sorted(rank_frames, key=lambda item: item[0])
     for self_idx, clue in enumerate(gift_clues):
-        if (clue['is_mystery'] or clue['raw_uid'] is not None
+        if (clue['blind_orig_name'] or clue['is_mystery'] or clue['raw_uid'] is not None
                 or clue['clue_md5'] is not None or clue['clue_face_sha1'] is not None):
             continue
         paid = clue['paid_milli_yuan']
@@ -832,6 +849,115 @@ def _apply_rank_delta_inference(
                 break
 
 
+def _apply_blind_box_rank_windows(
+    gifts: list[dict[str, Any]],
+    ranks: list[tuple[float, dict[int, int], dict[int, str]]],
+    receipts: dict[int, float],
+    other_paid: list[float],
+    bounds: tuple[float, float],
+) -> None:
+    """只认领同房同场、上下榜单帧能闭合的整段盲盒，金额字段保持原值。"""
+    if not ranks or not receipts:
+        return
+    packets: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    tid_counts: dict[str, int] = defaultdict(int)
+    for gift in gifts:
+        if gift['raw_id'] in receipts:
+            packets[gift['raw_id']].append(gift)
+        if gift['tid']:
+            tid_counts[gift['tid']] += 1
+
+    def mask_prefix(items: list[dict[str, Any]]) -> str | None:
+        mask = items[0]['raw_uname'] or ''
+        if len(mask) != 4 or mask[1:] != '***' or not mask[0].isalnum() or any(
+            g['raw_uname'] != mask or g['is_mystery'] for g in items
+        ):
+            return None
+        return mask[0].casefold()
+
+    def packet_mask(items: list[dict[str, Any]]) -> str | None:
+        prefix = mask_prefix(items)
+        if prefix is None:
+            return None
+        if any(
+            not g['blind_orig_name']
+            or any(g[key] is not None for key in ('raw_uid', 'clue_md5', 'clue_face_sha1', 'inferred_uid'))
+            or g['coin_type'] != 'gold' or g['paid_milli_yuan'] <= 0
+            or g['output_milli_yuan'] <= 0 or g['output_milli_yuan'] % 100
+            or not g['tid'] or tid_counts[g['tid']] != 1
+            or not bounds[0] <= g['event_ts'] <= bounds[1]
+            for g in items
+        ):
+            return None
+        return prefix
+
+    ids = sorted(packets, key=lambda rid: (receipts[rid], rid))
+    masks = {rid: packet_mask(packets[rid]) for rid in ids}
+    prefixes = {rid: mask_prefix(packets[rid]) for rid in ids}
+    gift_times = [receipts[rid] for rid in ids]
+    others = sorted(other_paid)
+    ranks.sort(key=lambda frame: frame[0])
+    rank_times = [frame[0] for frame in ranks]
+    by_mask: dict[str, list[list[int]]] = defaultdict(list)
+    for rid in ids:
+        mask = masks[rid]
+        if mask is None:
+            continue
+        groups = by_mask[mask]
+        if not groups or receipts[rid] - receipts[groups[-1][-1]] > 40:
+            groups.append([])
+        groups[-1].append(rid)
+
+    for mask, groups in by_mask.items():
+        for group in groups:
+            first, last = receipts[group[0]], receipts[group[-1]]
+            if last - first > 180:
+                continue
+            lo = bisect_left(rank_times, first - 3) - 1
+            if lo < 0 or first - rank_times[lo] > 60:
+                continue
+            before, old, old_names = ranks[lo]
+            group_ids = set(group)
+            points = sum(g['output_milli_yuan'] for rid in group for g in packets[rid]) // 100
+            after_lo = bisect_left(rank_times, last - 1)
+            after_hi = bisect_right(rank_times, last + 35)
+            possible: set[int] = set()
+            for after, scores, names in ranks[after_lo:after_hi]:
+                if bisect_left(others, before - 1) != bisect_right(others, after + 1):
+                    break
+                nearby = ids[bisect_left(gift_times, before - 1):bisect_right(gift_times, after + 1)]
+                competitors = [rid for rid in nearby if rid not in group_ids]
+                # 不把不同首字的未识别礼物并入；若其金额本身可解释目标跳变，就拒绝整个窗口。
+                if any(prefixes[rid] in (None, mask) for rid in competitors) or sum(
+                    g['output_milli_yuan'] for rid in competitors for g in packets[rid]
+                ) >= points * 100:
+                    break
+                matches = {
+                    uid for uid, score in scores.items() if uid in old and score - old[uid] == points
+                }
+                if len(matches) > 1:
+                    possible.clear()
+                    break
+                for uid in matches:
+                    if not names.get(uid, '').casefold().startswith(mask) or not old_names.get(
+                        uid, ''
+                    ).casefold().startswith(mask):
+                        continue
+                    if any(
+                        other != uid and value > old.get(other, 0)
+                        and names.get(other, '').casefold().startswith(mask)
+                        for other, value in scores.items()
+                    ):
+                        continue
+                    possible.add(uid)
+            if len(possible) == 1:
+                uid = next(iter(possible))
+                for rid in group:
+                    for gift in packets[rid]:
+                        gift['inferred_uid'] = uid
+                        gift['inference_method'] = 'blind_box_rank_window'
+
+
 def extract_session_events(
     room_id: str,
     start_ts: float,
@@ -843,7 +969,7 @@ def extract_session_events(
     if not raw_rows and timeline_rows:
         return _extract_from_timeline_fallback(room_id, start_ts, cutoff_ts, timeline_rows)
 
-    clues_bundle = extract_raw_gift_clues(raw_rows)
+    clues_bundle = extract_raw_gift_clues(raw_rows, session_bounds=(start_ts, cutoff_ts))
     seen_keys: set[str] = set()
     events: list[dict[str, Any]] = []
 

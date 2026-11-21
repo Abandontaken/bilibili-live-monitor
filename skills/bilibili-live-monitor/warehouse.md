@@ -6,12 +6,13 @@
 
 - **源数据库严格只读**：所有源 `monitor.sqlite3` 均以 URI `?mode=ro` 与 `PRAGMA query_only=ON` 打开，绝不回写源库或创建表。
 - **原始线索保留与查询晚绑定**：入库时保留每条互动事件的原始协议线索（明文 `raw_uid`、礼物连击无盐 `clue_md5`、用户上传头像 `clue_face_sha1`、匿名弹幕 `clue_crc32` 与首字），在查询视图 `v_resolved_events` 与增量同步阶段与全局字典 `dim_users` 双向关联。某位观众先在房间 `123456` 匿名发弹幕与送礼、数日后在房间 `654321` 点赞或进榜露出明文身份时，下一次 `sync` 会自动认领历史记录并刷新 `fact_session_presence`。
-- **五级防碰撞护栏**：
+- **身份归属与防碰撞护栏**：
   1. `native_uid`：明文正整数 UID 直接写入 `dim_users` 并计算 `uid_md5` 与 `uid_crc32`；
   2. `global_md5`：`batch_combo_id` 中的 128 位无盐 `MD5(uid)` 跨房精确关联；
   3. `unique_face`：仅提取 `/bfs/face/<40位hex>.`，排除 `noface` 与 `/bfs/garb/` 官方装扮；一旦观测到 2 个及以上不同 UID 共用同一头像哈希，`v_unique_face_uid` 自动排除该头像；
   4. `crc32_first_char`：匿名弹幕优先匹配 `uid_crc32` 与首字（多候选碰撞时按同场、同房已确凿露面记录消歧，无法唯一确定则置空并标 `ambiguous_crc32`）；若 `crc32` 未命中，允许通过 `info[0][15]` 提取的唯一头像 `v_unique_face_uid`（有 `clue_crc32` 时要求 CRC32 一致以兼顾改名用户与防撞图，无 `clue_crc32` 时要求首字无冲突）辅助认领，仍未解出时保留 `clue_face_sha1` 供盲盒与弹幕关联；
-  5. `rank_delta`：对无上述线索的单笔金瓜子礼物，仅当随后 15 秒内同房 `ONLINE_RANK_V3` 恰有唯一 1 名榜单观众贡献值增量精确吻合且窗口内无其他金瓜子干扰时，单笔记录 `inferred_uid`。
+  5. `rank_delta`：对无上述线索的单笔非盲盒金瓜子礼物，仅当随后 15 秒内同房 `ONLINE_RANK_V3` 恰有唯一 1 名榜单观众贡献值增量精确吻合且窗口内无其他金瓜子干扰时，单笔记录 `inferred_uid`。
+   6. `blind_box_rank_window`：盲盒不用实付匹配榜分。对同房同场、身份缺失、交易未重复的连续盲盒包，用开出面值总和匹配已在榜账号的唯一积分增量；首字只用于排除冲突。缺帧、干扰或多解时不归属。认领不改变开盒实付、礼物面值或房间总额。历史场次按审核后的清单显式 `--reingest <session_key>`，然后刷新受影响的本地看板。
 - **房间状态与 PK/连麦上下文沉淀**：场次入库同步构建每分钟房间状态序列 `fact_room_metrics`（同屏在线 `online_count`、累计看过 `watched_count`、关注数 `fans_count`、粉丝团 `fans_club_count`）与多说话人状态区间 `fact_cohost_intervals`（`pk`、`pk_punish`、`voice_join`、`voice_join_queue`）；已有 v1 数仓执行 `sync` 时自动平滑升级表结构与视图并重入旧版本场次。完整表字典、原始报文路径、八大口径防坑规则与标准 SQL 模板见 [数据库解析与口径防坑指南](data-interpretation.md)。
 
 ## 命令用法
