@@ -1,7 +1,13 @@
+import json
+import sqlite3
 from datetime import datetime, timezone
 
 import pytest
 
+from bilibili_live_monitor.warehouse_backfill import (
+    _load_blind_box_assignments,
+    overlay_session_gift_identities,
+)
 from bilibili_live_monitor.warehouse_protocol import extract_session_events
 
 START = 1_800_000_000
@@ -61,3 +67,47 @@ def test_duplicate_transaction_does_not_create_an_inferred_gift():
     ])
     assert len(gifts) == 1
     assert gifts[0]['inferred_uid'] is None
+
+
+@pytest.mark.parametrize('case', ['preexisting_jump', 'reset', 'bad_packet', 'unknown_face', 'missing_box_name'])
+def test_unclean_window_is_not_assigned(case):
+    gift = _gift(4, 20, 40000)
+    rows = [_rank(1, 1, 100)]
+    after = 500
+    if case == 'preexisting_jump':
+        rows.append(_rank(2, 19.5, 500))
+    elif case == 'reset':
+        rows.append(_rank(2, 19.5, 0))
+    elif case == 'bad_packet':
+        rows.append(_row(2, 19.5, 'SEND_GIFT_V2', {'pb': 'bad'}))
+    elif case == 'unknown_face':
+        other = _gift(2, 19, 9000)
+        other[3]['data']['uname'] = '花***'
+        del other[3]['data']['price']
+        rows.append(other)
+    else:
+        del gift[3]['data']['blind_gift']['original_gift_name']
+        after = 250
+    rows.extend([gift, _rank(5, 21, after)])
+    assert all(g['inferred_uid'] is None for g in _extract(rows))
+
+
+def test_page_overlay_loads_same_assignment_from_warehouse(tmp_path):
+    source_db, warehouse = tmp_path / 'source.db', tmp_path / 'warehouse.db'
+    _, at, cmd, packet = _gift(2, 20, 40000)
+    with sqlite3.connect(source_db) as db:
+        db.execute('CREATE TABLE raw_events(id, room_id, received_utc, command, data)')
+        db.execute('INSERT INTO raw_events VALUES (2, ?, ?, ?, ?)', ('1', at, cmd, json.dumps(packet)))
+    with sqlite3.connect(warehouse) as db:
+        db.execute('CREATE TABLE dim_sessions(session_key, source_db_path)')
+        db.execute('CREATE TABLE v_resolved_events(session_key, source_ref, resolved_uid, resolution_basis)')
+        db.execute('INSERT INTO dim_sessions VALUES (?, ?)', ('s1', str(source_db.resolve())))
+        db.execute("INSERT INTO v_resolved_events VALUES ('s1', 'raw:2:0', 42, 'blind_box_rank_window')")
+    config = {'workflow_key': 's1', 'database': str(source_db), 'room_id': '1'}
+    identities = _load_blind_box_assignments(warehouse, config)
+    assert identities == {('test-2', 0): 42}
+    item = {'author': '灰***', 'gift': {'event_id': 'test-2', 'event_type': 'SEND_GIFT'}}
+    source = {'raw': [(at, cmd, packet)], 'items': [('gift', at, item)]}
+    result, _ = overlay_session_gift_identities(source, {42: '灰头'}, {}, {}, identities)
+    assert result['items'][0][2]['sender_uid'] == '42'
+    assert 'sender_uid' not in item

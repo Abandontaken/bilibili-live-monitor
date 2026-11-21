@@ -623,8 +623,10 @@ def extract_raw_gift_clues(
             try:
                 msg = _decode_pb(WareGift, data)
             except Exception:
+                other_paid_receipts.append(rec_ts)
                 continue
             if msg is None or not msg.items:
+                other_paid_receipts.append(rec_ts)
                 continue
             mystery = bool(msg.is_mystery or msg.sender.base.is_mystery)
             base_uid = None if mystery else pos_int(msg.sender.uid or msg.uid)
@@ -696,6 +698,8 @@ def extract_raw_gift_clues(
                     'gift_id': str(item.gift_id),
                     'gift_name': clean_uname(item.gift_name),
                     'blind_orig_name': clean_uname(blind_dict['original_gift_name']) if blind_dict else None,
+                    'is_blind_box': blind_dict is not None,
+                    'face_known': price is not None and price > 0,
                     'quantity': num,
                     'coin_type': coin_type,
                     'paid_milli_yuan': paid,
@@ -759,6 +763,8 @@ def extract_raw_gift_clues(
                 'gift_id': str(data.get('giftId', '')),
                 'gift_name': clean_uname(data.get('giftName')),
                 'blind_orig_name': clean_uname(blind_dict.get('original_gift_name')) if blind_dict else None,
+                'is_blind_box': blind_dict is not None,
+                'face_known': price is not None and price > 0,
                 'quantity': num,
                 'coin_type': coin_type,
                 'paid_milli_yuan': paid,
@@ -773,6 +779,9 @@ def extract_raw_gift_clues(
             if tid:
                 by_tid_batch.setdefault((tid, 0), clue)
             by_fallback.append(clue)
+
+        elif cmd in ('SEND_GIFT', 'SEND_GIFT_V2'):
+            other_paid_receipts.append(rec_ts)
 
         elif cmd in ('GUARD_BUY', 'SUPER_CHAT_MESSAGE', 'USER_TOAST_MSG_V2') and isinstance(data, dict):
             other_paid_receipts.append(rec_ts)
@@ -801,7 +810,7 @@ def _apply_rank_delta_inference(
         return
     rank_frames = sorted(rank_frames, key=lambda item: item[0])
     for self_idx, clue in enumerate(gift_clues):
-        if (clue['blind_orig_name'] or clue['is_mystery'] or clue['raw_uid'] is not None
+        if (clue['is_blind_box'] or clue['is_mystery'] or clue['raw_uid'] is not None
                 or clue['clue_md5'] is not None or clue['clue_face_sha1'] is not None):
             continue
         paid = clue['paid_milli_yuan']
@@ -860,12 +869,12 @@ def _apply_blind_box_rank_windows(
     if not ranks or not receipts:
         return
     packets: dict[int, list[dict[str, Any]]] = defaultdict(list)
-    tid_counts: dict[str, int] = defaultdict(int)
+    tid_counts: dict[tuple[str, int], int] = defaultdict(int)
     for gift in gifts:
         if gift['raw_id'] in receipts:
             packets[gift['raw_id']].append(gift)
         if gift['tid']:
-            tid_counts[gift['tid']] += 1
+            tid_counts[(gift['tid'], gift['batch_index'])] += 1
 
     def mask_prefix(items: list[dict[str, Any]]) -> str | None:
         mask = items[0]['raw_uname'] or ''
@@ -880,11 +889,11 @@ def _apply_blind_box_rank_windows(
         if prefix is None:
             return None
         if any(
-            not g['blind_orig_name']
+            not g['is_blind_box'] or not g['face_known']
             or any(g[key] is not None for key in ('raw_uid', 'clue_md5', 'clue_face_sha1', 'inferred_uid'))
             or g['coin_type'] != 'gold' or g['paid_milli_yuan'] <= 0
             or g['output_milli_yuan'] <= 0 or g['output_milli_yuan'] % 100
-            or not g['tid'] or tid_counts[g['tid']] != 1
+            or not g['tid'] or tid_counts[(g['tid'], g['batch_index'])] != 1
             or not bounds[0] <= g['event_ts'] <= bounds[1]
             for g in items
         ):
@@ -892,7 +901,7 @@ def _apply_blind_box_rank_windows(
         return prefix
 
     ids = sorted(packets, key=lambda rid: (receipts[rid], rid))
-    masks = {rid: packet_mask(packets[rid]) for rid in ids}
+    masks = {rid: packet_mask(packets[rid]) if bounds[0] <= receipts[rid] <= bounds[1] else None for rid in ids}
     prefixes = {rid: mask_prefix(packets[rid]) for rid in ids}
     gift_times = [receipts[rid] for rid in ids]
     others = sorted(other_paid)
@@ -919,7 +928,8 @@ def _apply_blind_box_rank_windows(
             before, old, old_names = ranks[lo]
             group_ids = set(group)
             points = sum(g['output_milli_yuan'] for rid in group for g in packets[rid]) // 100
-            after_lo = bisect_left(rank_times, last - 1)
+            latest_event = max(g['event_ts'] for rid in group for g in packets[rid])
+            after_lo = bisect_right(rank_times, max(last, latest_event))
             after_hi = bisect_right(rank_times, last + 35)
             possible: set[int] = set()
             for after, scores, names in ranks[after_lo:after_hi]:
@@ -928,7 +938,8 @@ def _apply_blind_box_rank_windows(
                 nearby = ids[bisect_left(gift_times, before - 1):bisect_right(gift_times, after + 1)]
                 competitors = [rid for rid in nearby if rid not in group_ids]
                 # 不把不同首字的未识别礼物并入；若其金额本身可解释目标跳变，就拒绝整个窗口。
-                if any(prefixes[rid] in (None, mask) for rid in competitors) or sum(
+                if any(prefixes[rid] in (None, mask) or any(not g['face_known'] for g in packets[rid])
+                       for rid in competitors) or sum(
                     g['output_milli_yuan'] for rid in competitors for g in packets[rid]
                 ) >= points * 100:
                     break
@@ -939,6 +950,12 @@ def _apply_blind_box_rank_windows(
                     possible.clear()
                     break
                 for uid in matches:
+                    if any(frame[1].get(uid, old[uid]) != old[uid]
+                           for frame in ranks[lo + 1:bisect_left(rank_times, first - 0.1)]):
+                        continue
+                    samples = [frame[1][uid] for frame in ranks[lo:bisect_right(rank_times, after)] if uid in frame[1]]
+                    if any(y < x for x, y in zip(samples, samples[1:])):
+                        continue
                     if not names.get(uid, '').casefold().startswith(mask) or not old_names.get(
                         uid, ''
                     ).casefold().startswith(mask):
