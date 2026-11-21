@@ -5,7 +5,7 @@ import time
 from pathlib import Path
 
 from . import audience_crm as crm
-from .cursor_finalize import CURSOR_AUTHOR, GROK_BACKEND, frozen_author
+from .cursor_finalize import CURSOR_AUTHOR, GROK_BACKEND, frozen_author, maintenance_adapter_stopped
 from .live_share import atomic_json
 
 
@@ -64,6 +64,54 @@ def accepted_ready(session):
     config, _ = load_settings(session)
     crm.verify_accepted(config, directory, saved['plan_id'])
     return True
+
+
+def actionable_work(directory, plan_id, author):
+    """Identify ready coordinator actions from the frozen plan and worker receipts."""
+    plan = json.loads((directory / 'plan.json').read_text())
+    if plan['id'] != plan_id:
+        raise ValueError('观众终审计划身份不符')
+    waiting, review, retry = [], [], []
+    active = 0
+    incomplete = 0
+    cli = author in (CURSOR_AUTHOR, GROK_BACKEND)
+    for index, task in enumerate(plan['tasks']):
+        if task.get('reused'):
+            continue
+        result = Path(task['result'])
+        receipt = directory / 'cursor_workers' / f'{index:03d}.json'
+        if cli and receipt.is_file():
+            item = json.loads(receipt.read_text())
+            legacy = item.get('backend') == 'legacy_result' and item.get('state') == 'accepted'
+            if item.get('plan_id') != plan_id or (not legacy and item.get('shard') != f'{index:03d}'):
+                raise ValueError('观众终审分片回执身份不符')
+            status = item.get('state')
+            if status == 'accepted' and result.is_file():
+                continue
+            incomplete += 1
+            if status == 'awaiting_coordinator_review' and item.get('exit_code') == 0:
+                review.append(f'review:{index}:{item.get("token")}')
+            elif status in ('failed', 'interrupted') and not result.exists():
+                history = receipt.parent / 'history' / receipt.stem
+                if not history.exists() or len(list(history.iterdir())) < 2:
+                    retry.append(f'retry:{index}:{item.get("token")}')
+            elif status == 'maintenance_paused_before_start' and maintenance_adapter_stopped(item):
+                retry.append(f'retry:{index}:{item.get("token")}')
+            elif status in ('submitting', 'starting', 'running', 'cleanup_failed'):
+                active += 1
+        elif result.is_file():
+            if cli:
+                incomplete += 1
+                review.append(f'review:{index}:legacy')
+        else:
+            incomplete += 1
+            waiting.append(index)
+    capacity = max(0, min(10, plan.get('concurrency', 10)) - active)
+    stopped = cli and (directory / 'cursor_workers' / 'stop.json').exists()
+    # A native child may still be writing even if its parent is idle; a missing
+    # file is not proof that it is safe to redispatch without a worker receipt.
+    dispatchable = retry + [f'start:{index}' for index in waiting] if cli and not stopped else []
+    return [*review, *(['finish'] if not incomplete else [])], dispatchable, capacity
 
 
 def advance(session, state):
@@ -165,5 +213,6 @@ plan.json中reused=true的任务已由程序校验复用上一版result，直接
         state['audience_submitted'] = True
     from .finalize_lifecycle import supervise
     supervise({**session, 'author_agent': config['author_agent']},
-              state, ai_session, root, time.time(), key='audience_watch')
+              state, ai_session, root, time.time(), key='audience_watch',
+              actionable=lambda: actionable_work(directory, saved['plan_id'], config['author_agent']))
     return False

@@ -9,6 +9,9 @@ from .session_ai import ai_control
 GRACE_SECONDS = 120
 WAKE_INTERVAL = 300
 MAX_WAKES = 3
+CRM_WAKE_INTERVAL = 600
+CRM_MAX_WAKES = 10
+CRM_RETRY_INTERVAL = 900
 
 
 def drain(config, state, session, now, *, key='final_cleanup', children=True):
@@ -21,7 +24,7 @@ def drain(config, state, session, now, *, key='final_cleanup', children=True):
     return stop_ai(config, session, children=children)
 
 
-def supervise(config, state, session, root, now, *, key='coordinator_watch'):
+def supervise(config, state, session, root, now, *, key='coordinator_watch', actionable=None):
     """锁由runner/watch持有。先落发送意图；结果不明只对账，绝不盲目重投。"""
     from .session_budget import check_budget
     if not session:
@@ -40,21 +43,47 @@ def supervise(config, state, session, root, now, *, key='coordinator_watch'):
         watch.pop('pending_marker')
         watch['delivery'] = 'verified_in_session'
         atomic_json(journal, watch)
-    if now - watch['last_wake_at'] < WAKE_INTERVAL:
+    crm = key == 'audience_watch'
+    interval = CRM_WAKE_INTERVAL if crm else WAKE_INTERVAL
+    if now - watch['last_wake_at'] < interval:
         return
-    if now - watch.get('last_check_at', -float('inf')) < 60:
+    if now - watch.get('last_check_at', -float('inf')) < (interval if crm else 60):
         return
     watch['last_check_at'] = now
+    ready, dispatchable, capacity = actionable() if crm and actionable is not None else ([], [], 0)
+    if crm and not (ready or (capacity and dispatchable)):
+        watch['decision'] = 'waiting_for_actionable_work'
+        atomic_json(journal, watch)
+        return
     status = ai_control(config, 'status', session=session).get('type')
     watch['observed_status'] = status
-    if status in ('busy', 'retry'):
+    if (crm and status != 'idle') or status in ('busy', 'retry'):
         atomic_json(journal, watch)
         return
     check_budget(config, state)
-    if watch['attempts'] >= MAX_WAKES:
+    if watch['attempts'] >= (CRM_MAX_WAKES if crm else MAX_WAKES):
         watch['delivery'] = 'wake_limit_reached'
         atomic_json(journal, watch)
         return
+    if crm:
+        action_wakes = watch.get('action_wakes', {})
+        actions = ready + (dispatchable if capacity else [])
+
+        def can_wake(action):
+            wakes = action_wakes.get(action, [])
+            return len(wakes) < 2 and (not wakes or now - wakes[-1] >= CRM_RETRY_INTERVAL)
+
+        eligible = [action for action in ready if can_wake(action)]
+        eligible += [action for action in dispatchable if can_wake(action)][:capacity]
+        if not eligible:
+            watch['decision'] = ('action_retry_exhausted' if all(len(action_wakes.get(a, [])) >= 2 for a in actions)
+                                 else 'action_retry_backoff')
+            atomic_json(journal, watch)
+            return
+        watch['decision'] = 'action_retry' if all(a in action_wakes for a in eligible) else 'action_ready'
+        for action in eligible:
+            action_wakes[action] = [*action_wakes.get(action, []), now]
+        watch['action_wakes'] = action_wakes
     marker = f'FINALIZE_RESUME:{root.name}:{watch["attempts"] + 1}'
     finish_steps = ('逐人核对引用归属和previous保留，按原audience_crm finish合同收尾；禁止音乐merge/corrections'
                     if key == 'audience_watch' else
@@ -66,14 +95,18 @@ def supervise(config, state, session, root, now, *, key='coordinator_watch'):
     )
     author = config.get('author_agent')
     review_line = (
-        f'沿用原输入、原模型、已有结果和CLI回执。\n检查分片进度，有候选则实质语义审核后accept；全部通过后{finish_steps}。'
+        f'沿用原输入、原模型、已有结果和CLI回执。\n检查分片进度，有候选则实质语义审核后accept；'
+        f'有空位则按原合同补派未启动片或处理明确可重试的失败片；全部通过后{finish_steps}。'
         if uses_cli else
-        f'检查既有结果和冻结输入；仅把未完成分片通过task派发给冻结的 {author} 子代理；全部通过后{finish_steps}。'
+        f'检查既有结果和冻结输入；原分片由冻结的 {author} 子代理负责，不重派可能仍在写入的分片；全部通过后{finish_steps}。'
         if key == 'audience_watch' and author else
         f'执行路由未知，不得派发新分片；如既有结果全部通过则{finish_steps}。'
         if key == 'audience_watch' else
         f'沿用原输入、原模型和已有分片结果。\n检查分片进度，未完成分片通过task派发给plan.json指定的subagent写入对应result路径，核验覆盖与指纹后{finish_steps}。'
     )
+    if crm and uses_cli:
+        review_line += ('\n本次仅处理以下到期待办（末段 token 用于区分尝试，分片序号补零）：'
+                        + ', '.join(eligible) + '。不派发或重试清单以外的分片，不重试回执不明的派发。')
     prompt = root / 'resume_prompt.md'
     prompt.write_text(f'''{marker}
 继续原终审计划 {root / 'plan.json'}。读取本目录原prompt.md及instructions（如有），{review_line}不要重跑成功片，不手写completed，不改原稿、边界或URL。
