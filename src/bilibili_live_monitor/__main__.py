@@ -6,6 +6,8 @@ import sys
 
 from .activity import configure_parser as configure_activity
 from .activity import main as activity_main
+from .audience_log import configure_parser as configure_audience_log
+from .audience_log import main as audience_log_main
 from .browser import Browser
 from .config import load_settings
 from .gift_assets import configure_parser as configure_gift_assets
@@ -49,6 +51,7 @@ def main():
     configure_rotation(commands)
     configure_trends(commands)
     configure_activity(commands)
+    configure_audience_log(commands)
     configure_trailer(commands)
     configure_live_share(commands)
     configure_archive(commands)
@@ -60,6 +63,8 @@ def main():
     configure_room_discovery(commands)
     configure_checkin(commands)
     args = parser.parse_args()
+    if args.command == 'audience-log':
+        return audience_log_main(args)
     if args.command == 'checkin':
         return checkin_main(args)
     if args.command == 'room-discovery':
