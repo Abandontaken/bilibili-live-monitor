@@ -47,6 +47,8 @@ PK录屏花屏、视频剪辑读取及压缩前的参数检查见[PK编码参数
 
 观众当前备忘、跨场承诺和独立下播更新见[观众备忘接入](session-workflow.md#观众当前备忘与下播更新)：程序汇总事实，指定模型逐人生成并核验引用；完成本地语义验收后再接纳与发布。
 
+需要纯机械地按 UID 整理昵称、场次和原文弹幕时，见[观众弹幕档案](audience-log.md)：`bili-live audience-log` 从本地采集库导出结构化 JSON、独立静态网页或两者。
+
 需要跨多个实名/匿名采集库离线消解观众身份、构建标准化付费与转写数仓，或差量回填本地已完成匿名看板的送礼汇总与单曲去重人数时，见[跨房全局身份消解数仓](warehouse.md)：使用 `bili-live warehouse sync/stats/backfill-pages`，对源库严格只读，回填默认 `--dry-run`。
 
 编写 SQL 或 Python 脚本查询 `live_warehouse.sqlite3` 与 `monitor.sqlite3`、解读弹幕/盲盒/荣耀等级/粉丝牌/在线人数/PK 连麦字段时，先读[数据库解析与口径防坑指南](data-interpretation.md)，避免外房勋章剥离、短长房号不一致、盲盒双账本与成对广播重复记账等口径误判。

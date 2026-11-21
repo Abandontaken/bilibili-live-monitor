@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex,nofollow,noarchive">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
+<title>观众弹幕档案</title>
+<style>
+:root{color-scheme:light;--bg:#f3f6fb;--card:#fff;--text:#16243b;--muted:#53637a;--line:#e0e6ef;--accent:#2563eb;--tint:#edf3ff}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.7 -apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif}
+main{max-width:1120px;margin:auto;padding:26px}
+h1,h2,p{margin:0}h1{font-size:27px;line-height:1.4}h2{font-size:20px}
+.muted,time{color:var(--muted)}time,.uid{font-variant-numeric:tabular-nums}
+#coverage{margin-top:8px}.layout{display:grid;grid-template-columns:minmax(0,300px) minmax(0,1fr);gap:16px;align-items:start;margin-top:18px}
+.panel{min-width:0;padding:16px;background:var(--card);border:1px solid var(--line);border-radius:14px;box-shadow:0 4px 16px #18243b05;overflow-wrap:anywhere}
+input,button{font:inherit;color:inherit;background:var(--card);border:1px solid #d4deed;border-radius:8px;padding:8px 10px}
+input{width:100%;margin:5px 0 7px}button,summary{cursor:pointer}button:hover,button[aria-current="true"]{background:var(--tint);border-color:var(--accent)}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+#scroll{max-height:61vh;overflow:auto;padding:3px;margin:4px -3px 0}
+#people{display:grid;gap:6px}#people button{width:100%;text-align:left}#people small{display:block;color:var(--muted)}
+#sentinel{height:1px}.profile-head{display:flex;align-items:flex-start;gap:10px;justify-content:space-between;flex-wrap:wrap}.toggle{color:#1d4ed8;background:var(--tint)}
+.aliases{margin:5px 0 12px}.sessions{display:grid;gap:8px}
+details{border:1px solid var(--line);border-radius:9px}summary{padding:9px 11px}summary span{margin-left:9px}details[open] summary{background:#f8faff;border-radius:9px 9px 0 0}
+.messages{list-style:none;padding:0 11px;margin:0 0 9px}.messages li{display:grid;grid-template-columns:max-content minmax(0,1fr);gap:10px;border-top:1px solid var(--line);padding:6px 0}
+.message{white-space:pre-wrap;overflow-wrap:anywhere}
+@media(max-width:690px){main{padding:12px}.layout{grid-template-columns:1fr;gap:12px}#scroll{max-height:28vh}.panel{padding:12px}}
+</style>
+<main>
+  <header><h1 id="heading"></h1><p class="muted" id="coverage"></p></header>
+  <div class="layout">
+    <section class="panel" aria-label="查找观众">
+      <label for="query">查 UID、昵称或曾用昵称</label>
+      <input id="query" type="search" autocomplete="off" placeholder="输入 UID 或昵称">
+      <p id="count" class="muted" role="status"></p>
+      <div id="scroll" tabindex="0" aria-label="观众列表"><div id="people"></div><div id="sentinel"></div></div>
+    </section>
+    <section id="profile" class="panel" aria-label="观众弹幕" tabindex="-1"></section>
+  </div>
+</main>
+<script type="application/json" id="payload">__AUDIENCE_DATA__</script>
+<script>
+'use strict';
+const {title, timezone, sessions, people, stats} = JSON.parse(document.querySelector('#payload').textContent);
+const $ = id => document.getElementById(id);
+const el = (tag, text, css) => {
+  const node = document.createElement(tag);
+  if (text != null) node.textContent = text;
+  if (css) node.className = css;
+  return node;
+};
+const normalize = s => s.normalize('NFKC').toLowerCase();
+const lookup = people.map(p => [p, p.names.map(normalize)]);
+const date = s => s.slice(0,10);
+const time = s => s.slice(11,19);
+const full = s => s.slice(0,16).replace('T',' ');
+const number = n => n.toLocaleString('zh-CN');
+const batch = 30;
+let matches = [], shown = 0, selected = null;
+$('heading').textContent = document.title = title;
+const zone = timezone === 'Asia/Shanghai' ? '北京时间' : timezone;
+$('coverage').textContent = `${date(sessions[0].start)} 至 ${date(sessions.at(-1).start)} · ${sessions.length} 场 · ${number(people.length)} 位发言观众 · ${number(stats.message_count)} 条弹幕 · ${zone}`;
+
+function addBatch() {
+  const root = $('people');
+  for (const [p] of matches.slice(shown, shown + batch)) {
+    const button = el('button', p.names[0] || `UID ${p.uid}`);
+    button.type = 'button';
+    if (selected === p.uid) button.setAttribute('aria-current', 'true');
+    button.append(el('small', `${p.sessions.length} 场有记录 · ${number(p.message_count)} 条弹幕`));
+    button.addEventListener('click', () => {
+      root.querySelector('[aria-current]')?.removeAttribute('aria-current');
+      button.setAttribute('aria-current','true');
+      renderPerson(p);
+      $('profile').focus();
+    });
+    root.append(button);
+  }
+  shown = Math.min(shown + batch, matches.length);
+  $('count').textContent = `找到 ${number(matches.length)} 位观众`;
+  $('sentinel').hidden = shown >= matches.length;
+}
+
+const observer = new IntersectionObserver(entries => {
+  if (entries.some(entry => entry.isIntersecting) && shown < matches.length) addBatch();
+}, {root:$('scroll'), rootMargin:'0px 0px 120px 0px'});
+observer.observe($('sentinel'));
+function filter() {
+  const query = normalize($('query').value.trim());
+  matches = lookup.filter(([p,names]) => p.uid.includes(query) || names.some(n => n.includes(query)));
+  shown = 0;
+  $('people').replaceChildren();
+  $('scroll').scrollTop = 0;
+  addBatch();
+}
+
+function renderPerson(p) {
+  selected = p.uid;
+  const header = el('div', null, 'profile-head');
+  const identity = el('div');
+  identity.append(el('h2',p.names[0] || `UID ${p.uid}`),
+    el('p',`UID ${p.uid} · ${p.sessions.length} 场有记录 · ${number(p.message_count)} 条弹幕`,'uid muted'));
+  const toggle = el('button','展开全部','toggle');
+  toggle.type = 'button';
+  toggle.setAttribute('aria-controls','session-cards');
+  header.append(identity,toggle);
+  const cards = el('div',null,'sessions');
+  cards.id = 'session-cards';
+  const syncToggle = () => { toggle.textContent = cards.querySelector('details:not([open])') ? '展开全部' : '收起全部'; };
+  for (const {session,messages} of p.sessions) {
+    const {start,end} = sessions[session];
+    const card = el('details');
+    const summary = el('summary',`${full(start)} 至 ${date(start) === date(end) ? time(end).slice(0,5) : full(end)}`);
+    summary.append(el('span',messages.length ? `${number(messages.length)} 条弹幕` : '无弹幕','muted'));
+    card.append(summary);
+    card.addEventListener('toggle', () => {
+      syncToggle();
+      if (!card.open || card.children.length > 1) return;
+      if (!messages.length) {
+        card.append(el('p','这场只观测到非弹幕活动。','messages muted'));
+        return;
+      }
+      const list = el('ul',null,'messages');
+      for (const {at,name,text} of messages) {
+        const li = el('li');
+        const stamp = el('time',date(at) === date(start) ? time(at) : `${date(at)} ${time(at)}`);
+        stamp.dateTime = at;
+        const message = el('span',null,'message');
+        if (name && name !== p.names[0]) message.append(el('span',`${name}：`,'muted'));
+        message.append(document.createTextNode(text));
+        li.append(stamp,message);
+        list.append(li);
+      }
+      card.append(list);
+    });
+    cards.append(card);
+  }
+  toggle.addEventListener('click', () => {
+    const open = Boolean(cards.querySelector('details:not([open])'));
+    for (const card of cards.children) card.open = open;
+    syncToggle();
+  });
+  $('profile').replaceChildren(header, el('p',`观测昵称：${p.names.join(' / ') || '未记录'}`,'aliases'),cards);
+}
+
+$('query').addEventListener('input',filter);
+if (people.length) renderPerson(people[0]);
+else $('profile').append(el('p','所选场次没有可按 UID 归档的弹幕。'));
+filter();
+</script>
+</html>

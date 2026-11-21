@@ -242,7 +242,7 @@ python -m bilibili_live_monitor.broadcast_email --env-file /PRIVATE/notify.env -
 
 `finish_timeout` 默认21600秒，从 `live` 进入 `stopping` 时冻结 `finish_deadline`，不因进度或重启续期。预算耗尽后，runner 将 `stage=attention` 并持久保存 `automation_paused`（`reason=finish_timeout`、原 `stage`、`paused_at`、`finish_deadline`），退出自动推进；不 abort 协调会话、不停止已派发 Cursor、不发布异常页。新建会话、协调任务提交、Cursor 启动及重试、自动发布检查同一预算；已派发单片仍保留45分钟上限。manager 与健康巡检不自动恢复此终态。
 
-独立 `audience_watch` 使用自身 `state_file` 中冻结的期限，不借用原 `completed` 场次期限；暂停时保留 `active` 并返回 `paused`，阻止继续推进其他任务。人工恢复须先检查旧写入者和已有成果，再显式清除暂停标记、恢复原阶段并给新的有限期限；独立 watch 还需清除 `active.automation_paused`。这不是自动恢复命令。代码合并或 pull 不等于部署，固定 release 的运行任务只有加载相应新版代码后才采用新行为。
+独立 `audience_watch` 使用自身 `state_file` 中冻结的期限，不借用原 `completed` 场次期限；暂停时保留 `active` 并返回 `paused`，阻止继续推进其他任务。CRM 总协调每十分钟查一次待办，有候选待验收、有空位可补派或只差收尾时才唤醒空闲原会话，最多十次；同一待办可在至少十五分钟后补访一次。无待办不扣额度，未知交接仍须对账。人工恢复须先检查旧写入者和已有成果，再显式清除暂停标记、恢复原阶段并给新的有限期限；独立 watch 还需清除 `active.automation_paused`。这不是自动恢复命令。代码合并或 pull 不等于部署，固定 release 的运行任务只有加载相应新版代码后才采用新行为。
 
 私有 `workflow.json` 记录阶段、URL就绪、错误和收尾进度，`state.json` 记录看板截止点；`/api/automation` 提供逐场工作流状态。验收应覆盖断线重启不重复建场、同线程通知、下播先停止AI、源文件封口、离线转写进入页面、原URL不变和最终停止轮询。合成测试不代替真实部署、邮件送达与模型质量验收。
 

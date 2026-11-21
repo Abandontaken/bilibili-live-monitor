@@ -63,7 +63,8 @@ def test_native_crm_idle_wake_names_frozen_agent(tmp_path, monkeypatch):
     config = {'author_agent': 'general', 'model': 'example/coordinator',
               'opencode_python': 'python', 'opencode_cwd': str(tmp_path), 'workspace': str(tmp_path)}
     state = {'audience_watch': {'last_wake_at': 0, 'attempts': 0}}
-    lifecycle.supervise(config, state, 'test-session', tmp_path, 301, key='audience_watch')
+    lifecycle.supervise(config, state, 'test-session', tmp_path, 600, key='audience_watch',
+                        actionable=lambda: (['finish'], [], 0))
     prompt = (tmp_path / 'resume_prompt.md').read_text()
     assert '冻结的 general 子代理' in prompt
     assert 'plan.json指定的subagent' not in prompt
