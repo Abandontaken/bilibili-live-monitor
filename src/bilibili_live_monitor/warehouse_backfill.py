@@ -17,6 +17,7 @@ from .live_share_control import load_config, source_at_cutoff, verify_snapshot
 from .session_snapshot import write_snapshot
 from .time_utils import epoch
 from .warehouse import (
+    _compute_session_key,
     assert_distinct_warehouse_path,
     collect_session_databases,
     open_readonly_sqlite,
@@ -50,11 +51,54 @@ def _load_identity_dictionary(warehouse_path: Path) -> tuple[dict[int, str | Non
     return users_by_uid, uid_by_md5, uid_by_unique_face
 
 
+def _load_blind_box_assignments(
+    warehouse_path: Path, config: dict[str, Any], cutoff: float,
+) -> dict[tuple[str, int], int] | None:
+    """看板只复用数仓已归属结果；通过原始包 ID 还原看板使用的交易键。"""
+    db_path = Path(config['database']).resolve()
+    with open_readonly_sqlite(warehouse_path) as wh:
+        rows = wh.execute('''
+            SELECT source_ref, resolved_uid, start_ts, cutoff_ts FROM v_resolved_events JOIN dim_sessions USING(session_key)
+             WHERE session_key=? AND source_db_path=? AND resolution_basis='blind_box_rank_window'
+        ''', (_compute_session_key(config), str(db_path))).fetchall()
+    if not rows:
+        return {}
+    refs = {}
+    for ref, uid, start_ts, cutoff_ts in rows:
+        if (start_ts, cutoff_ts) != (epoch(config['start_utc']), cutoff):
+            return None
+        tag, raw_id, index = ref.split(':')
+        if tag != 'raw':
+            raise ValueError('盲盒归因来源必须为原始礼物包')
+        refs[(int(raw_id), int(index))] = uid
+    raw = []
+    with open_readonly_sqlite(db_path) as db:
+        for raw_id in sorted({rid for rid, _ in refs}):
+            row = db.execute('SELECT id, received_utc, command, data FROM raw_events WHERE id=? AND room_id=?',
+                             (raw_id, str(config['room_id']))).fetchone()
+            if row is None:
+                raise ValueError('盲盒原始包缺失')
+            raw.append((*row[:3], json.loads(row[3])))
+    assignments = {}
+    for clue in extract_raw_gift_clues(raw)['all_gifts']:
+        uid = refs.pop((clue['raw_id'], clue['batch_index']), None)
+        if uid is None:
+            continue
+        key = (clue['tid'], clue['batch_index'])
+        if not clue['tid'] or key in assignments:
+            raise ValueError('盲盒看板交易键缺失或重复')
+        assignments[key] = uid
+    if refs:
+        raise ValueError('盲盒归因与原始包不一致')
+    return assignments
+
+
 def overlay_session_gift_identities(
     source: dict[str, Any],
     users_by_uid: dict[int, str | None],
     uid_by_md5: dict[str, int],
     uid_by_unique_face: dict[str, int],
+    blind_box_assignments: dict[tuple[str, int], int] | None = None,
 ) -> tuple[dict[str, Any], dict[str, int]]:
     """在内存副本上用全局身份字典消解本场礼物事件，绝不改动源数据。"""
     clues = extract_raw_gift_clues(source.get('raw', []))
@@ -115,7 +159,9 @@ def overlay_session_gift_identities(
 
         clue_md5 = clue.get('clue_md5') if clue else None
         clue_face = clue.get('clue_face_sha1') if clue else None
-        inferred_uid = clue.get('inferred_uid') if clue else None
+        captured_id = (str(gift.get('event_id') or ''), int(gift.get('batch_index', 0) or 0))
+        from_warehouse = (blind_box_assignments or {}).get(captured_id) if clue and clue['is_blind_box'] else None
+        inferred_uid = from_warehouse or (clue.get('inferred_uid') if clue else None)
         raw_uid = native_uid or (clue.get('raw_uid') if clue else None)
 
         resolved_uid = (
@@ -247,9 +293,13 @@ def _process_single_session(
 
     _, cutoff, source = source_at_cutoff(config)
     existing_snapshot = json.loads(snap_path.read_text())
+    blind_box_assignments = _load_blind_box_assignments(warehouse_path, config, cutoff)
+    if blind_box_assignments is None:
+        return {'status': 'skipped_warehouse_window_mismatch', 'session': session_dir.name}
 
     resolved_source, counters = overlay_session_gift_identities(
-        source, users_by_uid, uid_by_md5, uid_by_unique_face
+        source, users_by_uid, uid_by_md5, uid_by_unique_face,
+        blind_box_assignments,
     )
     new_gift_summary, new_activity_summary = _recompute_summaries(existing_snapshot, resolved_source, cutoff)
 
@@ -295,8 +345,12 @@ def _process_single_session(
 
         locked_config = load_config(cfg_path)
         _, locked_cutoff, locked_source = source_at_cutoff(locked_config)
+        locked_assignments = _load_blind_box_assignments(warehouse_path, locked_config, locked_cutoff)
+        if locked_assignments is None:
+            return {'status': 'skipped_warehouse_window_mismatch', 'session': session_dir.name}
         locked_resolved, locked_counters = overlay_session_gift_identities(
-            locked_source, users_by_uid, uid_by_md5, uid_by_unique_face
+            locked_source, users_by_uid, uid_by_md5, uid_by_unique_face,
+            locked_assignments,
         )
         locked_gift_summary, locked_activity_summary = _recompute_summaries(
             locked_snapshot, locked_resolved, locked_cutoff
