@@ -7,6 +7,7 @@ import pytest
 
 from bilibili_live_monitor import finalize_lifecycle as lifecycle
 from bilibili_live_monitor import session_finalize, session_runner
+from bilibili_live_monitor.audience_finalize import CURSOR_AUTHOR, actionable_work
 from bilibili_live_monitor.session_budget import BudgetPaused, check_budget
 from bilibili_live_monitor.session_offline import NoMediaError, exclude_empty, run_offline
 
@@ -75,10 +76,50 @@ def test_resume_preserves_nonmusic_completion_contract(tmp_path, monkeypatch, ki
                         SimpleNamespace(returncode=0, stdout='{}', stderr=''))
     state = {}
     lifecycle.supervise(config, state, 'same-session', root, 0, key=key)
-    lifecycle.supervise(config, state, 'same-session', root, 300, key=key)
+    lifecycle.supervise(config, state, 'same-session', root, 600, key=key, actionable=lambda: ['work'])
     prompt = (root / 'resume_prompt.md').read_text()
     assert '禁止音乐merge/corrections' in prompt
     assert ('talk_finalize finish' if kind == 'talk_finalize' else 'audience_crm finish') in prompt
+
+
+def test_crm_waiting_result_gets_wake_and_only_one_retry(tmp_path, monkeypatch):
+    calls = []
+    config = {'workspace': str(tmp_path), 'model': 'synthetic/model',
+              'opencode_python': 'python', 'opencode_cwd': str(tmp_path)}
+    monkeypatch.setattr(lifecycle, 'ai_control', lambda c, op, **kw:
+                        True if op == 'submitted' else {'type': 'idle'})
+    monkeypatch.setattr(lifecycle.subprocess, 'run', lambda *a, **kw:
+                        calls.append(a) or SimpleNamespace(returncode=0, stdout='', stderr=''))
+    state = {}
+    lifecycle.supervise(config, state, 'same', tmp_path, 0, key='audience_watch')
+    for now in (600, 1200, 1800, 2400):
+        lifecycle.supervise(config, state, 'same', tmp_path, now, key='audience_watch', actionable=lambda: None)
+    assert not calls
+    for now in (3000, 3600, 4200, 4800):
+        lifecycle.supervise(config, {}, 'same', tmp_path, now, key='audience_watch', actionable=lambda: ['review'])
+    assert len(calls) == 2
+    assert json.loads((tmp_path / 'supervision.json').read_text())['decision'] == 'action_retry_exhausted'
+    lifecycle.supervise(config, {}, 'same', tmp_path, 5400, key='audience_watch', actionable=lambda: ['finish'])
+    assert len(calls) == 3
+
+
+def test_crm_full_concurrency_waits_until_a_candidate_is_ready(tmp_path):
+    tasks = [{'result': str(tmp_path / f'{i}.result.json')} for i in range(3)]
+    (tmp_path / 'plan.json').write_text(json.dumps({'id': 'plan', 'concurrency': 2, 'tasks': tasks}))
+    workers = tmp_path / 'cursor_workers'
+    workers.mkdir()
+    for index in range(2):
+        (workers / f'{index:03d}.json').write_text(json.dumps({
+            'plan_id': 'plan', 'shard': f'{index:03d}', 'state': 'running'}))
+    assert not actionable_work(tmp_path, 'plan', CURSOR_AUTHOR)
+    (workers / '001.json').write_text(json.dumps({
+        'plan_id': 'plan', 'shard': '001', 'state': 'awaiting_coordinator_review', 'exit_code': 0}))
+    assert actionable_work(tmp_path, 'plan', CURSOR_AUTHOR)
+    (tmp_path / '0.result.json').write_text('{}')
+    (workers / '000.json').write_text(json.dumps({
+        'plan_id': 'plan', 'backend': 'legacy_result', 'state': 'accepted'}))
+    assert actionable_work(tmp_path, 'plan', CURSOR_AUTHOR) == ['review:1:None', 'start:2']
+    assert not actionable_work(tmp_path, 'plan', 'native_worker')
 
 
 def test_reserve_reaches_advance_without_reopening_dispatch(tmp_path, monkeypatch):
