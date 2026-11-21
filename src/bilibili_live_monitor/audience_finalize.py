@@ -110,8 +110,8 @@ def actionable_work(directory, plan_id, author):
     stopped = cli and (directory / 'cursor_workers' / 'stop.json').exists()
     # A native child may still be writing even if its parent is idle; a missing
     # file is not proof that it is safe to redispatch without a worker receipt.
-    dispatchable = (retry + [f'start:{index}' for index in waiting])[:capacity] if cli and not stopped else []
-    return [*review, *dispatchable, *(['finish'] if not incomplete else [])]
+    dispatchable = retry + [f'start:{index}' for index in waiting] if cli and not stopped else []
+    return [*review, *(['finish'] if not incomplete else [])], dispatchable, capacity
 
 
 def advance(session, state):

@@ -50,8 +50,8 @@ def supervise(config, state, session, root, now, *, key='coordinator_watch', act
     if now - watch.get('last_check_at', -float('inf')) < (interval if crm else 60):
         return
     watch['last_check_at'] = now
-    actions = actionable() if crm and actionable is not None else []
-    if crm and not actions:
+    ready, dispatchable, capacity = actionable() if crm and actionable is not None else ([], [], 0)
+    if crm and not (ready or (capacity and dispatchable)):
         watch['decision'] = 'waiting_for_actionable_work'
         atomic_json(journal, watch)
         return
@@ -67,8 +67,14 @@ def supervise(config, state, session, root, now, *, key='coordinator_watch', act
         return
     if crm:
         action_wakes = watch.get('action_wakes', {})
-        eligible = [action for action in actions if len(action_wakes.get(action, [])) < 2
-                    and now - (action_wakes.get(action) or [-float('inf')])[-1] >= CRM_RETRY_INTERVAL]
+        actions = ready + (dispatchable if capacity else [])
+
+        def can_wake(action):
+            wakes = action_wakes.get(action, [])
+            return len(wakes) < 2 and (not wakes or now - wakes[-1] >= CRM_RETRY_INTERVAL)
+
+        eligible = [action for action in ready if can_wake(action)]
+        eligible += [action for action in dispatchable if can_wake(action)][:capacity]
         if not eligible:
             watch['decision'] = ('action_retry_exhausted' if all(len(action_wakes.get(a, [])) >= 2 for a in actions)
                                  else 'action_retry_backoff')
@@ -99,7 +105,8 @@ def supervise(config, state, session, root, now, *, key='coordinator_watch', act
         f'沿用原输入、原模型和已有分片结果。\n检查分片进度，未完成分片通过task派发给plan.json指定的subagent写入对应result路径，核验覆盖与指纹后{finish_steps}。'
     )
     if crm and uses_cli:
-        review_line += '\n本次到期的待办：' + ', '.join(eligible) + '。优先处理这些分片，不重试回执不明的派发。'
+        review_line += ('\n本次仅处理以下到期待办（末段 token 用于区分尝试，分片序号补零）：'
+                        + ', '.join(eligible) + '。不派发或重试清单以外的分片，不重试回执不明的派发。')
     prompt = root / 'resume_prompt.md'
     prompt.write_text(f'''{marker}
 继续原终审计划 {root / 'plan.json'}。读取本目录原prompt.md及instructions（如有），{review_line}不要重跑成功片，不手写completed，不改原稿、边界或URL。
