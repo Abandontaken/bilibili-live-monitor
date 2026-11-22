@@ -91,7 +91,11 @@ def prepare(config):
 
 
 def merge(config):
+    from .cursor_finalize import require_stopped
+
     root = Path(config['workspace']) / 'finalize'
+    if any(root.glob('*.reviewed-acceptance.json')):
+        require_stopped(config, 'finalize')
     plan = json.loads((root / 'plan.json').read_text())
     assert_frozen(config, plan)
     source = {s['seq']: s for s in frozen_source(config)[2]}
@@ -194,7 +198,7 @@ def submit(config, session, on_handoff=lambda: None):
 歌曲目录从只读礼物流水按实际内容区间和礼物事件时间计算件数、去重送礼人数与平台金额，不延长到片段前后，不把缺口或内容冲突归给歌曲。你只负责准确歌名与内容边界；识别窗口只作证据，不手算金额、不改礼物流水、不把片段内礼物解释为歌曲导致。当前声源分类不能可靠区分主播演唱和播放音乐，不向用户宣称已经区分。
 读取{Path(__file__).resolve().parents[2] / 'skills/bilibili-live-monitor/live-share.md'}的歌名来源登记规则。
 新歌名复用已有来源，不足时查公开歌名或短歌词，每次最多6条搜索结果；不向搜索引擎发送昵称、UID、完整转写。用live-share register-song命令登记来源，不改白名单。
-由总会话逐项审核各分片correction_candidates，并结合新查到的来源回看较早窗口。有充分依据的校正原子合并到本场transcript_corrections.json，以当前离线seq+fingerprint为准；保留旧记录，不把实时稿校正按序号直接套用，也不修改冻结输入。
+纠错是可选项。仅采用证据充分的局部校正；不确定就保留原稿，声源或歌名证据不足就保留未知，不因此退回完整分片。采用的校正原子合并到本场transcript_corrections.json，以当前离线seq+fingerprint为准；不修改冻结输入。
 校正后运行：{command} corrections {flag}。它会验证当前原稿与来源并列出active、rejected和needs_review。对needs_review逐项重审歌名、唱聊及声源判断，再在annotations.reviews保存对应原始fingerprint与当前correction_id；撤销校正后须重审原稿并移除旧ID。不能只补ID而不重审。无根据的候选保留不确定，不强行改字。
 最后运行：{command} finish {flag}。若报缺失或未登记歌曲，在本会话解决后重试finish，成功后报告“AI复核完成，等待程序发布最终页”，不把AI完成说成页面已经发布。
 后台子任务尚未结束时不能finish，也不能把等待回执时的idle当作总任务结束。不要创建定时任务，不发直播消息，不访问凭据或控制API。
