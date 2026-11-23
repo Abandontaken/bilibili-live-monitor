@@ -126,6 +126,72 @@ def test_crm_full_concurrency_waits_until_a_candidate_is_ready(tmp_path):
     assert actionable_work(tmp_path, 'plan', 'native_worker') == ([], [], 2)
 
 
+def test_music_wakes_only_when_candidate_arrives_and_survives_old_limit(tmp_path, monkeypatch):
+    root = tmp_path / 'finalize'
+    workers = root / 'cursor_workers'
+    workers.mkdir(parents=True)
+    result = root / '000.result.json'
+    receipt = workers / '000.json'
+    (root / 'plan.json').write_text(json.dumps({'id': 'plan', 'concurrency': 1, 'shards': [
+        {'input': str(root / '000.input.json'), 'result': str(result)}]}))
+    receipt.write_text(json.dumps({'state': 'running', 'plan_id': 'plan', 'token': 'original'}))
+    (root / 'supervision.json').write_text(json.dumps({'attempts': 3, 'last_wake_at': 0}))
+    config = {'workspace': str(tmp_path), 'final_subagent': 'grok_build_cli', 'model': 'synthetic/model',
+              'opencode_python': 'python', 'opencode_cwd': str(tmp_path)}
+    calls = []
+    monkeypatch.setattr(lifecycle, 'ai_control', lambda c, op, **kw: True if op == 'submitted' else {'type': 'idle'})
+    monkeypatch.setattr(lifecycle.subprocess, 'run', lambda *a, **kw:
+                        calls.append(a) or SimpleNamespace(returncode=0, stdout='', stderr=''))
+    for now in (300, 600, 900, 1200):
+        lifecycle.supervise(config, {}, 'same', root, now, actionable=lambda: lifecycle.music_work(root))
+    assert not calls
+    receipt.write_text(json.dumps({'state': 'awaiting_coordinator_review', 'plan_id': 'plan', 'token': 'original'}))
+    (workers / '000.result.json').write_text('{}')
+    lifecycle.supervise(config, {}, 'same', root, 1500, actionable=lambda: lifecycle.music_work(root))
+    assert len(calls) == 1
+    assert 'review:000:original' in (root / 'resume_prompt.md').read_text()
+    result.write_text('{}')
+    receipt.write_text(json.dumps({'state': 'accepted', 'plan_id': 'plan', 'token': 'original'}))
+    lifecycle.supervise(config, {}, 'same', root, 1800, actionable=lambda: lifecycle.music_work(root))
+    assert len(calls) == 2
+    assert 'finish:plan' in (root / 'resume_prompt.md').read_text()
+
+
+def test_manual_publication_reserve_preserves_expired_dispatch_budget(tmp_path, monkeypatch):
+    config = {'workspace': str(tmp_path), 'finalize_parallel': True}
+    state = {'stage': 'offline_review', 'finish_deadline': 1}
+    session_runner.pause_budget(state, 10)
+    monkeypatch.setattr(session_finalize, 'complete', lambda c: False)
+    with pytest.raises(ValueError, match='完成凭证'):
+        session_runner.resume_paused_music_publication(config, state, 11)
+    assert state['stage'] == 'attention'
+    monkeypatch.setattr(session_finalize, 'complete', lambda c: True)
+    session_runner.resume_paused_music_publication(config, state, 12)
+    assert state['publication_resume']['previous_pause']['stage'] == 'offline_review'
+    assert state['stage'] == 'finalizing' and state['publication_deadline'] == 612
+    with pytest.raises(BudgetPaused):
+        check_budget(config, state, now=13)
+    check_budget(config, state, now=611, publication=True)
+    with pytest.raises(BudgetPaused):
+        check_budget(config, state, now=612, publication=True)
+    session_runner.pause_budget(state, 612)
+    with pytest.raises(ValueError):
+        session_runner.resume_paused_music_publication(config, state, 613)
+
+
+def test_publication_restart_refuses_changed_destination(tmp_path, monkeypatch):
+    config = {'workspace': str(tmp_path), 'remote': 'synthetic:/original'}
+    state = {'stage': 'finalizing', 'publication_resume': {
+        'config_sha256': session_runner.publication_config_digest(config)}}
+    path = tmp_path / 'workflow.json'
+    path.write_text(json.dumps(state))
+    versions = iter([config, dict(config, remote='synthetic:/changed')])
+    monkeypatch.setattr(session_runner, 'load_config', lambda p: next(versions))
+    monkeypatch.setattr(session_runner, 'advance', lambda *a: pytest.fail('不得推进发布'))
+    assert session_runner.run(tmp_path / 'config.json') == 1
+    assert json.loads(path.read_text())['last_error'] == '发布恢复配置已变更'
+
+
 def test_reserve_reaches_advance_without_reopening_dispatch(tmp_path, monkeypatch):
     config = {'workspace': str(tmp_path), 'finalize_parallel': True}
     state = {'stage': 'offline_review', 'finish_deadline': 1, 'final_session': 'coordinator'}

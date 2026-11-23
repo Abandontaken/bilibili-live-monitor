@@ -249,8 +249,11 @@ def advance(config, state, now):
                 session_finalize.finish(config)
                 state['stage'] = 'finalizing'
             else:
-                from .finalize_lifecycle import supervise
-                supervise(config, state, state['final_session'], workspace / 'finalize', now)
+                from .finalize_lifecycle import music_work, supervise
+                root = workspace / 'finalize'
+                actionable = (lambda: music_work(root)) if config.get('final_subagent') in (
+                    'grok_build_cli', 'cursor_cli_grok') else None
+                supervise(config, state, state['final_session'], root, now, actionable=actionable)
             return
         if ai_control(config, 'status', session=state['final_session']).get('type') in ('busy', 'retry'):
             return
@@ -320,7 +323,7 @@ def advance(config, state, now):
         state.update(stage='completed', completed_at=iso(now), last_error=None, ready=True)
 
 
-def run(path):
+def run(path, *, resume_publication=False):
     config = load_config(path)
     from .deployment import MaintenancePaused, check_task
     check_task(config)
@@ -330,6 +333,9 @@ def run(path):
         fcntl.flock(publisher, fcntl.LOCK_EX | fcntl.LOCK_NB)
         status_path = workspace / 'workflow.json'
         state = json.loads(status_path.read_text()) if status_path.exists() else {'stage': 'created'}
+        if resume_publication:
+            resume_paused_music_publication(config, state, time.time())
+        publication_only = bool(state.get('publication_resume'))
         state['runner_runtime'] = {'pid': os.getpid(),
             'code_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
             'cursor_worker_sha256': hashlib.sha256(Path(__file__).with_name('cursor_finalize.py').read_bytes()).hexdigest(),
@@ -343,6 +349,11 @@ def run(path):
                 return 0  # 维护停止不更改业务阶段，也不发布attention页。
             started = time.time()
             config = load_config(path)
+            if publication_only and (state['stage'] != 'finalizing'
+                    or state['publication_resume']['config_sha256'] != publication_config_digest(config)):
+                state.update(stage='attention', last_error='发布恢复配置已变更', updated_at=iso(started))
+                atomic_json(status_path, state)
+                break
             try:
                 publication_ready(config, state, started)
                 check_budget(config, state, now=started, publication=state.get('stage') == 'finalizing')
@@ -350,7 +361,7 @@ def run(path):
                 pause_budget(state, started)
                 atomic_json(status_path, state)
                 break
-            if started >= next_health_check:
+            if not publication_only and started >= next_health_check:
                 from .session_health import ensure_scheduled
                 try:
                     ensure_scheduled(config, delay=1)
@@ -388,10 +399,11 @@ def run(path):
                         stopped = False
                     if stopped:
                         state['stage'] = 'attention'
-                        try:
-                            mark_attention(config)
-                        except Exception as publication_error:
-                            state['attention_publish_error'] = type(publication_error).__name__
+                        if not publication_only:
+                            try:
+                                mark_attention(config)
+                            except Exception as publication_error:
+                                state['attention_publish_error'] = type(publication_error).__name__
             state['updated_at'] = iso(time.time())
             atomic_json(status_path, state)
             if state['stage'] not in ('completed', 'attention'):
@@ -410,7 +422,34 @@ def pause_budget(state, now):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=Path, required=True)
-    return run(parser.parse_args().config.resolve())
+    parser.add_argument('--resume-publication', action='store_true', help='恢复已暂停且本地终审完成的音乐场次发布')
+    args = parser.parse_args()
+    return run(args.config.resolve(), resume_publication=args.resume_publication)
+
+
+def publication_config_digest(config):
+    return hashlib.sha256(json.dumps(config, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def resume_paused_music_publication(config, state, now):
+    from .cursor_finalize import require_stopped
+    from .deployment import require_running
+    from .session_finalize import complete
+
+    require_running('sessions')
+    pause = state.get('automation_paused') or {}
+    if (state.get('stage') != 'attention' or pause.get('reason') != 'finish_timeout'
+            or pause.get('stage') not in ('offline_review', 'finalizing')
+            or not config.get('finalize_parallel') or config.get('content_mode', 'music') != 'music'
+            or config.get('audience_crm_config') or state.get('publication_resume')
+            or state.get('finish_deadline', float('inf')) > now):
+        raise ValueError('本场不符合一次性音乐发布恢复条件')
+    require_stopped(config, 'finalize')
+    if not complete(config):
+        raise ValueError('缺少匹配当前输入的终审完成凭证')
+    state['publication_resume'] = {'at': iso(now), 'previous_pause': state.pop('automation_paused'),
+                                   'config_sha256': publication_config_digest(config)}
+    state.update(stage='finalizing', publication_deadline=now + 600, last_error=None, consecutive_errors=0)
 
 
 def publication_ready(config, state, now):

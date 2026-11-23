@@ -206,16 +206,42 @@ def music_candidate(text):
     """Read a single top-level JSON object, allowing surrounding progress prose."""
     if not isinstance(text, str):
         raise ValueError('缺少音乐候选文本')
+    def unique_keys(pairs):
+        out = {}
+        for key, value in pairs:
+            if key in out:
+                raise ValueError('音乐候选有重复字段')
+            out[key] = value
+        return out
+
+    def decode(value):
+        return json.loads(value, object_pairs_hook=unique_keys)
+
+    def safe_prose(value):
+        if re.search(r'[{}\[\]]', value):
+            return False
+        for line in value.splitlines():
+            try:
+                json.loads(line)
+            except ValueError:
+                continue
+            return False
+        return True
+
     try:
-        return json.loads(text)
+        return decode(text)
     except ValueError:
+        if '```' not in text:
+            start = text.find('{')
+            if start > 0 and safe_prose(text[:start]):
+                return decode(text[start:])  # 要求唯一、完整的 JSON，且无尾随内容。
         blocks = list(re.finditer(r'(?m)^```(?:json)?[ \t]*\r?\n(.*?)^```[ \t]*$', text, re.DOTALL))
         if len(blocks) != 1 or text.count('```') != 2:
             raise ValueError('音乐输出须为JSON或一个独立JSON代码块') from None
         block = blocks[0]
-        if re.search(r'[{}\[\]]', text[:block.start()] + text[block.end():]):
+        if not (safe_prose(text[:block.start()]) and safe_prose(text[block.end():])):
             raise ValueError('音乐JSON代码块外还有结构化内容') from None
-        return json.loads(block[1])
+        return decode(block[1])
 
 
 def group_exists(pgid):
@@ -334,7 +360,10 @@ def worker(config, kind, shard_id, token):
                 result = json.loads(stdout.read_text())
             except (ValueError, UnicodeError):
                 result = None
+                state['error'] = 'invalid_cli_envelope'
             success = grok_receipt(result, state)
+            if not success:
+                state.setdefault('error', 'invalid_cli_terminal_receipt')
             if code == 0 and success:
                 try:
                     text = result.get('text') or ''
@@ -342,6 +371,8 @@ def worker(config, kind, shard_id, token):
                 except (ValueError, TypeError):
                     candidate = None
                 success = isinstance(candidate, dict) and bool(candidate)
+                if not success:
+                    state['error'] = 'invalid_candidate_json'
                 if success:
                     try:
                         validate_candidate(root, plan, shard, kind, candidate)
