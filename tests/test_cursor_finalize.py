@@ -51,7 +51,16 @@ def test_accept_reviewed_music_preserves_worker_and_refuses_changed_output(tmp_p
 
 
 def test_music_candidate_allows_prose_but_rejects_ambiguous_objects():
+    assert cursor.music_candidate('正在核对证据。\n\n{"seq": 9223372036854775807}') == {'seq': 9223372036854775807}
     assert cursor.music_candidate('已完成\n```json\n{\n"plan_id": "first"\n}\n```') == {'plan_id': 'first'}
+    with pytest.raises(ValueError):
+        cursor.music_candidate('已检查\n{"reviews": [')
+    with pytest.raises(ValueError):
+        cursor.music_candidate('已检查\n{}\n{}')
+    with pytest.raises(ValueError):
+        cursor.music_candidate('已检查\nnull\n{}')
+    with pytest.raises(ValueError):
+        cursor.music_candidate('{"plan_id": "a", "plan_id": "b"}')
     with pytest.raises(ValueError, match='独立'):
         cursor.music_candidate('{}\n{}')
     with pytest.raises(ValueError, match='结构化内容'):
