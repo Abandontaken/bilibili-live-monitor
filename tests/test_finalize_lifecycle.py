@@ -166,6 +166,8 @@ def test_manual_publication_reserve_preserves_expired_dispatch_budget(tmp_path, 
         session_runner.resume_paused_music_publication(config, state, 11)
     assert state['stage'] == 'attention'
     monkeypatch.setattr(session_finalize, 'complete', lambda c: True)
+    (tmp_path / 'finalize').mkdir()
+    (tmp_path / 'finalize/completed.json').write_text('{}')
     session_runner.resume_paused_music_publication(config, state, 12)
     assert state['publication_resume']['previous_pause']['stage'] == 'offline_review'
     assert state['stage'] == 'finalizing' and state['publication_deadline'] == 612
@@ -177,6 +179,21 @@ def test_manual_publication_reserve_preserves_expired_dispatch_budget(tmp_path, 
     session_runner.pause_budget(state, 612)
     with pytest.raises(ValueError):
         session_runner.resume_paused_music_publication(config, state, 613)
+
+
+def test_publication_refuses_receipt_invalidated_during_drain(tmp_path, monkeypatch):
+    config = {'workspace': str(tmp_path), 'finalize_parallel': True, 'ai_enabled': True}
+    state = {'stage': 'offline_review', 'finish_deadline': 1, 'final_session': 'coordinator'}
+    session_runner.pause_budget(state, 10)
+    (tmp_path / 'finalize').mkdir()
+    (tmp_path / 'finalize/completed.json').write_text('{}')
+    valid = [True]
+    monkeypatch.setattr(session_finalize, 'complete', lambda c: valid[0])
+    session_runner.resume_paused_music_publication(config, state, 12)
+    monkeypatch.setattr(lifecycle, 'drain', lambda *a, **kw: valid.__setitem__(0, False) or True)
+    monkeypatch.setattr(session_finalize, 'finish', lambda c: pytest.fail('不得重建凭证'))
+    with pytest.raises(ValueError, match='终审凭证已变更'):
+        session_runner.advance(config, state, 132)
 
 
 def test_publication_restart_refuses_changed_destination(tmp_path, monkeypatch):

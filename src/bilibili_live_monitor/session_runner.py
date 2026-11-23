@@ -294,8 +294,13 @@ def advance(config, state, now):
             if not talk_finalize.complete(config):
                 raise ValueError('杂谈精修尚未完整入库，不能发布')
         if uses_ai and not drain(config, state, state.get('final_session'), now,
-                                 children=config.get('finalize_parallel', False)):
+                                  children=config.get('finalize_parallel', False)):
             return
+        if state.get('publication_resume'):
+            from .session_finalize import complete
+            if (not complete(config) or state['publication_resume']['receipt_sha256']
+                    != publication_receipt_digest(config)):
+                raise ValueError('发布恢复的终审凭证已变更')
         if uses_ai and config.get('finalize_parallel'):
             from .session_finalize import finish
             finish(config)  # 所有写入者停止后，重验实际待发布内容。
@@ -431,6 +436,10 @@ def publication_config_digest(config):
     return hashlib.sha256(json.dumps(config, sort_keys=True, default=str).encode()).hexdigest()
 
 
+def publication_receipt_digest(config):
+    return hashlib.sha256((Path(config['workspace']) / 'finalize' / 'completed.json').read_bytes()).hexdigest()
+
+
 def resume_paused_music_publication(config, state, now):
     from .cursor_finalize import require_stopped
     from .deployment import require_running
@@ -448,7 +457,8 @@ def resume_paused_music_publication(config, state, now):
     if not complete(config):
         raise ValueError('缺少匹配当前输入的终审完成凭证')
     state['publication_resume'] = {'at': iso(now), 'previous_pause': state.pop('automation_paused'),
-                                   'config_sha256': publication_config_digest(config)}
+                                   'config_sha256': publication_config_digest(config),
+                                   'receipt_sha256': publication_receipt_digest(config)}
     state.update(stage='finalizing', publication_deadline=now + 600, last_error=None, consecutive_errors=0)
 
 
