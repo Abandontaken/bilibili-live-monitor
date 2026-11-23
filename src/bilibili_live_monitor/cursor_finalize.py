@@ -2,6 +2,7 @@
 import argparse
 import errno
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -201,6 +202,22 @@ def grok_receipt(result, state):
             and state['observed_models'] == ['grok-4.7-build'])
 
 
+def music_candidate(text):
+    """Read a single top-level JSON object, allowing surrounding progress prose."""
+    if not isinstance(text, str):
+        raise ValueError('缺少音乐候选文本')
+    try:
+        return json.loads(text)
+    except ValueError:
+        blocks = list(re.finditer(r'(?m)^```(?:json)?[ \t]*\r?\n(.*?)^```[ \t]*$', text, re.DOTALL))
+        if len(blocks) != 1 or text.count('```') != 2:
+            raise ValueError('音乐输出须为JSON或一个独立JSON代码块') from None
+        block = blocks[0]
+        if re.search(r'[{}\[\]]', text[:block.start()] + text[block.end():]):
+            raise ValueError('音乐JSON代码块外还有结构化内容') from None
+        return json.loads(block[1])
+
+
 def group_exists(pgid):
     """EPERM可能是权限或系统边界；只在完整进程表证实空组时认为已退出。"""
     try:
@@ -320,7 +337,8 @@ def worker(config, kind, shard_id, token):
             success = grok_receipt(result, state)
             if code == 0 and success:
                 try:
-                    candidate = json.loads(result.get('text') or '')
+                    text = result.get('text') or ''
+                    candidate = music_candidate(text) if kind == 'finalize' else json.loads(text)
                 except (ValueError, TypeError):
                     candidate = None
                 success = isinstance(candidate, dict) and bool(candidate)
@@ -438,7 +456,29 @@ def validate_candidate(root, plan, shard, kind, payload):
     return payload
 
 
-def accept(config, kind, shard_id):
+def _sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _check_music_worker(state, plan, shard_id):
+    if (state.get('state') not in ('failed', 'interrupted', 'awaiting_coordinator_review')
+            or state.get('plan_id') != plan['id'] or state.get('shard') != shard_id
+            or not state.get('ended_at') or (state.get('pgid') and group_exists(state['pgid']))):
+        raise ValueError('原音乐分片身份不符或写入进程尚未退出')
+
+
+def _check_reviewed_acceptance(receipt, path, plan, shard):
+    saved = json.loads(receipt.read_text())
+    _check_music_worker(json.loads(path.read_text()), plan, path.stem)
+    if (saved.get('backend') != 'reviewed_recovery' or saved.get('state') != 'accepted'
+            or saved.get('plan_id') != plan['id'] or saved.get('receipt_sha256') != _sha(path)
+            or saved.get('input_sha256') != _sha(Path(shard['input']))
+            or saved.get('result_sha256') != _sha(Path(shard['result']))):
+        raise ValueError('人工接纳证据已变化：' + path.stem)
+    return saved
+
+
+def accept(config, kind, shard_id, reviewed_candidate=None):
     """总协调完成语义审查后调用；程序再验回执、输入身份与基本覆盖。"""
     root, plan, shard = context(config, kind, shard_id)
     runs = root / 'cursor_workers'
@@ -446,6 +486,34 @@ def accept(config, kind, shard_id):
     with (runs / f'{shard_id}.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         path = runs / f'{shard_id}.json'
+        receipt = root / f'{shard_id}.reviewed-acceptance.json'
+        if kind == 'finalize' and receipt.exists() and (Path(shard['result']).exists() or reviewed_candidate is None):
+            saved = _check_reviewed_acceptance(receipt, path, plan, shard)
+            if reviewed_candidate is not None and json.loads(reviewed_candidate.read_text()) != json.loads(Path(shard['result']).read_text()):
+                raise ValueError('已存在不同的人工接纳结果')
+            return saved
+        if reviewed_candidate is not None:
+            if kind != 'finalize':
+                raise ValueError('人工候选接纳仅适用于音乐终审')
+            state = json.loads(path.read_text())
+            _check_music_worker(state, plan, shard_id)
+            payload = validate_candidate(root, plan, shard, kind, json.loads(reviewed_candidate.read_text()))
+            if any(r.get('confidence', 'low') not in ('high', 'medium', 'low')
+                   or (r.get('song') is not None and not isinstance(r['song'], str)) for r in payload['reviews']):
+                raise ValueError('歌名或confidence格式无效')
+            output = Path(shard['result'])
+            if output.exists() and json.loads(output.read_text()) != payload:
+                raise ValueError('已存在不同的正式结果')
+            encoded = json.dumps(payload, ensure_ascii=False, separators=(',', ':')).encode()
+            record = {'state': 'accepted', 'backend': 'reviewed_recovery', 'plan_id': plan['id'],
+                      'receipt_sha256': _sha(path), 'input_sha256': _sha(Path(shard['input'])),
+                      'result_sha256': _sha(output) if output.exists() else hashlib.sha256(encoded).hexdigest()}
+            if receipt.exists() and json.loads(receipt.read_text()) != record:
+                raise ValueError('已存在不同的人工接纳记录')
+            atomic_json(receipt, record)
+            if not output.exists():
+                atomic_json(output, payload)
+            return record
         legacy = not path.exists() and Path(shard['result']).exists()
         state = ({'backend': 'legacy_result', 'plan_id': plan['id']}
                  if legacy else json.loads(path.read_text()))
@@ -468,15 +536,23 @@ def require_stopped(config, kind):
 
 
 def require_run_stopped(root):
-    runs = Path(root) / 'cursor_workers'
+    root = Path(root)
+    runs = root / 'cursor_workers'
     for path in runs.glob('*.json'):
         if not path.stem.isdigit():
             continue
-        state = json.loads(path.read_text())
-        if state.get('state') != 'accepted':
-            raise ValueError('Cursor分片未完成验收，不能finish：' + path.stem)
         with path.with_suffix('.lock').open('a') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            state = json.loads(path.read_text())
+            receipt = root / f'{path.stem}.reviewed-acceptance.json'
+            if root.name == 'finalize' and receipt.exists():
+                plan = json.loads((root / 'plan.json').read_text())
+                shard = next((s for s in plan['shards'] if Path(s['input']).stem == f'{path.stem}.input'), None)
+                if shard is None:
+                    raise ValueError('人工接纳分片不在冻结计划：' + path.stem)
+                _check_reviewed_acceptance(receipt, path, plan, shard)
+            elif state.get('state') != 'accepted':
+                raise ValueError('Cursor分片未完成验收，不能finish：' + path.stem)
 
 
 def reconcile_worker(config, kind, shard_id):
@@ -583,7 +659,9 @@ def coordinator_prompt(config, prompt, root):
     else:
         prompt = prompt.replace(f"再用task分发给{plan['subagent']}，最多同时{plan['concurrency']}片。", '分片使用Cursor CLI执行。')
         prompt = prompt.replace('所有task实际结束', '所有Cursor进程实际退出')
-    final_steps = ('最终逐条检查纠错候选真实引文、跨片歌名及边界，拒绝官方歌词替代改词/漏听。所有Cursor已退出后继续原合同的merge、来源登记、corrections逐条重审、正常finish。'
+    final_steps = ('可选纠错拿不准就不采用，歌名或声源证据不足就保留未知，不因这些疑点整片退回。'
+                   '已人工审核修复的音乐候选，可对已退出分片调用 accept --reviewed-candidate <JSON>；保留原回执。'
+                   '合并后按原合同完成已采用的校正重审、来源登记与finish。'
                    if kind == 'finalize' else
                    '最终逐条检查校正真实引文、覆盖和跨片用词一致性，保留未确定内容。所有Cursor已退出后仅按原合同执行talk_finalize finish，不执行音乐merge、歌曲来源登记或corrections。')
     from .deployment import task_command
@@ -596,7 +674,7 @@ def coordinator_prompt(config, prompt, root):
 进度和回执在{root / 'cursor_workers'}的逐片JSON、stdout.jsonl、stderr.log；stream init含CLI session_id。用短工具读日志/结果并更新可见todo，不把长前台CLI塞进短bash，不用sleep占满工具预算。程序负责同会话回访，不创建临时脚本或定时任务。
 明确failed/interrupted的片，先确认无前次写入者，可将start改为retry（其他参数不变）；程序锁定分片、拒绝尚存进程组、归档旧证据，最多两次恢复，优先--resume原CLI UUID且模型不变。发送不明不使用retry；已成功但内容有疑点先报告，由你按原证据保守审核，不能把失败文件手工转正。
 每片45分钟，Launcher留清理余量；非零退出、模型/认证错误或无success回执不能当成功。只允许同模型有界人工检查恢复，不自动降级。文件存在、日志增长或进程存活不等于有效进展。
-你必须逐片核对退出码0、最终result/success/is_error=false、目标覆盖、plan_id/fingerprint和内容语义后，调用同一CLI的accept操作（将start改为accept，其他参数不变）验收转正；不能直接复制文件或自行修改回执。worker不直接写生产结果。
+常规接纳须核对退出码0、最终result/success/is_error=false、目标覆盖、plan_id/fingerprint和内容语义，再调用同一CLI的accept操作；音乐人工修复走下述单独入口。worker不直接写生产结果。
 迁移例外：plan指定的旧result已存在且无Cursor回执时不重跑。逐片按原合同核验覆盖/指纹和内容后也调用accept，程序记录backend=legacy_result，明确沿用旧来源，不编造Cursor退出码/session/success。旧结果的最终全量验证仍由原merge/finish承担。
 {final_steps}完成标记由finish生成，不能伪造。然后报告程序下游状态，不将AI完成误报为页面发布完成。
 '''
@@ -615,7 +693,10 @@ def main():
     parser.add_argument('--kind', required=True, choices=KINDS)
     parser.add_argument('--shard', required=True)
     parser.add_argument('--token')
+    parser.add_argument('--reviewed-candidate', type=Path)
     args = parser.parse_args()
+    if args.reviewed_candidate is not None and (args.action != 'accept' or args.kind != 'finalize'):
+        parser.error('--reviewed-candidate 仅用于音乐终审 accept')
     config = load_config(args.config)
     from .deployment import check_task, require_running
     component = 'crm' if args.kind == 'audience_finalize' else 'sessions'
@@ -624,6 +705,8 @@ def main():
     check_task(config, component)
     if args.action == 'worker':
         value = worker(config, args.kind, args.shard, args.token)
+    elif args.action == 'accept':
+        value = accept(config, args.kind, args.shard, args.reviewed_candidate)
     else:
         value = {'start': launch, 'accept': accept, 'retry': retry}[args.action](config, args.kind, args.shard)
     print(json.dumps(value, ensure_ascii=False))

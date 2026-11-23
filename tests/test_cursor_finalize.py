@@ -23,6 +23,41 @@ def setup(tmp_path, kind='finalize'):
     return config, plan, root
 
 
+def test_accept_reviewed_music_preserves_worker_and_refuses_changed_output(tmp_path, monkeypatch):
+    config, plan, root = setup(tmp_path)
+    shard = plan['shards'][0]
+    source = json.loads(Path(shard['input']).read_text())
+    candidate = tmp_path / 'reviewed.json'
+    atomic_json(candidate, {'plan_id': plan['id'], 'reviews': [
+        dict(seq=w['seq'], fingerprint=w['fingerprint'], label='speaking',
+             music_source='none', investigation_version=2)
+        for w in source['windows'] if w['seq'] in source['target_seqs']]})
+    runs = root / 'cursor_workers'
+    runs.mkdir(exist_ok=True)
+    path = runs / '000.json'
+    atomic_json(path, {'plan_id': plan['id'], 'state': 'failed', 'shard': '000', 'ended_at': 1, 'pgid': 400})
+    original = path.read_bytes()
+    monkeypatch.setattr(cursor, 'group_exists', lambda _: True)
+    with pytest.raises(ValueError, match='写入进程'):
+        cursor.accept(config, 'finalize', '000', candidate)
+    monkeypatch.setattr(cursor, 'group_exists', lambda _: False)
+    assert cursor.accept(config, 'finalize', '000', candidate)['state'] == 'accepted'
+    assert cursor.accept(config, 'finalize', '000')['backend'] == 'reviewed_recovery'
+    cursor.require_run_stopped(root)
+    assert path.read_bytes() == original
+    atomic_json(Path(shard['result']), {})
+    with pytest.raises(ValueError, match='证据已变化'):
+        cursor.require_run_stopped(root)
+
+
+def test_music_candidate_allows_prose_but_rejects_ambiguous_objects():
+    assert cursor.music_candidate('已完成\n```json\n{\n"plan_id": "first"\n}\n```') == {'plan_id': 'first'}
+    with pytest.raises(ValueError, match='独立'):
+        cursor.music_candidate('{}\n{}')
+    with pytest.raises(ValueError, match='结构化内容'):
+        cursor.music_candidate('{}\n```json\n{}\n```')
+
+
 @pytest.mark.parametrize('pause_call', [1, 2])
 def test_maintenance_before_cursor_start_is_recoverable(tmp_path, monkeypatch, pause_call):
     from bilibili_live_monitor import deployment
