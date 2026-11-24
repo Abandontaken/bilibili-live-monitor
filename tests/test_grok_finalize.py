@@ -77,15 +77,20 @@ def test_native_crm_idle_wake_names_frozen_agent(tmp_path, monkeypatch):
     (0, 'valid', 'grok-4.7-build-fast', False),
     (0, '{"reviews": []}', 'grok-4.7-build', False),
 ])
-def test_worker_writes_candidate_only_for_valid_grok_run(tmp_path, monkeypatch, code, text, model, ready):
-    config, plan, root = setup(tmp_path)
+@pytest.mark.parametrize('kind', ['finalize', 'talk_finalize'])
+def test_worker_writes_candidate_only_for_valid_grok_run(tmp_path, monkeypatch, code, text, model, ready, kind):
+    config, plan, root = setup(tmp_path, kind)
     inputs = json.loads((root / '000.input.json').read_text())
     if text == 'valid':
-        text = json.dumps({'plan_id': plan['id'], 'reviews': [
+        text = '我先读取分片。\n\n' + json.dumps({'plan_id': plan['id'], 'reviews': [
             {'seq': w['seq'], 'fingerprint': w['fingerprint'], 'correction_id': w.get('correction_id'),
-             'investigation_version': 2, 'label': 'speaking', 'music_source': 'none'}
+             'investigation_version': 2, 'label': 'speaking', 'music_source': 'none',
+             'corrected_text': w['text'], 'reason': '保留原文'}
             for w in inputs['windows'] if w['seq'] in inputs['target_seqs']]})
     config['final_subagent'] = finalize.GROK_BACKEND
+    if kind == 'talk_finalize':
+        plan['subagent'] = finalize.GROK_BACKEND
+        (root / 'plan.json').write_text(json.dumps(plan))
     monkeypatch.setattr(finalize, 'post', lambda *_: {'pid': 123, 'diagnose_on_failure': False})
     monkeypatch.setattr(finalize, 'stop_group', lambda _: None)
     monkeypatch.setenv('XAI_API_KEY', 'fake-should-not-be-inherited')
@@ -104,7 +109,7 @@ def test_worker_writes_candidate_only_for_valid_grok_run(tmp_path, monkeypatch, 
             return self.returncode
 
     monkeypatch.setattr(finalize.subprocess, 'Popen', AgentProcess)
-    first = finalize.launch(config, 'finalize', '000')
-    result = finalize.worker(config, 'finalize', '000', first['token'])
+    first = finalize.launch(config, kind, '000')
+    result = finalize.worker(config, kind, '000', first['token'])
     assert result['state'] == ('awaiting_coordinator_review' if ready else 'failed')
     assert (root / 'cursor_workers/000.result.json').exists() == ready
