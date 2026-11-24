@@ -14,6 +14,42 @@ CRM_MAX_WAKES = 10
 CRM_RETRY_INTERVAL = 900
 
 
+def music_work(root):
+    from .cursor_finalize import group_exists, maintenance_adapter_stopped
+
+    plan = json.loads((root / 'plan.json').read_text())
+    runs = root / 'cursor_workers'
+    ready, dispatchable, active, accepted = [], [], 0, 0
+    for shard in plan['shards']:
+        name = Path(shard['input']).name.removesuffix('.input.json')
+        receipt = runs / f'{name}.json'
+        result = Path(shard['result']).is_file()
+        if not receipt.exists():
+            if result:
+                ready.append(f'review:{name}:legacy')
+            elif not (runs / 'stop.json').exists():
+                dispatchable.append(f'start:{name}')
+            continue
+        worker = json.loads(receipt.read_text())
+        if worker.get('plan_id') != plan['id'] or worker.get('shard', name) != name:
+            continue
+        status, token = worker.get('state'), worker.get('token')
+        if result and (status == 'accepted' or (root / f'{name}.reviewed-acceptance.json').is_file()):
+            accepted += 1
+        elif status == 'awaiting_coordinator_review' and (runs / f'{name}.result.json').is_file():
+            ready.append(f'review:{name}:{token}')
+        elif (not result and not (runs / 'stop.json').exists()
+              and ((status in ('failed', 'interrupted') and len(list((runs / 'history' / name).glob('*'))) < 2
+                    and not (worker.get('pgid') and group_exists(worker['pgid'])))
+                   or (status == 'maintenance_paused_before_start' and maintenance_adapter_stopped(worker)))):
+            dispatchable.append(f'retry:{name}:{token}')
+        elif status in ('submitting', 'starting', 'running', 'cleanup_failed'):
+            active += 1
+    if accepted == len(plan['shards']):
+        ready.append(f'finish:{plan["id"]}')
+    return ready, dispatchable, max(0, min(10, plan['concurrency']) - active)
+
+
 def drain(config, state, session, now, *, key='final_cleanup', children=True):
     from .session_runner import stop_ai
     if not session:
@@ -44,28 +80,29 @@ def supervise(config, state, session, root, now, *, key='coordinator_watch', act
         watch['delivery'] = 'verified_in_session'
         atomic_json(journal, watch)
     crm = key == 'audience_watch'
+    by_action = actionable is not None
     interval = CRM_WAKE_INTERVAL if crm else WAKE_INTERVAL
     if now - watch['last_wake_at'] < interval:
         return
     if now - watch.get('last_check_at', -float('inf')) < (interval if crm else 60):
         return
     watch['last_check_at'] = now
-    ready, dispatchable, capacity = actionable() if crm and actionable is not None else ([], [], 0)
-    if crm and not (ready or (capacity and dispatchable)):
+    ready, dispatchable, capacity = actionable() if by_action else ([], [], 0)
+    if by_action and not (ready or (capacity and dispatchable)):
         watch['decision'] = 'waiting_for_actionable_work'
         atomic_json(journal, watch)
         return
     status = ai_control(config, 'status', session=session).get('type')
     watch['observed_status'] = status
-    if (crm and status != 'idle') or status in ('busy', 'retry'):
+    if ((crm or by_action) and status != 'idle') or status in ('busy', 'retry'):
         atomic_json(journal, watch)
         return
     check_budget(config, state)
-    if watch['attempts'] >= (CRM_MAX_WAKES if crm else MAX_WAKES):
+    if (crm or not by_action) and watch['attempts'] >= (CRM_MAX_WAKES if crm else MAX_WAKES):
         watch['delivery'] = 'wake_limit_reached'
         atomic_json(journal, watch)
         return
-    if crm:
+    if by_action:
         action_wakes = watch.get('action_wakes', {})
         actions = ready + (dispatchable if capacity else [])
 
@@ -104,7 +141,7 @@ def supervise(config, state, session, root, now, *, key='coordinator_watch', act
         if key == 'audience_watch' else
         f'沿用原输入、原模型和已有分片结果。\n检查分片进度，未完成分片通过task派发给plan.json指定的subagent写入对应result路径，核验覆盖与指纹后{finish_steps}。'
     )
-    if crm and uses_cli:
+    if by_action and uses_cli:
         review_line += ('\n本次仅处理以下到期待办（末段 token 用于区分尝试，分片序号补零）：'
                         + ', '.join(eligible) + '。不派发或重试清单以外的分片，不重试回执不明的派发。')
     prompt = root / 'resume_prompt.md'

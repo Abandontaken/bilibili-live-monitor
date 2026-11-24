@@ -165,6 +165,8 @@ def worker_prompt(config, root, shard, output, kind='finalize', *, read_only=Fal
     if not read_only:
         destination = (f'唯一结果路径 {output}，检查点 {output.with_suffix(".checkpoint.json")}。'
                        '每10–20条保存已完成条目，最后完整结果原子写入结果路径。')
+    elif kind == 'talk_finalize':
+        destination += '读取前后直接调用工具，不发进度说明。整轮唯一可见文本是最终JSON对象，以{开头、以}结尾。'
     return f'''你只负责离线终审一个分片，读取完整输入 {shard['input']}。
 只读总协调合同 {root / 'prompt.md'}，继承其中内容判断、隐私、歌词和证据规则，但不执行任何总协调的调度/合并/登记来源/校正全局文件/finish/发布操作，也不新建子任务。
 只输出target_seqs，每条恰好一次；上下文窗口只读。plan_id、fingerprint及已有correction_id原样保留。
@@ -202,20 +204,46 @@ def grok_receipt(result, state):
             and state['observed_models'] == ['grok-4.7-build'])
 
 
-def music_candidate(text):
+def grok_candidate(text):
     """Read a single top-level JSON object, allowing surrounding progress prose."""
     if not isinstance(text, str):
-        raise ValueError('缺少音乐候选文本')
+        raise ValueError('缺少Grok候选文本')
+    def unique_keys(pairs):
+        out = {}
+        for key, value in pairs:
+            if key in out:
+                raise ValueError('Grok候选有重复字段')
+            out[key] = value
+        return out
+
+    def decode(value):
+        return json.loads(value, object_pairs_hook=unique_keys)
+
+    def safe_prose(value):
+        if re.search(r'[{}\[\]]', value):
+            return False
+        for line in value.splitlines():
+            try:
+                json.loads(line)
+            except ValueError:
+                continue
+            return False
+        return True
+
     try:
-        return json.loads(text)
+        return decode(text)
     except ValueError:
+        if '```' not in text:
+            start = text.find('{')
+            if start > 0 and safe_prose(text[:start]):
+                return decode(text[start:])  # 要求唯一、完整的 JSON，且无尾随内容。
         blocks = list(re.finditer(r'(?m)^```(?:json)?[ \t]*\r?\n(.*?)^```[ \t]*$', text, re.DOTALL))
         if len(blocks) != 1 or text.count('```') != 2:
-            raise ValueError('音乐输出须为JSON或一个独立JSON代码块') from None
+            raise ValueError('Grok输出须为JSON或一个独立JSON代码块') from None
         block = blocks[0]
-        if re.search(r'[{}\[\]]', text[:block.start()] + text[block.end():]):
-            raise ValueError('音乐JSON代码块外还有结构化内容') from None
-        return json.loads(block[1])
+        if not (safe_prose(text[:block.start()]) and safe_prose(text[block.end():])):
+            raise ValueError('Grok JSON代码块外还有结构化内容') from None
+        return decode(block[1])
 
 
 def group_exists(pgid):
@@ -334,14 +362,19 @@ def worker(config, kind, shard_id, token):
                 result = json.loads(stdout.read_text())
             except (ValueError, UnicodeError):
                 result = None
+                state['error'] = 'invalid_cli_envelope'
             success = grok_receipt(result, state)
+            if not success:
+                state.setdefault('error', 'invalid_cli_terminal_receipt')
             if code == 0 and success:
                 try:
                     text = result.get('text') or ''
-                    candidate = music_candidate(text) if kind == 'finalize' else json.loads(text)
+                    candidate = grok_candidate(text) if kind in ('finalize', 'talk_finalize') else json.loads(text)
                 except (ValueError, TypeError):
                     candidate = None
                 success = isinstance(candidate, dict) and bool(candidate)
+                if not success:
+                    state['error'] = 'invalid_candidate_json'
                 if success:
                     try:
                         validate_candidate(root, plan, shard, kind, candidate)
