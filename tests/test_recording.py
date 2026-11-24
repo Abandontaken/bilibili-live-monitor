@@ -138,6 +138,20 @@ async def test_refusal_discovered_during_stderr_drain_remains_terminal(tmp_path)
         await recorder.check()
 
 
+@pytest.mark.parametrize('code', [403, 412, 429])
+async def test_flv_track_size_mismatch_is_a_stream_end(tmp_path, code):
+    recorder = Recording(Settings(data_dir=tmp_path), {'room_id': '123456'})
+    reader = asyncio.StreamReader()
+    reader.feed_data(f'[in#0/flv @ 0x123] Track size mismatch: {code}!\n'.encode())
+    reader.feed_data(b'Error during demuxing: Input/output error\n')
+    reader.feed_eof()
+    recorder.process = SimpleNamespace(stderr=reader, returncode=1)
+    recorder.tasks = [asyncio.create_task(recorder.read_errors())]
+
+    with pytest.raises(RuntimeError, match=rf'^recording_stream_ended: .*Track size mismatch: {code}!'):
+        await recorder.check()
+
+
 async def test_successful_media_response_refreshes_hls_and_ignores_failed_flv():
     class Page:
         url = 'https://live.bilibili.com/123456'
