@@ -106,10 +106,7 @@ class Recording:
             await asyncio.gather(*self.tasks, return_exceptions=True)
             if self.refused:
                 raise RuntimeError('recording_refused: HTTP ' + self.refused)
-            # 不把鉴权或限流拒绝当成普通断线反复请求。
-            refused = any(re.search(r'\b(403|412|429)\b', line) for line in self.error_lines)
-            reason = 'recording_refused' if refused else 'recording_stream_ended'
-            raise RuntimeError(reason + ': ' + ' | '.join(self.error_lines)[-900:])
+            raise RuntimeError('recording_stream_ended: ' + ' | '.join(self.error_lines)[-900:])
         if time.monotonic() - self.last_progress > 40:
             raise RuntimeError('recording_stalled：40秒没有新媒体进度')
 
