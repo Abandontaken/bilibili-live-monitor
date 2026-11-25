@@ -69,16 +69,23 @@ def summary_gift_share(rows, label):
     metrics_rows = [row.get('metrics', {}) for row in rows]
     covered = []
     incomplete = False
+    partial_sessions = 0
     for metrics in metrics_rows:
         total, nonself = metrics.get('amount'), metrics.get('amount_nonself')
+        partial = total is None or nonself is None
+        if partial:
+            total, nonself = metrics.get('amount_priced'), metrics.get('amount_nonself_priced')
         if not all(type(value) in (int, float) and math.isfinite(value) for value in (total, nonself)):
             continue
         if not 0 <= nonself <= total:
             continue
         covered.append((total, nonself))
-        incomplete |= 'paid_donors_nonself' in metrics and metrics['paid_donors_nonself'] is None
+        partial_sessions += partial
+        incomplete |= partial or ('paid_donors_nonself' in metrics and metrics['paid_donors_nonself'] is None)
     result = _gift_share(label, sum(a - b for a, b in covered), sum(a for a, _ in covered),
                          incomplete or len(covered) != len(metrics_rows))
     if 'confirmed_percentage' in result and len(covered) != len(metrics_rows):
         result.update(covered_sessions=len(covered), total_sessions=len(metrics_rows))
+    if 'confirmed_percentage' in result and partial_sessions:
+        result['partial_sessions'] = partial_sessions
     return result

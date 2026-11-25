@@ -403,6 +403,26 @@ def test_period_uses_scoped_warehouse_gift_identity_without_changing_face_value(
     assert 'uid' not in json.dumps(after)
 
 
+def test_period_enrichment_keeps_original_gift_dedup_selection(tmp_path):
+    root, db = fixture(tmp_path)
+    with sqlite3.connect(db) as conn:
+        for uid in (None, '42'):
+            item = {'identity_status': 'unresolved' if uid is None else 'uid',
+                    'gift': {'sender_uid': uid, 'event_type': 'SEND_GIFT', 'event_id': 'x',
+                             'num': 1, 'coin_type': 'gold', 'total_coin': 1000}}
+            conn.execute('INSERT INTO timeline(room_id,kind,at_utc,data) VALUES (?,?,?,?)',
+                         ('1', 'gift', '2026-01-01T15:59:30+00:00', json.dumps(item)))
+        conn.execute('INSERT INTO raw_events(room_id,received_utc,command,data) VALUES (?,?,?,?)',
+                     ('1', '2026-01-01T15:59:30+00:00', 'SEND_GIFT', '{"data":{"tid":"x","uid":42,"num":1}}'))
+    warehouse = tmp_path / 'warehouse.sqlite3'
+    with sqlite3.connect(warehouse) as conn:
+        conn.executescript('CREATE TABLE dim_users(uid, uid_md5, latest_uname); '
+                           'CREATE TABLE v_unique_face_uid(face_sha1, uid);')
+    kwargs = {'gift_share': {'enabled': True, 'uids': ['42']}}
+    assert [archive_data(root, db, '1', '测试', warehouse_database=path, **kwargs)['days'][-1]['gift_amount_yuan']
+            for path in (None, warehouse)] == [4, 4]
+
+
 def test_chained_history_sources_take_only_their_own_interval_in_order():
     from bilibili_live_monitor.room_archive import history_cutoffs, merge_sources
     sources = history_cutoffs([{'database': 'b', 'session_root': 'b', 'until': '2026-01-03T00:00:00+00:00'},

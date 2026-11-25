@@ -301,17 +301,26 @@ def test_read_only_history_root_serves_existing_reports_without_private_metadata
 
 def test_handoff_history_sessions_and_pages_revalidate(tmp_path):
     current, previous = tmp_path/'current', tmp_path/'previous'
-    current.mkdir()
     key = 'f'*24
-    (previous/key/'public').mkdir(parents=True)
-    (previous/key/'config.json').write_text('{"room_id":"1"}')
-    (previous/key/'public/index.html').write_text('<html><main>交接前报告</main></html>')
+    start, end = '2026-01-01T01:00:00+00:00', '2026-01-01T02:00:00+00:00'
+    for root, phase, updated, title in [(current, 'attention', start, '不完整副本'),
+                                        (previous, 'completed', end, '交接前报告')]:
+        session = root / key
+        (session/'public').mkdir(parents=True)
+        (session/'config.json').write_text(json.dumps({'room_id': '1', 'start_utc': start}))
+        (session/'workflow.json').write_text(json.dumps({'stage': phase}))
+        (session/'public/index.html').write_text(f'<html><main>{title}</main></html>')
+        (session/'public/snapshot.json').write_text(json.dumps({'phase': phase, 'session_start': start,
+                                                                  'updated_at': updated}))
+    (current/key/'public/data.json').write_text('{"stale":true}')
     config = {'instances':[{'id':'guest','label':'匿名','url':'http://127.0.0.1:8766','session_root':str(current),
         'archive':{'rooms':{'1':'测试'},'history_sources':{'1':[{'database':'PRIVATE_DB','session_root':str(previous),
                                                                   'until':'2026-01-02T00:00:00+00:00'}]}}}]}
     with TestClient(create_gateway(config)) as client:
         response = client.get(f'/instances/guest/sessions/{key}/')
         assert response.status_code == 200 and '交接前报告' in response.text
+        assert client.get(f'/instances/guest/sessions/{key}/snapshot.json').json()['updated_at'] == end
+        assert client.get(f'/instances/guest/sessions/{key}/data.json').status_code == 404
         assert response.headers['cache-control'] == 'no-cache'
         assert client.get(f'/instances/guest/sessions/{key}/config.json').status_code == 404
         assert client.get('/instances/guest/sessions/' + 'a'*24 + '/').status_code == 404

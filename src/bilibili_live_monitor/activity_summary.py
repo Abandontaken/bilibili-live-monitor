@@ -80,9 +80,9 @@ def gift_amount(gift):
     return gift_value(gift)
 
 
-def gift_observations(source, *, platform_uid=False, event_time_only=False):
-    gifts, seen = [], set()
-    for index, (kind, at, data) in enumerate(source['items']):
+def unique_gift_items(items):
+    seen = set()
+    for index, (kind, at, data) in enumerate(items):
         gift = data.get('gift')
         if kind != 'gift' or not isinstance(gift, dict):
             continue
@@ -94,6 +94,14 @@ def gift_observations(source, *, platform_uid=False, event_time_only=False):
         if key in seen:
             continue
         seen.add(key)
+        yield kind, at, data
+
+
+def gift_observations(source, *, platform_uid=False, event_time_only=False, deduplicate=True):
+    gifts = []
+    items = unique_gift_items(source['items']) if deduplicate else source['items']
+    for _, at, data in items:
+        gift = data['gift']
         count = nonnegative_integer(gift.get('num'))
         from .identity import analysis_key
         uid = (analysis_key(data) if data.get('analysis_identity_basis') == 'nickname'

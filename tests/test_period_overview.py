@@ -50,6 +50,15 @@ def test_summary_share_keeps_confirmed_amounts_and_discloses_incomplete_coverage
     }
 
 
+def test_summary_share_includes_priced_subtotal_from_incomplete_session():
+    rows = [{'metrics': {'amount': None, 'amount_nonself': None, 'amount_priced': 100,
+                         'amount_nonself_priced': 75}}, {'metrics': {'amount': 50, 'amount_nonself': 50}}]
+    share = summary_gift_share(rows, '测试观众')
+    assert share['percentage'] is None
+    assert share['confirmed_percentage'] == pytest.approx(25 / 150 * 100)
+    assert share['partial_sessions'] == 1
+
+
 def club(date, value):
     return dict(date=date, entries=1, gift_amount_yuan=0, has_observations=True, fans_club_close=value)
 

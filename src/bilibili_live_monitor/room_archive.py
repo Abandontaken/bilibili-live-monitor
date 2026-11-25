@@ -9,7 +9,7 @@ from datetime import datetime, time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from .activity_summary import gift_observations, nonnegative_integer
+from .activity_summary import gift_observations, nonnegative_integer, unique_gift_items
 from .gift_value import value_fields
 from .session_source import read_source
 from .song_followers import merged_windows
@@ -97,6 +97,35 @@ def merge_sources(main, parts, cutoff):
     return merged
 
 
+def session_record(root, directory, *, config=None):
+    cfg = read_object(root, directory / 'config.json') if config is None else config
+    start = epoch(cfg['start_utc'])
+    workflow = read_object(root, directory / 'workflow.json')
+    snap_path = within(root, directory / 'public/snapshot.json')
+    snap = read_object(root, snap_path) if snap_path.is_file() else None
+    if snap and epoch(snap['session_start']) != start:
+        raise ValueError('场次身份不一致')
+    end = epoch(snap['updated_at']) if snap else start
+    if not math.isfinite(start) or not math.isfinite(end) or end < start:
+        raise ValueError('场次时间无效')
+    return cfg, start, end, workflow, snap
+
+
+def session_priority(start, end, workflow):
+    return end > start, workflow.get('stage') == 'completed'
+
+
+def gift_scope_windows(sessions, windows, history):
+    """在场次和采集库交接边界切断线索查找，窗口的总统计范围不变。"""
+    edges = sorted({epoch(row[field]) for row in sessions for field in ('start', 'end')}
+                   | {item['until_epoch'] for item in history})
+    result = []
+    for start, end in windows:
+        points = [start, *edges[bisect_right(edges, start):bisect_left(edges, end)], end]
+        result.extend(zip(points, points[1:]))
+    return result
+
+
 def archive_data(session_root, database, room_id, name, include_summaries=True, *, gift_share=None, now=None,
                  historical_windows=(), historical_root=None, history_sources=(), warehouse_database=None):
     root = Path(session_root).resolve()
@@ -118,17 +147,9 @@ def archive_data(session_root, database, room_id, name, include_summaries=True, 
             cfg = read_object(root, directory / 'config.json')
             if str(cfg.get('room_id')) != room_id:
                 continue
-            start = epoch(cfg['start_utc'])
+            _, start, end, wf, snap = session_record(root, directory, config=cfg)
             if bounds and not bounds['since_epoch'] <= start < bounds['until_epoch']:
                 continue
-            wf = read_object(root, directory / 'workflow.json')
-            snap_path = within(root, directory / 'public/snapshot.json')
-            snap = read_object(root, snap_path) if snap_path.is_file() else None
-            if snap and epoch(snap['session_start']) != start:
-                raise ValueError('场次身份不一致')
-            end = epoch(snap['updated_at']) if snap else start
-            if not math.isfinite(start) or not math.isfinite(end) or end < start:
-                raise ValueError('场次时间无效')
             summary = (snap or {}).get('session_summary', {})
             if not isinstance(summary, dict):
                 raise ValueError('场次汇总须为对象')
@@ -139,7 +160,7 @@ def archive_data(session_root, database, room_id, name, include_summaries=True, 
                                for k in ('followers_change', 'gift_count', 'gift_amount_yuan', 'watched')},
                    'dates': [d for d, _, _ in day_windows(start, end)] or
                              [_shanghai_date(start)]}
-            priority = (end > start, wf.get('stage') == 'completed')
+            priority = session_priority(start, end, wf)
             previous = selected.get(directory.name)
             if previous and previous[0] >= priority:
                 continue
@@ -276,6 +297,7 @@ def archive_data(session_root, database, room_id, name, include_summaries=True, 
         if kind == 'gift':
             gift_items_only.append((kind, at, item))
 
+    gift_items_only = list(unique_gift_items(gift_items_only))
     share_amounts = {}
     unassigned_dates = set()
     if share_label and warehouse_database and any(item.get('identity_status') == 'unresolved'
@@ -284,11 +306,11 @@ def archive_data(session_root, database, room_id, name, include_summaries=True, 
         try:
             gift_items_only = overlay_archive_gift_identities(
                 {'items': gift_items_only, 'raw': [row for row in source['raw'] if row[2] and row[1] in raw_cmds]},
-                Path(warehouse_database), windows,
+                Path(warehouse_database), gift_scope_windows(sessions, windows, sources),
             )['items']
         except (OSError, sqlite3.Error):
             warnings += 1
-    for stamp, count, amount, uid, _ in gift_observations({'items': gift_items_only}, platform_uid=True):
+    for stamp, count, amount, uid, _ in gift_observations({'items': gift_items_only}, platform_uid=True, deduplicate=False):
         date = _shanghai_date(stamp)
         if observed(stamp) and date in days:
             day = days[date]
