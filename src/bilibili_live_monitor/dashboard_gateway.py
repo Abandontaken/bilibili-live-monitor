@@ -473,7 +473,8 @@ def create_gateway(config, *, transport=None, prewarm_archives=False):
         if not re.fullmatch(r'[a-f0-9]{24}', key) or asset not in ('index.html', 'snapshot.json', 'data.json') or not row.get('session_root'):
             raise HTTPException(404, '结果不存在')
         archive = row.get('archive', {})
-        from .room_archive import history_cutoffs, session_priority, session_record
+        from .room_archive import history_cutoffs, read_object, session_priority, session_record
+        from .time_utils import epoch
         roots = [(r, None, None) for r in (row['session_root'], archive.get('historical_root'))]
         roots += [(item['session_root'], rid, item) for rid, items in archive.get('history_sources', {}).items()
                   for item in history_cutoffs(items)]
@@ -489,7 +490,17 @@ def create_gateway(config, *, transport=None, prewarm_archives=False):
             try:
                 cfg, start, end, workflow, _ = session_record(root, directory)
             except (OSError, ValueError, TypeError, KeyError):
-                if bounds is None and fallback is None and path.is_file():
+                if fallback is None and path.is_file():
+                    if bounds is not None:
+                        try:
+                            cfg = read_object(root, directory / 'config.json')
+                            if str(cfg.get('room_id')) != room:
+                                continue
+                            stamp = cfg.get('start_utc')
+                            if stamp is not None and not bounds['since_epoch'] <= epoch(stamp) < bounds['until_epoch']:
+                                continue
+                        except (OSError, ValueError, TypeError, KeyError):
+                            continue
                     fallback = ((), root, path)
                 continue
             if bounds and (str(cfg.get('room_id')) != room or not bounds['since_epoch'] <= start < bounds['until_epoch']):
@@ -502,7 +513,7 @@ def create_gateway(config, *, transport=None, prewarm_archives=False):
             raise HTTPException(404, '结果尚未生成')
         _, root, path = selected
         if asset == 'index.html' and row.get('archive'):
-            from .room_archive import read_json, read_object
+            from .room_archive import read_json
             from .session_overview import session_overview
             try:
                 config = read_json(root, root / key / 'config.json')

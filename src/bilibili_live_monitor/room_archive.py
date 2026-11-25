@@ -108,6 +108,8 @@ def session_record(root, directory, *, config=None):
     end = epoch(snap['updated_at']) if snap else start
     if not math.isfinite(start) or not math.isfinite(end) or end < start:
         raise ValueError('场次时间无效')
+    if not isinstance((snap or {}).get('session_summary', {}), dict):
+        raise ValueError('场次汇总须为对象')
     return cfg, start, end, workflow, snap
 
 
@@ -151,8 +153,6 @@ def archive_data(session_root, database, room_id, name, include_summaries=True, 
             if bounds and not bounds['since_epoch'] <= start < bounds['until_epoch']:
                 continue
             summary = (snap or {}).get('session_summary', {})
-            if not isinstance(summary, dict):
-                raise ValueError('场次汇总须为对象')
             summary = {**summary, 'gift_amount_yuan': summary.get('gift_value_yuan')}
             row = {'key': directory.name, 'start': iso(start), 'end': iso(end),
                    'status': wf.get('stage', 'created'), 'has_result': snap is not None,
@@ -211,16 +211,17 @@ def archive_data(session_root, database, room_id, name, include_summaries=True, 
         return value_fields(result)
     earliest = min([a for a, _ in windows] + [epoch(s['start']) for s in sessions])
     raw_cmds = _HISTORY_RAW_COMMANDS if history else _ARCHIVE_RAW_COMMANDS
-    if share_label and warehouse_database:
-        raw_cmds += ('SEND_GIFT', 'SEND_GIFT_V2', 'COMBO_SEND', 'GUARD_BUY', 'SUPER_CHAT_MESSAGE', 'USER_TOAST_MSG_V2')
+    gift_cmds = (('SEND_GIFT', 'SEND_GIFT_V2', 'COMBO_SEND', 'GUARD_BUY', 'SUPER_CHAT_MESSAGE', 'USER_TOAST_MSG_V2')
+                 if share_label and warehouse_database else ())
     item_kinds = ('gift', 'entry') if history else ('gift',)
     source = read_source(Path(database), room_id, iso(earliest),
-                         raw_commands=raw_cmds, item_json_kinds=item_kinds)
+                         raw_commands=raw_cmds, optional_raw_commands=gift_cmds, item_json_kinds=item_kinds)
     if sources:
         # 历史库只读到截止前（多读一秒，再按精确边界过滤）。
         source = merge_sources(source, [(read_source(Path(item['database']), room_id, iso(earliest),
                                                      iso(item['until_epoch'] + 1),
-                                                     raw_commands=raw_cmds, item_json_kinds=item_kinds),
+                                                      raw_commands=raw_cmds, optional_raw_commands=gift_cmds,
+                                                      item_json_kinds=item_kinds),
                                          item['since_epoch'], item['until_epoch']) for item in sources],
                                sources[-1]['until_epoch'])
     if history:
@@ -305,10 +306,11 @@ def archive_data(session_root, database, room_id, name, include_summaries=True, 
         from .warehouse_backfill import overlay_archive_gift_identities
         try:
             gift_items_only = overlay_archive_gift_identities(
-                {'items': gift_items_only, 'raw': [row for row in source['raw'] if row[2] and row[1] in raw_cmds]},
+                {'items': gift_items_only, 'raw': [row for row in source['raw']
+                                                   if isinstance(row[2], dict) and row[2] and row[1] in gift_cmds]},
                 Path(warehouse_database), gift_scope_windows(sessions, windows, sources),
             )['items']
-        except (OSError, sqlite3.Error):
+        except (OSError, sqlite3.Error, ValueError, TypeError):
             warnings += 1
     for stamp, count, amount, uid, _ in gift_observations({'items': gift_items_only}, platform_uid=True, deduplicate=False):
         date = _shanghai_date(stamp)

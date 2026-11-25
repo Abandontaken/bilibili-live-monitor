@@ -29,6 +29,7 @@ def read_source(
     end: str = '9999',
     *,
     raw_commands: tuple[str, ...] | None = None,
+    optional_raw_commands: tuple[str, ...] = (),
     item_json_kinds: tuple[str, ...] | None = None,
 ) -> dict:
     """读取[start, end)的记录；可选仅解码指定command/kind的大JSON载荷以加速归档聚合。"""
@@ -44,14 +45,23 @@ def read_source(
                 'ORDER BY id', (room_id, start, end))]
         else:
             # 顺着(room_id, received_utc)索引顺序扫描，再按id用Timsort恢复精确插入序，避免SQLite临时B-Tree排序。
-            placeholders = _in_clause(raw_commands)
+            decoded = (*raw_commands, *optional_raw_commands)
+            placeholders = _in_clause(decoded)
             raw_rows = db.execute(
                 f'SELECT id,received_utc,command,CASE WHEN command IN ({placeholders}) THEN data END '
                 'FROM raw_events WHERE room_id=? AND received_utc>=? AND received_utc<?',
-                (*raw_commands, room_id, start, end),
+                (*decoded, room_id, start, end),
             ).fetchall()
             raw_rows.sort(key=lambda r: r[0])
-            raw = [(at, cmd, json.loads(data) if data is not None else {}) for _, at, cmd, data in raw_rows]
+            raw = []
+            for _, at, cmd, data in raw_rows:
+                try:
+                    packet = json.loads(data) if data is not None else {}
+                except (ValueError, TypeError):
+                    if cmd not in optional_raw_commands:
+                        raise
+                    packet = {}
+                raw.append((at, cmd, packet))
 
         if 'timeline' not in tables:
             items = []

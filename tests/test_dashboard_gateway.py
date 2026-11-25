@@ -299,11 +299,13 @@ def test_read_only_history_root_serves_existing_reports_without_private_metadata
         assert client.get(f'/instances/account/sessions/{key}/').status_code==404
 
 
-def test_handoff_history_sessions_and_pages_revalidate(tmp_path):
+@pytest.mark.parametrize('invalid_summary', [False, True])
+def test_handoff_history_sessions_and_pages_revalidate(tmp_path, invalid_summary):
     current, previous = tmp_path/'current', tmp_path/'previous'
     key = 'f'*24
     start, end = '2026-01-01T01:00:00+00:00', '2026-01-01T02:00:00+00:00'
-    for root, phase, updated, title in [(current, 'attention', start, '不完整副本'),
+    for root, phase, updated, title in [(current, 'completed' if invalid_summary else 'attention',
+                                        end if invalid_summary else start, '不完整副本'),
                                         (previous, 'completed', end, '交接前报告')]:
         session = root / key
         (session/'public').mkdir(parents=True)
@@ -311,7 +313,7 @@ def test_handoff_history_sessions_and_pages_revalidate(tmp_path):
         (session/'workflow.json').write_text(json.dumps({'stage': phase}))
         (session/'public/index.html').write_text(f'<html><main>{title}</main></html>')
         (session/'public/snapshot.json').write_text(json.dumps({'phase': phase, 'session_start': start,
-                                                                  'updated_at': updated}))
+            'updated_at': updated, 'session_summary': [] if root == current and invalid_summary else {}}))
     (current/key/'public/data.json').write_text('{"stale":true}')
     config = {'instances':[{'id':'guest','label':'匿名','url':'http://127.0.0.1:8766','session_root':str(current),
         'archive':{'rooms':{'1':'测试'},'history_sources':{'1':[{'database':'PRIVATE_DB','session_root':str(previous),
@@ -324,6 +326,22 @@ def test_handoff_history_sessions_and_pages_revalidate(tmp_path):
         assert response.headers['cache-control'] == 'no-cache'
         assert client.get(f'/instances/guest/sessions/{key}/config.json').status_code == 404
         assert client.get('/instances/guest/sessions/' + 'a'*24 + '/').status_code == 404
+
+
+def test_metadata_light_handoff_report_remains_available(tmp_path):
+    current, previous = tmp_path/'current', tmp_path/'previous'
+    current.mkdir()
+    key = 'f'*24
+    (previous/key/'public').mkdir(parents=True)
+    (previous/key/'config.json').write_text('{"room_id":"1"}')
+    (previous/key/'public/index.html').write_text('交接前报告')
+    config = {'instances':[{'id':'guest','label':'匿名','url':'http://127.0.0.1:8766','session_root':str(current),
+        'archive':{'rooms':{'1':'测试'},'history_sources':{'1':[{'database':'stub','session_root':str(previous),
+                                                                'until':'2026-01-02T00:00:00+00:00'}]}}}]}
+    with TestClient(create_gateway(config)) as client:
+        assert '交接前报告' in client.get(f'/instances/guest/sessions/{key}/').text
+        (previous/key/'config.json').write_text('{"room_id":"2"}')
+        assert client.get(f'/instances/guest/sessions/{key}/').status_code == 404
 
 
 @pytest.mark.parametrize('sources', [[], {'1': {}}, {'x': []}, {'1': [{'database': 'd', 'session_root': 's'}]},

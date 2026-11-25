@@ -393,6 +393,8 @@ def test_period_uses_scoped_warehouse_gift_identity_without_changing_face_value(
             conn.execute('INSERT INTO raw_events(room_id,received_utc,command,data) VALUES (?,?,?,?)',
                          ('1', stamp, 'SEND_GIFT', json.dumps({'data': {'tid': 'transaction', 'uid': uid,
                                                                        'giftName': '测试', 'num': 1}})))
+        conn.execute('INSERT INTO raw_events(room_id,received_utc,command,data) VALUES (?,?,?,?)',
+                     ('1', '2026-01-01T16:02:30+00:00', 'SEND_GIFT', '{invalid'))
     kwargs = {'gift_share': {'enabled': True, 'uids': ['42']},
               'now': datetime.fromisoformat('2026-01-02T12:00:00+08:00')}
     before, after = (archive_data(root, db, '1', '测试', warehouse_database=path, **kwargs)['periods'][0]
