@@ -38,11 +38,13 @@ _REMOTE_INSTALL = '''
 import ctypes, fcntl, hashlib, json, os, pathlib, shutil, sys, tempfile
 root = pathlib.Path(sys.argv[1])
 tx = json.load(sys.stdin)
+if root.resolve(strict=True) != root:
+    raise ValueError('noncanonical origin directory')
 fd = os.open(root.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
 fcntl.flock(fd, fcntl.LOCK_EX)
 try:
     names = ('index.html', 'snapshot.json')
-    if root.is_symlink() or set(p.name for p in root.iterdir()) != set(names):
+    if root.resolve(strict=True) != root or set(p.name for p in root.iterdir()) != set(names):
         raise ValueError('unexpected origin directory')
     root_stat = root.stat()
     staged = pathlib.Path(tempfile.mkdtemp(prefix='.identity-', dir=root.parent))
@@ -69,7 +71,8 @@ try:
     if changed:
         os.chown(staged, root_stat.st_uid, root_stat.st_gid)
         os.chmod(staged, root_stat.st_mode & 0o7777)
-        if (root.stat().st_ino != root_stat.st_ino or set(p.name for p in root.iterdir()) != set(names)
+        if (root.resolve(strict=True) != root or root.stat().st_ino != root_stat.st_ino
+                or set(p.name for p in root.iterdir()) != set(names)
                 or any(hashlib.sha256((root / n).read_bytes()).hexdigest() != initial[n] for n in names)):
             raise ValueError('destination changed while staging')
         lib = ctypes.CDLL(None, use_errno=True)
@@ -102,7 +105,8 @@ def _hash(data):
 def _target_keys(config):
     host, _, directory = (config.get('remote') or '').partition(':')
     url = urlsplit(config.get('url') or '')
-    return (('ssh', host.rsplit('@', 1)[-1].lower(), posixpath.normpath('/' + directory.lstrip('/'))),
+    # Different SSH aliases can target the same machine; conservatively reserve each directory path once.
+    return (('ssh', posixpath.normpath('/' + directory.lstrip('/')) if host else None),
             ('https', url.hostname, url.port or 443, posixpath.normpath('/' + unquote(url.path).lstrip('/'))))
 
 

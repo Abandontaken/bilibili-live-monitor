@@ -64,6 +64,7 @@ def test_invalid_candidate_never_reaches_publisher(tmp_path, monkeypatch):
 
 
 def test_origin_installer_refuses_changed_peer_before_replacing_either_file(tmp_path):
+    tmp_path = tmp_path.resolve()
     (tmp_path / 'index.html').write_bytes(b'old')
     (tmp_path / 'snapshot.json').write_bytes(b'changed')
     tx = {'before': {name: backfill._hash(b'old') for name in backfill.FILES},
@@ -76,6 +77,23 @@ def test_origin_installer_refuses_changed_peer_before_replacing_either_file(tmp_
     (tmp_path / 'snapshot.json').write_bytes(b'old')
     subprocess.run(args, input=payload, capture_output=True, check=True)
     assert all((tmp_path / name).read_bytes() == b'new' for name in backfill.FILES)
+
+
+def test_origin_installer_refuses_ancestor_alias(tmp_path):
+    real = tmp_path.resolve() / 'real'
+    real.mkdir()
+    directory = real / 'page'
+    directory.mkdir()
+    for name in backfill.FILES:
+        (directory / name).write_bytes(b'old')
+    alias = tmp_path.resolve() / 'alias'
+    alias.symlink_to(real)
+    tx = {'before': {name: backfill._hash(b'old') for name in backfill.FILES},
+          'files': {name: 'new' for name in backfill.FILES}}
+    proc = subprocess.run([sys.executable, '-c', backfill._REMOTE_INSTALL, str(alias / 'page')],
+                          input=json.dumps(tx).encode(), capture_output=True, check=False)
+    assert proc.returncode != 0 and b'noncanonical origin' in proc.stderr
+    assert all((directory / name).read_bytes() == b'old' for name in backfill.FILES)
 
 
 def test_html_only_changes_activity_user_cell():
