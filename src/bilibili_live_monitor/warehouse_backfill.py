@@ -161,7 +161,10 @@ def overlay_session_gift_identities(
         clue_face = clue.get('clue_face_sha1') if clue else None
         captured_id = (str(gift.get('event_id') or ''), int(gift.get('batch_index', 0) or 0))
         from_warehouse = (blind_box_assignments or {}).get(captured_id) if clue and clue['is_blind_box'] else None
-        inferred_uid = from_warehouse or (clue.get('inferred_uid') if clue else None)
+        # 首次可见积分可能含榜外历史分；该推断只留在数仓，不生成具名消费行。
+        inferred_uid = from_warehouse or (clue.get('inferred_uid')
+                                          if clue and clue.get('inference_method') != 'blind_box_first_rank_window'
+                                          else None)
         raw_uid = native_uid or (clue.get('raw_uid') if clue else None)
 
         resolved_uid = (

@@ -99,11 +99,10 @@ def refresh_archive_values(rows, config):
                 continue
             metrics['amount'] = sum(event[2] for event in events) / 1000
             excluded = set(map(str, config.get('exclude_account_uids', [])))
-            if any(event[2] and event[3] is None for event in events):
-                continue
             others = [event for event in events if str(event[3]) not in excluded]
             metrics['amount_nonself'] = sum(event[2] for event in others) / 1000
-            metrics['paid_donors_nonself'] = len({event[3] for event in others if event[2] > 0})
+            if all(not event[2] or event[3] is not None for event in others):
+                metrics['paid_donors_nonself'] = len({str(event[3]) for event in others if event[2] > 0})
     return result
 
 
