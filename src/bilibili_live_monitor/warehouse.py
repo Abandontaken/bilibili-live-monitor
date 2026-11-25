@@ -2188,6 +2188,8 @@ def main(args) -> int:
         else:
             result = warehouse_stats(args.warehouse)
         print(json.dumps(result, ensure_ascii=False, indent=2))
+        if args.warehouse_command == 'backfill-remote-pages' and result['failures']:
+            return 1
         return 0
     except (ValueError, TypeError, KeyError, OSError, sqlite3.Error) as error:
         print(json.dumps({'error': f'{type(error).__name__}: {error}'}, ensure_ascii=False))
