@@ -254,7 +254,8 @@ def create_gateway(config, *, transport=None, prewarm_archives=False):
                                        gift_share=archive.get('gift_share', {}).get(room_id),
                                        historical_windows=archive.get('historical_windows', {}).get(room_id, []),
                                        historical_root=archive.get('historical_root'),
-                                       history_sources=archive.get('history_sources', {}).get(room_id, []))
+                                        history_sources=archive.get('history_sources', {}).get(room_id, []),
+                                        warehouse_database=archive.get('warehouse_database'))
         data['mode'] = row.get('mode', 'account')
         if summary_file:
             from .archive_summary import shared_summaries

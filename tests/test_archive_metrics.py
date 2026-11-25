@@ -80,6 +80,7 @@ def test_gift_dedup_exclusion_and_unknown_identity():
     assert metrics['amount'] == 16
     assert metrics['amount_nonself'] == 6
     assert metrics['paid_donors_nonself'] is None
+    assert metrics['paid_donors_nonself_minimum'] == 1
 
 
 def test_unknown_gift_amount_does_not_hide_viewer_metrics():

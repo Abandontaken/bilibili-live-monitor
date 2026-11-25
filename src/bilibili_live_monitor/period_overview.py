@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 from .gift_value import value_fields
 
 
-def period_overview(days, *, now=None, share_amounts=None, share_label=None):
+def period_overview(days, *, now=None, share_amounts=None, share_label=None, unassigned_dates=()):
     today = (now or datetime.now(ZoneInfo('Asia/Shanghai'))).astimezone(ZoneInfo('Asia/Shanghai')).date()
     result = []
     for count in (7, 30):
@@ -24,8 +24,8 @@ def period_overview(days, *, now=None, share_amounts=None, share_label=None):
         if share_label is not None:
             amounts = [(share_amounts or {}).get(row['date'], 0) for row in selected]
             own = sum(amount or 0 for amount in amounts)
-            item['gift_share'] = {'label': share_label,
-                                 'percentage': own / total * 100 if total and not unknown and None not in amounts else None}
+            incomplete = unknown or None in amounts or any(row['date'] in unassigned_dates for row in selected)
+            item['gift_share'] = _gift_share(share_label, own, total, incomplete)
         result.append(item)
     return value_fields(result)
 
@@ -46,27 +46,39 @@ def fans_club_period(days, start, end):
             'fans_club_change_since': base[0] if base else None}
 
 
-def overall_share(days, amounts, label):
+def _gift_share(label, own, total, incomplete):
+    percentage = own / total * 100 if total and total > 0 else None
+    result = {'label': label, 'percentage': None if incomplete else percentage}
+    if incomplete and percentage is not None:
+        result['confirmed_percentage'] = percentage
+    return result
+
+
+def overall_share(days, amounts, label, *, unassigned_dates=()):
     observed = [row for row in days if row.get('has_observations')]
     total = sum(row.get('gift_amount_yuan') or 0 for row in observed)
     unknown = any(row.get('gift_amount_unknown') for row in observed)
     own = sum(amount or 0 for amount in amounts.values())
-    return {'label': label, 'percentage': own / total * 100
-            if total and not unknown and None not in amounts.values() else None}
+    incomplete = unknown or None in amounts.values() or any(row['date'] in unassigned_dates for row in observed)
+    return _gift_share(label, own, total, incomplete)
 
 
 def summary_gift_share(rows, label):
     """总体沿用已审核场次金额，避免遗漏只有历史汇总的场次。"""
-    rows = list(rows)
-    if any('paid_donors_nonself' in metrics and metrics['paid_donors_nonself'] is None
-           for metrics in (row.get('metrics', {}) for row in rows)):
-        return {'label': label, 'percentage': None}
     # 调用者须确认 amount_nonself 排除的账号集合与当前指定对象一致。
-    amounts = [(row.get('metrics', {}).get('amount'), row.get('metrics', {}).get('amount_nonself'))
-               for row in rows]
-    if not amounts or any(type(value) not in (int, float) or not math.isfinite(value)
-                          for pair in amounts for value in pair):
-        return {'label': label, 'percentage': None}
-    total = sum(pair[0] for pair in amounts)
-    own = sum(pair[0] - pair[1] for pair in amounts)
-    return {'label': label, 'percentage': own / total * 100 if total > 0 else None}
+    metrics_rows = [row.get('metrics', {}) for row in rows]
+    covered = []
+    incomplete = False
+    for metrics in metrics_rows:
+        total, nonself = metrics.get('amount'), metrics.get('amount_nonself')
+        if not all(type(value) in (int, float) and math.isfinite(value) for value in (total, nonself)):
+            continue
+        if not 0 <= nonself <= total:
+            continue
+        covered.append((total, nonself))
+        incomplete |= 'paid_donors_nonself' in metrics and metrics['paid_donors_nonself'] is None
+    result = _gift_share(label, sum(a - b for a, b in covered), sum(a for a, _ in covered),
+                         incomplete or len(covered) != len(metrics_rows))
+    if 'confirmed_percentage' in result and len(covered) != len(metrics_rows):
+        result.update(covered_sessions=len(covered), total_sessions=len(metrics_rows))
+    return result

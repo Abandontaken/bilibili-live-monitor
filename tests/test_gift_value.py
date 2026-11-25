@@ -149,6 +149,7 @@ def test_crm_revalues_frozen_history_by_event_identity_without_mutating_it(tmp_p
         db.execute('INSERT INTO timeline VALUES(2,?,?,?,?)', ('456', 'gift', at, json.dumps(anonymous)))
     assert refresh_archive_values(rows, config)[0]['metrics'] == {
         'amount': 4466, 'amount_nonself': 2233, 'paid_donors_nonself': None, 'online_mean': 10,
+        'paid_donors_nonself_minimum': 0,
     }
     no_records = refresh_archive_values([{**rows[0], 'start_utc': '2026-01-02T11:00:00Z',
                                          'updated_at': '2026-01-02T13:00:00Z', 'metrics': {'amount': 0}}], config)

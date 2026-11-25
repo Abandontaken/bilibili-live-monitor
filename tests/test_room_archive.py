@@ -333,7 +333,8 @@ def test_handoff_history_merges_two_databases_without_boundary_double_count(tmp_
         CREATE TABLE segments(room_id TEXT,seq INTEGER,data TEXT);'''
     cutoff = '2026-01-02T04:00:00+00:00'
     plan = {'old': [('c' * 24, '2026-01-01T04:00:00+00:00', '2026-01-02T04:00:00+00:00')],
-            'new': [('d' * 24, '2026-01-02T04:00:00+00:00', '2026-01-02T06:00:00+00:00')]}
+             'new': [('d' * 24, '2026-01-02T04:00:00+00:00', '2026-01-02T06:00:00+00:00'),
+                     ('c' * 24, '2026-01-01T04:00:00+00:00', '2026-01-01T04:00:00+00:00')]}
     # 两边都在交接边界两侧各有一条进房和粉丝团推送；只保留旧库截止前、新库截止后的部分。
     events = {'old': [('2026-01-01T05:00:00+00:00', 50), ('2026-01-02T03:00:00+00:00', 44),
                       ('2026-01-02T05:00:00+00:00', 999)],
@@ -365,6 +366,7 @@ def test_handoff_history_merges_two_databases_without_boundary_double_count(tmp_
     data = archive_data(*paths['new'], '1', '测试', now=datetime.fromisoformat('2026-01-02T18:00:00+08:00'),
                         history_sources=history)
     assert sorted(s['key'] for s in data['sessions']) == ['c' * 24, 'd' * 24]
+    assert next(s for s in data['sessions'] if s['key'] == 'c' * 24)['end'] == cutoff
     days = {d['date']: d for d in data['days']}
     assert (days['2026-01-01']['entries'], days['2026-01-01']['fans_club_close']) == (1, 50)
     assert (days['2026-01-02']['entries'], days['2026-01-02']['fans_club_close']) == (2, 40)
@@ -372,6 +374,33 @@ def test_handoff_history_merges_two_databases_without_boundary_double_count(tmp_
     assert 'PRIVATE' not in json.dumps(data) and str(tmp_path) not in json.dumps(data)
     with pytest.raises(ValueError):
         archive_data(*paths['new'], '1', '测试', history_sources=[{'database': 'x', 'session_root': 'y'}])
+
+
+def test_period_uses_scoped_warehouse_gift_identity_without_changing_face_value(tmp_path):
+    from datetime import datetime
+
+    root, db = fixture(tmp_path)
+    warehouse = tmp_path / 'warehouse.sqlite3'
+    with sqlite3.connect(warehouse) as conn:
+        conn.executescript('CREATE TABLE dim_users(uid, uid_md5, latest_uname); '
+                           'CREATE TABLE v_unique_face_uid(face_sha1, uid);')
+    at = '2026-01-01T15:59:30+00:00'
+    gift = {'event_type': 'SEND_GIFT', 'event_id': 'transaction', 'num': 1, 'coin_type': 'gold', 'total_coin': 4000}
+    with sqlite3.connect(db) as conn:
+        conn.execute('INSERT INTO timeline(room_id,kind,at_utc,data) VALUES (?,?,?,?)',
+                     ('1', 'gift', at, json.dumps({'gift': gift, 'identity_status': 'unresolved'})))
+        for stamp, uid in [(at, 42), ('2026-01-01T15:58:30+00:00', 43)]:
+            conn.execute('INSERT INTO raw_events(room_id,received_utc,command,data) VALUES (?,?,?,?)',
+                         ('1', stamp, 'SEND_GIFT', json.dumps({'data': {'tid': 'transaction', 'uid': uid,
+                                                                       'giftName': '测试', 'num': 1}})))
+    kwargs = {'gift_share': {'enabled': True, 'uids': ['42']},
+              'now': datetime.fromisoformat('2026-01-02T12:00:00+08:00')}
+    before, after = (archive_data(root, db, '1', '测试', warehouse_database=path, **kwargs)['periods'][0]
+                     for path in (None, warehouse))
+    assert before['gift_amount_yuan'] == after['gift_amount_yuan'] == 12
+    assert before['gift_share']['confirmed_percentage'] == 0
+    assert after['gift_share']['confirmed_percentage'] == pytest.approx(100 / 3)
+    assert 'uid' not in json.dumps(after)
 
 
 def test_chained_history_sources_take_only_their_own_interval_in_order():

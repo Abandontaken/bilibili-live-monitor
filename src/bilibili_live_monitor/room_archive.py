@@ -2,6 +2,7 @@
 import json
 import math
 import re
+import sqlite3
 from bisect import bisect_left, bisect_right
 from datetime import date as date_cls
 from datetime import datetime, time, timedelta
@@ -97,7 +98,7 @@ def merge_sources(main, parts, cutoff):
 
 
 def archive_data(session_root, database, room_id, name, include_summaries=True, *, gift_share=None, now=None,
-                 historical_windows=(), historical_root=None, history_sources=()):
+                 historical_windows=(), historical_root=None, history_sources=(), warehouse_database=None):
     root = Path(session_root).resolve()
     sessions, windows, coverage, offline_keys = [], [], [], set()
     warnings = 0
@@ -109,11 +110,9 @@ def archive_data(session_root, database, room_id, name, include_summaries=True, 
     if historical_root and Path(historical_root).resolve() != root:
         roots.append(Path(historical_root).resolve())
     roots = [(r, None) for r in roots] + [(Path(item['session_root']).resolve(), item) for item in sources]
-    seen_keys = set()
+    selected = {}
     for root, bounds, directory in [(r, b, d) for r, b in roots for d in sorted(r.iterdir())]:
         if not re.fullmatch(r'[a-f0-9]{24}', directory.name):
-            continue
-        if directory.name in seen_keys:
             continue
         try:
             cfg = read_object(root, directory / 'config.json')
@@ -139,9 +138,14 @@ def archive_data(session_root, database, room_id, name, include_summaries=True, 
                    'summary': {k: summary.get(k)
                                for k in ('followers_change', 'gift_count', 'gift_amount_yuan', 'watched')},
                    'dates': [d for d, _, _ in day_windows(start, end)] or
-                            [_shanghai_date(start)]}
+                             [_shanghai_date(start)]}
+            priority = (end > start, wf.get('stage') == 'completed')
+            previous = selected.get(directory.name)
+            if previous and previous[0] >= priority:
+                continue
             offline_path = within(root, directory / 'offline_segments.json')
             staged_coverage = []
+            has_offline = False
             if wf.get('stage') == 'completed' and offline_path.is_file():
                 try:
                     offline = read_json(root, offline_path)
@@ -153,18 +157,21 @@ def archive_data(session_root, database, room_id, name, include_summaries=True, 
                             raise ValueError('转写时间无效')
                         if a < b and usable_segment(segment):
                             staged_coverage.append((a, b))
-                    offline_keys.add(directory.name)
+                    has_offline = True
                 except (OSError, ValueError, TypeError, KeyError):
                     # 整份离线文件验证后才纳入，避免部分解析结果抬高覆盖率。
                     staged_coverage = []
                     warnings += 1
-            sessions.append(row)
-            seen_keys.add(directory.name)
-            coverage.extend(staged_coverage)
-            if end > start:
-                windows.append((start, end))
+            selected[directory.name] = priority, row, staged_coverage, has_offline, (start, end)
         except (OSError, ValueError, TypeError, KeyError):
             warnings += 1
+    for _, row, staged_coverage, has_offline, span in selected.values():
+        sessions.append(row)
+        coverage.extend(staged_coverage)
+        if has_offline:
+            offline_keys.add(row['key'])
+        if span[1] > span[0]:
+            windows.append(span)
 
     history = []
     for window in historical_windows:
@@ -183,6 +190,8 @@ def archive_data(session_root, database, room_id, name, include_summaries=True, 
         return value_fields(result)
     earliest = min([a for a, _ in windows] + [epoch(s['start']) for s in sessions])
     raw_cmds = _HISTORY_RAW_COMMANDS if history else _ARCHIVE_RAW_COMMANDS
+    if share_label and warehouse_database:
+        raw_cmds += ('SEND_GIFT', 'SEND_GIFT_V2', 'COMBO_SEND', 'GUARD_BUY', 'SUPER_CHAT_MESSAGE', 'USER_TOAST_MSG_V2')
     item_kinds = ('gift', 'entry') if history else ('gift',)
     source = read_source(Path(database), room_id, iso(earliest),
                          raw_commands=raw_cmds, item_json_kinds=item_kinds)
@@ -268,6 +277,17 @@ def archive_data(session_root, database, room_id, name, include_summaries=True, 
             gift_items_only.append((kind, at, item))
 
     share_amounts = {}
+    unassigned_dates = set()
+    if share_label and warehouse_database and any(item.get('identity_status') == 'unresolved'
+                                                  for _, _, item in gift_items_only):
+        from .warehouse_backfill import overlay_archive_gift_identities
+        try:
+            gift_items_only = overlay_archive_gift_identities(
+                {'items': gift_items_only, 'raw': [row for row in source['raw'] if row[2] and row[1] in raw_cmds]},
+                Path(warehouse_database), windows,
+            )['items']
+        except (OSError, sqlite3.Error):
+            warnings += 1
     for stamp, count, amount, uid, _ in gift_observations({'items': gift_items_only}, platform_uid=True):
         date = _shanghai_date(stamp)
         if observed(stamp) and date in days:
@@ -278,8 +298,8 @@ def archive_data(session_root, database, room_id, name, include_summaries=True, 
             day['gift_amount_unknown'] += amount is None
             if share_label is not None and amount is not None:
                 if uid is None and amount > 0:
-                    share_amounts[date] = None
-                elif str(uid) in share_uids and share_amounts.get(date, 0) is not None:
+                    unassigned_dates.add(date)
+                elif str(uid) in share_uids:
                     share_amounts[date] = share_amounts.get(date, 0) + amount / 1000
 
     points = []
@@ -362,7 +382,9 @@ def archive_data(session_root, database, room_id, name, include_summaries=True, 
             'summaries': session_summaries, 'summary_source': 'recorded',
              'warnings': warnings, 'updated_at': iso(max([b for _, b in windows] +
                                                          [epoch(s['end']) for s in sessions]))}
-    result['periods'] = period_overview(result['days'], now=now, share_amounts=share_amounts, share_label=share_label)
+    result['periods'] = period_overview(result['days'], now=now, share_amounts=share_amounts, share_label=share_label,
+                                        unassigned_dates=unassigned_dates)
     if share_label is not None:
-        result['gift_share'] = overall_share(result['days'], share_amounts, share_label)
+        result['gift_share'] = overall_share(result['days'], share_amounts, share_label,
+                                             unassigned_dates=unassigned_dates)
     return value_fields(result)
