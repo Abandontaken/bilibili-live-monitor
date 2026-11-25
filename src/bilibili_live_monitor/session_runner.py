@@ -42,17 +42,20 @@ def _strip_cdn_beacon(match):
     return match.group()
 
 
+def read_remote_artifact(config, name):
+    req = urllib.request.Request(config['url'] + name,
+                                 headers={'Cache-Control': 'no-cache', 'User-Agent': 'bilibili-live-monitor/0.1'})
+    with urllib.request.urlopen(req, timeout=20) as response:
+        remote = response.read()
+    return re.sub(rb'<script\b[^>]*></script>\n?', _strip_cdn_beacon, remote) if name == 'index.html' else remote
+
+
 def verify_remote(config):
     if config.get('local_only', False):
         return
     for name in ('index.html', 'snapshot.json'):
         local = (Path(config['workspace']) / 'public' / name).read_bytes()
-        req = urllib.request.Request(config['url'] + name,
-                                     headers={'Cache-Control': 'no-cache', 'User-Agent': 'bilibili-live-monitor/0.1'})
-        with urllib.request.urlopen(req, timeout=20) as response:
-            remote = response.read()
-        if name == 'index.html':
-            remote = re.sub(rb'<script\b[^>]*></script>\n?', _strip_cdn_beacon, remote)
+        remote = read_remote_artifact(config, name)
         if hashlib.sha256(remote).digest() != hashlib.sha256(local).digest():
             raise RuntimeError('远端看板内容与本次本地产物不一致')
 
