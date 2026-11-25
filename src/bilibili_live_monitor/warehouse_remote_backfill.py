@@ -184,6 +184,10 @@ def _update_html(page, previous, gifts, activity):
         return page
 
     def update(section):
+        header = '<th>礼物数</th><th>金额（元）</th>'
+        legacy = '送礼人数</th>' not in section and section.count(header) == 1
+        if legacy:
+            section = section.replace(header, '<th>礼物数</th><th>送礼人数</th><th>金额（元）</th>', 1)
         table = re.search(r'<tbody>(.*?)</tbody>', section, re.S)
         if table is None:
             raise ValueError('页面缺少活动表')
@@ -192,10 +196,13 @@ def _update_html(page, previous, gifts, activity):
         def row(match):
             before, after = next(rows)
             cells = list(re.finditer(r'<td(?: [^>]*)?>(.*?)</td>', match[0], re.S))
-            if len(cells) != 7 or cells[4][1] != _users(before):
+            if len(cells) != (6 if legacy else 7) or (not legacy and cells[4][1] != _users(before)):
                 raise ValueError('页面和快照的区间人数不一致')
             if tuple(html.unescape(re.sub(r'<[^>]+>', '', cell[1])) for cell in cells[:2]) != _period_title(before):
                 raise ValueError('页面和快照的区间身份不一致')
+            if legacy:
+                at = cells[4].start()
+                return match[0][:at] + f'<td>{_users(after)}</td>' + match[0][at:]
             lo, hi = cells[4].span(1)
             return match[0][:lo] + _users(after) + match[0][hi:]
 
@@ -271,10 +278,14 @@ def _session(workspace, warehouse, dictionary, execute, target):
                     for old, new in zip(snapshot['activity_summary'], activity, strict=True)]
         if previous == gifts and snapshot['activity_summary'] == activity:
             return 'unchanged'
+        before = {name: _hash((public / name).read_bytes()) for name in FILES}
+        try:
+            page = _update_html((public / 'index.html').read_bytes().decode(), snapshot, gifts, activity)
+        except (ValueError, StopIteration):
+            return 'skipped_incompatible_html'
         if not execute:
             return 'would_publish'
-        before = {name: _hash((public / name).read_bytes()) for name in FILES}
-        files = {'index.html': _update_html((public / 'index.html').read_bytes().decode(), snapshot, gifts, activity),
+        files = {'index.html': page,
                  'snapshot.json': json.dumps({**snapshot, 'gift_summary': gifts, 'activity_summary': activity},
                                              ensure_ascii=False, separators=(',', ':'))}
         transaction = {'target': [config['remote'], config['url']], 'before': before, 'files': files,
