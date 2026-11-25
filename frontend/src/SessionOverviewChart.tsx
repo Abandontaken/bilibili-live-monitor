@@ -68,7 +68,7 @@ export function SessionOverviewChart({rows}:{rows:SummaryRow[]}){
    </div>
    <output className="overview-chart-detail" aria-live="polite">{selected?
     `${selected.date} · ${selected.session} ｜ 平均在线 ${online(selected.metrics.online_mean)} 人 ｜ 礼物总金额 ${amount(selected.metrics.amount)}`:
-    '默认显示最近场次，向左滚动查看更早场次；悬停、点击或用键盘选中可查看数值。缺失数据不记为零。'}</output>
+    '向左滚动查看更早场次。'}</output>
   </>}
  </section>;
 }
