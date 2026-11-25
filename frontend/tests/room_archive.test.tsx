@@ -23,7 +23,9 @@ test('按日期筛选场次、保留跨日场次且不把累计看过汇成日�
  expect(screen.getByText('查看本场实时结果 →').getAttribute('href')).toBe('/instances/guest/sessions/b/');
  fireEvent.change(screen.getByLabelText('选择日期'),{target:{value:'2026-01-01'}});
  expect(screen.queryByText('查看本场实时结果 →')).toBeNull();
- expect(screen.getByText('跨日场次 · 本页汇总仅计入所选日期')).toBeTruthy();
+ expect(screen.getAllByText('22')).toHaveLength(1);
+ expect(screen.getByText('查看最终结果 →')).toBeTruthy();
+ expect(screen.queryByText(/所选日期|暂无上报|不跨场相加去重/)).toBeNull();
  expect(fetch.mock.calls[0][0]).toBe('/instances/guest/api/rooms/1/archive');
  expect(screen.queryByRole('link',{name:'远程逐日看板 ↗'})).toBeNull();
 });
@@ -55,8 +57,8 @@ test('按日显示粉丝团收盘值与较上次推送日期的变化，无推�
  render(<RoomArchive base="/instances/guest/" roomId="1"/>);
  await screen.findByText('测试主播');
  expect(screen.getByText('粉丝团人数')).toBeTruthy();
- expect(screen.getByText('当天无平台推送')).toBeTruthy();
+ expect(screen.getByText('粉丝团人数').nextElementSibling?.textContent).toBe('—');
  fireEvent.change(screen.getByLabelText('选择日期'),{target:{value:'2026-01-02'}});
  expect(screen.getByText('37')).toBeTruthy();
- expect(screen.getByText(/^较 01-01 \+5 · 截至/)).toBeTruthy();
+ expect(screen.getByText('较 01-01 +5')).toBeTruthy();
 });

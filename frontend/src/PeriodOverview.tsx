@@ -9,9 +9,7 @@ export type PeriodSummary={days:number;start:string;end:string;observed_days:num
  fans_club_change?:number|null;fans_club_change_since?:string|null};
 export function GiftShareValue({share}:{share:GiftShare}){
  const value=share.percentage??share.confirmed_percentage;
- return <>{value==null?'—':value.toFixed(2)+'%'}{share.percentage==null&&share.confirmed_percentage!=null&&
-  <small className="period-detail">（已确认送礼 ÷ 已知总标价{share.covered_sessions!=null&&
-   `，覆盖 ${share.covered_sessions}/${share.total_sessions} 场`}）</small>}</>;
+ return <>{value==null?'—':value.toFixed(2)+'%'}</>;
 }
 const signed=(value:number|null|undefined)=>value==null?'—':(value>0?'+':'')+value.toLocaleString('zh-CN');
 // 跨年时保留年份，避免很久以前的基线只显示月日。
@@ -28,7 +26,7 @@ export function PeriodOverview({periods,giftShare}:{periods:PeriodSummary[];gift
     {'fans_club_change' in item&&<div><span>粉丝团变化</span><strong>{signed(item.fans_club_change)}</strong>
      {item.fans_club_change_since&&<em className="period-detail">较 {monthDay(item.fans_club_change_since,item.end)}</em>}</div>}
      {item.gift_share&&<div><span>{item.gift_share.label}送礼占比</span><strong><GiftShareValue share={item.gift_share}/></strong></div>}
-   </div><small>有记录 {item.observed_days} 天 · 含今天</small>
+   </div>
   </section>)}
    {giftShare&&<p className="period-total-share">{giftShare.label}总体送礼占比 <strong><GiftShareValue share={giftShare}/></strong></p>}
  </div>;

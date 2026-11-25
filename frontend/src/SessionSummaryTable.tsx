@@ -11,7 +11,6 @@ export function SessionSummaryTable({rows,base=''}:{rows:SummaryRow[];base?:stri
    key==='online_mean'?value.toFixed(2):key.startsWith('amount')?'¥'+value.toFixed(2):
     (key==='followers_net'&&value>0?'+':'')+value.toLocaleString('zh-CN');
  return <section className="archive-panel session-summary" aria-label="场次汇总"><h2>场次汇总</h2>
-  <p>按开播日期查看完整场次，跨天直播不拆分。暂无记录的指标显示为 —。</p>
   <div className="session-summary-scroll" tabIndex={0} aria-label="场次汇总表，可横向滚动"><table><thead><tr>
    <th>日期 · 场次</th><th>时长</th>{columns.map(([key,label])=><th key={key}>{label}</th>)}<th>状态</th>
    </tr></thead><tbody id="rows">{rows.map((row,index)=><tr key={row.key||row.date+row.session+index}>

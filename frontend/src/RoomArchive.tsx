@@ -44,26 +44,22 @@ export function RoomArchive({base,roomId}:{base:string;roomId:string}){
      <div><span>当天涉及场次</span><strong>{selected.session_keys.length}</strong></div>
       <div><span>已记录时长</span><strong>{hours(selected.coverage_seconds)}</strong><small>直播时长 {hours(selected.observed_seconds)}</small></div>
      <div><span>弹幕条数</span><strong>{number(selected.danmaku)}</strong></div>
-      <div><span>进房次数</span><strong>{number(selected.entries)}</strong><small>同一观众多次来访会重复计入</small></div>
+      <div><span>进房次数</span><strong>{number(selected.entries)}</strong></div>
      <div><span>累计看过（分场）</span>{selected.watched_sessions?.length?selected.watched_sessions.map(w=><section key={w.key}>
-      <strong>{number(w.value)}</strong><small style={{display:'block'}}>开播 {clock(w.start)}{w.observed_at?' · 上报 '+clock(w.observed_at):' · 暂无上报'}</small>
-     </section>):<strong>—</strong>}<small>截至所选日期末或当前的本场累计值；跨日含此前观看，不跨场相加去重</small></div>
-     <div><span>礼物价值</span><strong>{selected.gift_value_yuan==null?'—':'¥'+selected.gift_value_yuan.toFixed(2)}{selected.gift_amount_unknown?'+':''}</strong><small>{number(selected.gift_count)} 件{selected.gift_count_unknown?'，另有数量未知事件':''}</small></div>
-      {'fans_club_close' in selected&&<div><span>粉丝团人数</span><strong>{number(selected.fans_club_close)}</strong><small>{selected.fans_club_close==null?'当天无平台推送':
-       (selected.fans_club_change==null||!selected.fans_club_change_since?'暂无更早记录可比较':'较 '+selected.fans_club_change_since.slice(5)+' '+(selected.fans_club_change>0?'+':'')+number(selected.fans_club_change))+
-       (selected.fans_club_close_at?' · 截至 '+clock(selected.fans_club_close_at):'')}</small></div>}
-      <div><span>净涨粉</span><strong>{selected.followers_change==null?'—':(selected.followers_change>0?'+':'')+number(selected.followers_change)}</strong><small>{selected.followers_partial?'当天记录不完整':'按当天记录计算'}</small></div>
+      <strong>{number(w.value)}</strong><small style={{display:'block'}}>开播 {clock(w.start)}</small>
+     </section>):<strong>—</strong>}</div>
+     <div><span>礼物价值</span><strong>{selected.gift_value_yuan==null?'—':'¥'+selected.gift_value_yuan.toFixed(2)}{selected.gift_amount_unknown?'+':''}</strong><small>{number(selected.gift_count)} 件</small></div>
+      {'fans_club_close' in selected&&<div><span>粉丝团人数</span><strong>{number(selected.fans_club_close)}</strong>
+       {selected.fans_club_close!=null&&selected.fans_club_change!=null&&selected.fans_club_change_since&&
+        <small>较 {selected.fans_club_change_since.slice(5)} {selected.fans_club_change>0?'+':''}{number(selected.fans_club_change)}</small>}</div>}
+      <div><span>净涨粉</span><strong>{selected.followers_change==null?'—':(selected.followers_change>0?'+':'')+number(selected.followers_change)}</strong></div>
     </section>
-    {selected.coverage_seconds<selected.observed_seconds*.95&&<p className="archive-note">当天转写未覆盖全部场次时间，空白时段不视为已采集。</p>}
     <h2>当天场次</h2><section className="archive-sessions">{sessions.map(s=><article className="archive-panel" key={s.key}>
      <div className="archive-section-title"><h3>{clock(s.start)} — {clock(s.end)}</h3><span className={'archive-status '+s.status}>{status[s.status]||'处理中'}</span></div>
-     {s.dates.length>1&&<p className="archive-note">跨日场次 · 本页汇总仅计入所选日期</p>}
      <p>本场礼物价值 ¥{s.summary.gift_value_yuan?.toFixed(2)??'—'} · {number(s.summary.gift_count)} 件 · 平台累计看过 {number(s.summary.watched)}</p>
      {s.has_result?<a className="archive-result" href={base+'sessions/'+s.key+'/'}>{s.status==='completed'?'查看最终结果':'查看本场实时结果'} →</a>:<p>本场结果准备中</p>}
     </article>)}</section>
    </>}
-    <p className="archive-note">日均来访按实际有记录天数计算，同一观众多次进入会重复计入。盲盒按抽中礼物面值统计，非主播实收；无记录显示 —。</p>
-    {data.days.some(d=>'fans_club_close' in d)&&<p className="archive-note">粉丝团人数为平台推送的当前点亮人数，平台只在开播时推送，每天取最后一次推送值；变化与上一个有推送的日期比较，包含下播期间的到期熄灭。</p>}
     {!!data.warnings&&<p role="alert">有 {data.warnings} 场记录暂时无法显示。</p>}
    <p className="archive-note">最新数据时间：{data.updated_at?clock(data.updated_at):'暂无'}</p>
   </>}
