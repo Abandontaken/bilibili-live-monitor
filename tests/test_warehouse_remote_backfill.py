@@ -80,7 +80,11 @@ def test_origin_installer_refuses_changed_peer_before_replacing_either_file(tmp_
 
 def test_html_only_changes_activity_user_cell():
     page = ('<nav><a href="/existing">back</a></nav><section id="activity-summary">'
-            '<table><tbody><tr><td>time</td><td><a href="/song">song</a></td><td>0</td>'
+            '<table><tbody><tr><td>08:00:00–08:01:00</td><td><a href="/song">song</a></td><td>0</td>'
             '<td>3</td><td>0+</td><td>10</td><td></td></tr></tbody></table></section>')
-    before = {'gift_summary': [], 'activity_summary': [{'gift_users': 0, 'gift_users_unknown_events': 3}]}
+    before = {'gift_summary': [], 'activity_summary': [{'gift_users': 0, 'gift_users_unknown_events': 3,
+              'kind': 'song', 'title': 'song', 'start': '2026-01-01T00:00:00+00:00',
+              'end': '2026-01-01T00:01:00+00:00'}]}
     assert backfill._update_html(page, before, [], [{'gift_users': 1}]) == page.replace('<td>0+</td>', '<td>1</td>')
+    with pytest.raises(ValueError, match='区间身份'):
+        backfill._update_html(page.replace('>song<', '>other<'), before, [], [{'gift_users': 1}])

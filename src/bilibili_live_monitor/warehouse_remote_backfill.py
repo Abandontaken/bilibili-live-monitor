@@ -1,6 +1,7 @@
 """Opt-in identity backfill for already published single-session pages."""
 import fcntl
 import hashlib
+import html
 import json
 import os
 import re
@@ -9,7 +10,9 @@ import subprocess
 import tempfile
 from collections import Counter
 from contextlib import ExitStack
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from . import warehouse_backfill as local_backfill
 from .activity_summary import render_gifters
@@ -30,35 +33,54 @@ ACCOUNTING = ('gift_count', 'gift_count_unknown', 'gift_amount_yuan', 'gift_amou
 
 # Compare at the write destination under a directory lock, not just at the CDN.
 _REMOTE_INSTALL = '''
-import fcntl, hashlib, json, os, pathlib, sys, tempfile
+import ctypes, fcntl, hashlib, json, os, pathlib, shutil, sys, tempfile
 root = pathlib.Path(sys.argv[1])
 tx = json.load(sys.stdin)
-fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+fd = os.open(root.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
 fcntl.flock(fd, fcntl.LOCK_EX)
-pending = []
 try:
-    for name in ('index.html', 'snapshot.json'):
+    names = ('index.html', 'snapshot.json')
+    if root.is_symlink() or set(p.name for p in root.iterdir()) != set(names):
+        raise ValueError('unexpected origin directory')
+    root_stat = root.stat()
+    staged = pathlib.Path(tempfile.mkdtemp(prefix='.identity-', dir=root.parent))
+    changed = False
+    initial = {}
+    for name in names:
         path = root / name
         if path.is_symlink() or not path.is_file():
             raise ValueError('invalid artifact')
         data = tx['files'][name].encode()
         current = hashlib.sha256(path.read_bytes()).hexdigest()
+        initial[name] = current
         new = hashlib.sha256(data).hexdigest()
         if current not in {tx['before'][name], new}:
             raise ValueError('destination changed')
-        if current == new:
-            continue
-        with tempfile.NamedTemporaryFile(dir=root, delete=False) as temp:
-            pending.append((temp.name, path))
-            os.fchmod(temp.fileno(), path.stat().st_mode & 0o777)
+        changed |= current != new
+        meta = path.stat()
+        with (staged / name).open('xb') as temp:
+            os.fchown(temp.fileno(), meta.st_uid, meta.st_gid)
+            os.fchmod(temp.fileno(), meta.st_mode & 0o7777)
             temp.write(data)
             temp.flush()
             os.fsync(temp.fileno())
-    for temp, path in pending:
-        os.replace(temp, path)
+    if changed:
+        os.chown(staged, root_stat.st_uid, root_stat.st_gid)
+        os.chmod(staged, root_stat.st_mode & 0o7777)
+        if (root.stat().st_ino != root_stat.st_ino or set(p.name for p in root.iterdir()) != set(names)
+                or any(hashlib.sha256((root / n).read_bytes()).hexdigest() != initial[n] for n in names)):
+            raise ValueError('destination changed while staging')
+        lib = ctypes.CDLL(None, use_errno=True)
+        if sys.platform == 'darwin':
+            result = lib.renamex_np(os.fsencode(root), os.fsencode(staged), 2)
+        else:
+            result = lib.renameat2(-100, os.fsencode(root), -100, os.fsencode(staged), 2)
+        if result:
+            err = ctypes.get_errno()
+            raise OSError(err, os.strerror(err))
 finally:
-    for temp, _ in pending:
-        pathlib.Path(temp).unlink(missing_ok=True)
+    if 'staged' in locals():
+        shutil.rmtree(staged)
     os.close(fd)
 '''
 
@@ -132,6 +154,16 @@ def _users(row):
             str(row['gift_users']) + ('+' if row.get('gift_users_unknown_events') else ''))
 
 
+def _period_title(row):
+    if row.get('time_unknown'):
+        return '—', '未分类／礼物事件时间不明'
+    period = '–'.join(datetime.fromisoformat(row[k]).astimezone(ZoneInfo('Asia/Shanghai')).strftime('%H:%M:%S')
+                      for k in ('start', 'end'))
+    title = ((row['title'] or '歌名待确认') if row['kind'] == 'song' else
+             '杂谈' if row['kind'] == 'talk' else '未分类／无内容记录')
+    return period, title
+
+
 def _update_html(page, previous, gifts, activity):
     if previous['gift_summary'] != gifts:
         page = _replace_section(page, 'gift-summary', lambda _: render_gifters(gifts))
@@ -149,6 +181,8 @@ def _update_html(page, previous, gifts, activity):
             cells = list(re.finditer(r'<td(?: [^>]*)?>(.*?)</td>', match[0], re.S))
             if len(cells) != 7 or cells[4][1] != _users(before):
                 raise ValueError('页面和快照的区间人数不一致')
+            if tuple(html.unescape(re.sub(r'<[^>]+>', '', cell[1])) for cell in cells[:2]) != _period_title(before):
+                raise ValueError('页面和快照的区间身份不一致')
             lo, hi = cells[4].span(1)
             return match[0][:lo] + _users(after) + match[0][hi:]
 
@@ -245,6 +279,8 @@ def backfill_remote_pages(warehouse, roots, *, execute=False):
     counts = Counter()
     failures = []
     dictionary = None
+    entries = []
+    targets = Counter()
 
     def load_dictionary():
         nonlocal dictionary
@@ -259,12 +295,25 @@ def backfill_remote_pages(warehouse, roots, *, execute=False):
             if entry.is_symlink() or not entry.is_dir():
                 continue
             try:
-                # Avoid taking locks on local-only sessions in the remote pass.
                 cfg = entry / 'config.json'
-                if not cfg.is_file() or cfg.is_symlink() or json.loads(cfg.read_text()).get('local_only') is not False:
+                if not cfg.is_file() or cfg.is_symlink():
                     continue
-                counts[_session(entry, warehouse, load_dictionary, execute)] += 1
+                data = json.loads(cfg.read_text())
+                if data.get('local_only') is not False:
+                    continue
+                target = (('ssh', data.get('remote')), ('https', data.get('url')))
+                targets.update(x for x in target if x[1])
+                entries.append((entry, target))
             except Exception as exc:
                 counts['failed'] += 1
                 failures.append({'session': entry.name, 'reason': type(exc).__name__})
+    for entry, target in entries:
+        try:
+            if any(targets[x] > 1 for x in target):
+                counts['skipped_shared_destination'] += 1
+                continue
+            counts[_session(entry, warehouse, load_dictionary, execute)] += 1
+        except Exception as exc:
+            counts['failed'] += 1
+            failures.append({'session': entry.name, 'reason': type(exc).__name__})
     return {'counts': dict(counts), 'failures': failures}
