@@ -187,11 +187,11 @@ def export_snapshot(config):
     return {'output': str(destination), 'published': False, 'phase': snapshot['phase'], 'cutoff': iso(cutoff)}
 
 
-def verify_snapshot(config):
+def verify_snapshot(config, *, public_dir=None):
     from .activity_summary import accounting_errors
     from .annotation_history import read_annotations
     workspace = Path(config['workspace'])
-    public = workspace / 'public'
+    public = public_dir if public_dir is not None else workspace / 'public'
     snapshot = json.loads((public / 'snapshot.json').read_text())
     page = (public / 'index.html').read_text()
     errors = accounting_errors(snapshot)
