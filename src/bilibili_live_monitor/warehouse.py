@@ -167,10 +167,12 @@ SELECT
     e.*,
     CASE
         WHEN e.is_mystery = 1 THEN NULL
+        WHEN e.inference_method = 'blind_box_first_rank_window' THEN NULL
         ELSE COALESCE(e.raw_uid, u_md5.uid, e.resolved_crc32_uid, u_face_user.uid, e.inferred_uid)
     END AS resolved_uid,
     CASE
         WHEN e.is_mystery = 1 THEN 'mystery:' || e.session_key || ':' || e.event_seq
+        WHEN e.inference_method = 'blind_box_first_rank_window' THEN 'anon:' || e.session_key || ':' || e.event_seq
         WHEN COALESCE(e.raw_uid, u_md5.uid, e.resolved_crc32_uid, u_face_user.uid, e.inferred_uid) IS NOT NULL
             THEN 'uid:' || COALESCE(e.raw_uid, u_md5.uid, e.resolved_crc32_uid, u_face_user.uid, e.inferred_uid)
         WHEN e.clue_md5 IS NOT NULL THEN 'md5:' || e.clue_md5
@@ -180,6 +182,7 @@ SELECT
     END AS actor_key,
     CASE
         WHEN e.is_mystery = 1 THEN 'mystery'
+        WHEN e.inference_method = 'blind_box_first_rank_window' THEN 'unresolved'
         WHEN e.raw_uid IS NOT NULL THEN 'native_uid'
         WHEN u_md5.uid IS NOT NULL THEN 'global_md5'
         WHEN e.resolved_crc32_uid IS NOT NULL THEN 'crc32_first_char'
@@ -1435,6 +1438,7 @@ def _resolve_danmaku_crc32_and_presence(wh: sqlite3.Connection) -> dict[str, int
            AND u_md5.uid IS NULL
            AND e.clue_face_sha1 = u_face.face_sha1
         WHERE e.is_mystery = 0
+          AND e.inference_method IS NOT 'blind_box_first_rank_window'
           AND COALESCE(e.raw_uid, u_md5.uid, u_face.uid, e.inferred_uid) IS NOT NULL
         GROUP BY e.session_key, e.room_id, firm_uid
         """

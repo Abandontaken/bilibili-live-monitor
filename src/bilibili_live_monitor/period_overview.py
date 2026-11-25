@@ -57,6 +57,10 @@ def overall_share(days, amounts, label):
 
 def summary_gift_share(rows, label):
     """总体沿用已审核场次金额，避免遗漏只有历史汇总的场次。"""
+    rows = list(rows)
+    if any('paid_donors_nonself' in metrics and metrics['paid_donors_nonself'] is None
+           for metrics in (row.get('metrics', {}) for row in rows)):
+        return {'label': label, 'percentage': None}
     # 调用者须确认 amount_nonself 排除的账号集合与当前指定对象一致。
     amounts = [(row.get('metrics', {}).get('amount'), row.get('metrics', {}).get('amount_nonself'))
                for row in rows]

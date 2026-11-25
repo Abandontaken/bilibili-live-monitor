@@ -91,11 +91,12 @@ def aggregate_prepared_metrics(prepared, lower, upper, excluded_uids=None):
     known_amount = observed and all(gift[2] is not None for gift in gifts)
     amount = round(sum(gift[2] for gift in gifts) / 1000, 2) if known_amount else None
     others = donors = None
-    if excluded_uids is not None and known_amount and all(not gift[2] or gift[3] is not None for gift in gifts):
+    if excluded_uids is not None and known_amount:
         excluded = set(map(str, excluded_uids))
         selected = [gift for gift in gifts if str(gift[3]) not in excluded]
         others = round(sum(gift[2] for gift in selected) / 1000, 2)
-        donors = len({str(gift[3]) for gift in selected if gift[2] > 0})
+        if all(not gift[2] or gift[3] is not None for gift in selected):
+            donors = len({str(gift[3]) for gift in selected if gift[2] > 0})
     return {'online_mean': weighted / seconds if seconds else None,
             'online_peak': max((value for _, value in online), default=None),
             'watched_last': watched[-1][1] if watched else None,

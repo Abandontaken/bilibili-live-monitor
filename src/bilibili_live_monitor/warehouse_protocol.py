@@ -876,9 +876,11 @@ def _apply_blind_box_rank_windows(
         if gift['tid']:
             tid_counts[(gift['tid'], gift['batch_index'])] += 1
 
-    def mask_prefix(items: list[dict[str, Any]]) -> str | None:
+    def mask_prefix(items: list[dict[str, Any]], *, allow_symbol: bool = False) -> str | None:
         mask = items[0]['raw_uname'] or ''
-        if len(mask) != 4 or mask[1:] != '***' or not mask[0].isalnum() or any(
+        if len(mask) != 4 or mask[1:] != '***' or not (
+            mask[0].isalnum() or (allow_symbol and mask[0] == '-')
+        ) or any(
             g['raw_uname'] != mask or g['is_mystery'] for g in items
         ):
             return None
@@ -907,6 +909,10 @@ def _apply_blind_box_rank_windows(
     others = sorted(other_paid)
     ranks.sort(key=lambda frame: frame[0])
     rank_times = [frame[0] for frame in ranks]
+    first_seen = {}
+    for idx, (_, scores, _) in enumerate(ranks):
+        for uid in scores:
+            first_seen.setdefault(uid, idx)
     by_mask: dict[str, list[list[int]]] = defaultdict(list)
     for rid in ids:
         mask = masks[rid]
@@ -936,40 +942,81 @@ def _apply_blind_box_rank_windows(
                 budgets.append(budgets[-1] + value)
             latest_event = max(g['event_ts'] for rid in group for g in packets[rid])
             after_lo = bisect_right(rank_times, max(last, latest_event))
-            after_hi = bisect_right(rank_times, last + 35)
             possible: set[int] = set()
+            # A buyer can enter the visible board because of their first blind box.
+            # Only infer a zero baseline if the first observed score accounts for the
+            # gifts received by that frame and arrives with the first gift broadcast.
+            newcomers = {}
+            entry_hi = bisect_right(rank_times, first + 3)
+            for idx in range(lo + 1, entry_hi):
+                t, scores, names = ranks[idx]
+                budget = budgets[bisect_right(arrival_times, t + 0.1)]
+                for uid in scores:
+                    if (first_seen[uid] == idx and first - 0.1 <= t < last - 0.1
+                            and 0 < budget < points and scores[uid] == budget
+                            and names.get(uid, '').casefold().startswith(mask)):
+                        newcomers[uid] = (names[uid], idx)
+            # The initial appearance already anchors newcomers to this group. Allow
+            # one minute for their final score to arrive, but keep the old window for existing buyers.
+            after_hi = bisect_right(rank_times, last + (60 if newcomers else 35))
             for after, scores, names in ranks[after_lo:after_hi]:
                 if bisect_left(others, before - 1) != bisect_right(others, after + 1):
                     break
                 nearby = ids[bisect_left(gift_times, before - 1):bisect_right(gift_times, after + 1)]
                 competitors = [rid for rid in nearby if rid not in group_ids]
-                # 不把不同首字的未识别礼物并入；若其金额本身可解释目标跳变，就拒绝整个窗口。
-                if any(prefixes[rid] in (None, mask) or any(not g['face_known'] for g in packets[rid])
+                if any(prefixes[rid] == mask or any(not g['face_known'] for g in packets[rid])
                        for rid in competitors) or sum(
                     g['output_milli_yuan'] for rid in competitors for g in packets[rid]
                 ) >= points * 100:
                     break
+                opaque = [rid for rid in competitors if prefixes[rid] is None]
+                if opaque and (not newcomers or len(opaque) != 1
+                               or receipts[opaque[0]] >= first
+                               or mask_prefix(packets[opaque[0]], allow_symbol=True) != '-'):
+                    break
                 matches = {
-                    uid for uid, score in scores.items() if uid in old and score - old[uid] == points
+                    uid for uid, score in scores.items()
+                    if (uid in newcomers or (not opaque and uid in old and after <= last + 35))
+                    and score - old.get(uid, 0) == points
                 }
                 if len(matches) > 1:
                     possible.clear()
                     break
                 for uid in matches:
-                    if any(frame[1].get(uid, old[uid]) != old[uid]
+                    if opaque:
+                        # 首次上榜帧若也记录了另一笔礼物的独立精确跳分，可排除该笔干扰。
+                        # 连字符只用于排除干扰，不作为认领目标的昵称证据。
+                        rid = opaque[0]
+                        if any(g['event_ts'] > first for g in packets[rid]):
+                            continue
+                        _, entry_scores, entry_names = ranks[newcomers[uid][1]]
+                        value = sum(g['output_milli_yuan'] for g in packets[rid])
+                        competitor_ts = max(receipts[rid], *(g['event_ts'] for g in packets[rid]))
+                        if value <= 0 or sum(
+                            other != uid and other in old and entry_names.get(other, '').startswith('-')
+                            and (score - old[other]) * 100 == value
+                            and all(frame_scores.get(other, old[other]) == old[other]
+                                    for _, frame_scores, _ in ranks[
+                                        lo + 1:bisect_left(rank_times, competitor_ts - 0.1)
+                                    ])
+                            for other, score in entry_scores.items()
+                        ) != 1:
+                            continue
+                    baseline = old.get(uid, 0)
+                    if any(frame[1].get(uid, baseline) != baseline
                            for frame in ranks[lo + 1:bisect_left(rank_times, first - 0.1)]):
                         continue
                     samples = [frame[1][uid] for frame in ranks[lo:bisect_right(rank_times, after)] if uid in frame[1]]
                     if any(y < x for x, y in zip(samples, samples[1:])):
                         continue
                     # 同毫秒广播可能先到榜单。只给极短收包乱序余量，尾帧仍须在最后一条礼物之后。
-                    if any(frame_scores[uid] - old[uid] > budgets[bisect_right(arrival_times, t + 0.1)]
+                    if any(frame_scores[uid] - baseline > budgets[bisect_right(arrival_times, t + 0.1)]
                            for t, frame_scores, _ in ranks[lo:bisect_right(rank_times, after)]
                            if uid in frame_scores):
                         continue
-                    if not names.get(uid, '').casefold().startswith(mask) or not old_names.get(
-                        uid, ''
-                    ).casefold().startswith(mask):
+                    previous_name = newcomers[uid][0] if uid in newcomers else old_names.get(uid, '')
+                    if (not names.get(uid, '').casefold().startswith(mask)
+                            or not previous_name.casefold().startswith(mask)):
                         continue
                     if any(
                         other != uid and value > old.get(other, 0)
@@ -984,7 +1031,9 @@ def _apply_blind_box_rank_windows(
                 for rid in group:
                     for gift in packets[rid]:
                         gift['inferred_uid'] = uid
-                        gift['inference_method'] = 'blind_box_rank_window'
+                        gift['inference_method'] = (
+                            'blind_box_first_rank_window' if uid in newcomers else 'blind_box_rank_window'
+                        )
 
 
 def extract_session_events(

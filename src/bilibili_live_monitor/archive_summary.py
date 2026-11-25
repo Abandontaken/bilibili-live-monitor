@@ -56,6 +56,8 @@ def shared_summaries(path, local_rows, origin=None):
         metrics = row['metrics']
         values = {key: value if type(value := metrics.get(key)) in (int, float) and math.isfinite(value)
                   else None for key in FIELDS}
+        if 'paid_donors_nonself' not in metrics:
+            values.pop('paid_donors_nonself', None)
         match = matches.get(row.get('start_utc'))
         if row.get('gift_value_basis', data.get('gift_value_basis')) != VALUE_BASIS:
             values['amount'] = ((match.get('metrics') or {}).get('amount') if 'metrics' in match else

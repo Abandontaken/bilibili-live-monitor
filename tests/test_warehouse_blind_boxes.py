@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 
 import pytest
 
+from bilibili_live_monitor import warehouse_backfill
 from bilibili_live_monitor.warehouse_backfill import (
     _load_blind_box_assignments,
     overlay_session_gift_identities,
@@ -44,6 +45,44 @@ def test_split_rank_updates_match_face_value_without_changing_paid_cost():
     ])
     assert [(g['inferred_uid'], g['inference_method']) for g in gifts] == [(42, 'blind_box_rank_window')] * 2
     assert [(g['paid_milli_yuan'], g['output_milli_yuan']) for g in gifts] == [(15000, 40000), (15000, 9000)]
+
+
+@pytest.mark.parametrize('first_score,expected', [(20, 42), (21, None)])
+def test_first_blind_box_can_put_the_buyer_on_the_board(first_score, expected):
+    before = _rank(1, 1, 0)
+    before[3]['data']['online_list'].pop(0)
+    gifts = _extract([
+        before, _rank(3, 9.999, first_score), _gift(2, 10, 2000),
+        _gift(4, 20, 9000), _rank(5, 62, 110),
+    ], cutoff=90)
+    assert [g['inferred_uid'] for g in gifts] == [expected, expected]
+    assert [g['inference_method'] for g in gifts] == [
+        'blind_box_first_rank_window' if expected else None,
+    ] * 2
+
+
+def test_first_visible_score_alone_does_not_attribute_a_gift():
+    before = _rank(1, 1, 0)
+    before[3]['data']['online_list'].pop(0)
+    gift, = _extract([before, _gift(2, 10, 2000), _rank(3, 11, 20), _rank(4, 12, 20)])
+    assert gift['inferred_uid'] is None
+
+
+@pytest.mark.parametrize('difference,seen_before,expected', [(90, False, 42), (91, False, None), (90, True, None)])
+def test_entry_with_an_independently_explained_competitor(difference, seen_before, expected):
+    early = _rank(1, 1, 20)
+    before = _rank(3, 10, 0)
+    before[3]['data']['online_list'].pop(0)
+    competing = _gift(2, 9.999, 9000)
+    competing[3]['data']['uname'] = '-***'
+    entry = _rank(4, 22.999, 20, other=30 + difference)
+    tail = _rank(7, 80, 110, other=30 + difference)
+    for frame in (early, before, entry, tail):
+        frame[3]['data']['online_list'][-1]['uname'] = '-另一位'
+    gifts = _extract(([early] if seen_before else []) + [
+        competing, before, entry, _gift(5, 23, 2000), _gift(6, 38, 9000), tail,
+    ], cutoff=90)
+    assert [g['inferred_uid'] for g in gifts] == [None, expected, expected]
 
 
 @pytest.mark.parametrize('after,other,cutoff', [(250, 30, 60), (500, 430, 60), (500, 30, 10), (500, 31, 60)])
@@ -126,3 +165,21 @@ def test_page_overlay_loads_same_assignment_from_warehouse(tmp_path):
     result, _ = overlay_session_gift_identities(source, {42: '灰头'}, {}, {}, identities)
     assert result['items'][0][2]['sender_uid'] == '42'
     assert 'sender_uid' not in item
+
+
+def test_page_overlay_does_not_name_first_rank_guesses(monkeypatch):
+    _, at, cmd, packet = _gift(2, 20, 40000)
+    item = {'author': '灰***', 'gift': {'event_id': 'test-2', 'event_type': 'SEND_GIFT'}}
+    source = {'raw': [(at, cmd, packet)], 'items': [('gift', at, item)]}
+    extract = warehouse_backfill.extract_raw_gift_clues
+
+    def clues(*args, **kwargs):
+        result = extract(*args, **kwargs)
+        result['all_gifts'][0].update(inferred_uid=42, inference_method='blind_box_first_rank_window')
+        return result
+
+    monkeypatch.setattr(warehouse_backfill, 'extract_raw_gift_clues', clues)
+    result, _ = overlay_session_gift_identities(source, {42: '灰头'}, {}, {})
+    gift = result['items'][0][2]
+    assert gift['author'] == '灰***'
+    assert 'sender_uid' not in gift
