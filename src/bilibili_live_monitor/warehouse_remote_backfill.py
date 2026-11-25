@@ -4,6 +4,7 @@ import hashlib
 import html
 import json
 import os
+import posixpath
 import re
 import shlex
 import subprocess
@@ -12,6 +13,7 @@ from collections import Counter
 from contextlib import ExitStack
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 from zoneinfo import ZoneInfo
 
 from . import warehouse_backfill as local_backfill
@@ -95,6 +97,13 @@ def _publish(config, transaction):
 
 def _hash(data):
     return hashlib.sha256(data).hexdigest()
+
+
+def _target_keys(config):
+    host, _, directory = (config.get('remote') or '').partition(':')
+    url = urlsplit(config.get('url') or '')
+    return (('ssh', host.rsplit('@', 1)[-1].lower(), posixpath.normpath('/' + directory.lstrip('/'))),
+            ('https', url.hostname, url.port or 443, posixpath.normpath('/' + unquote(url.path).lstrip('/'))))
 
 
 def _write_pending(path, data):
@@ -195,7 +204,7 @@ def _update_html(page, previous, gifts, activity):
     return _replace_section(page, 'activity-summary', update)
 
 
-def _session(workspace, warehouse, dictionary, execute):
+def _session(workspace, warehouse, dictionary, execute, target):
     cfg_path = workspace / 'config.json'
     wf_path = workspace / 'workflow.json'
     if not cfg_path.is_file() or not wf_path.is_file():
@@ -215,6 +224,8 @@ def _session(workspace, warehouse, dictionary, execute):
         config = load_config(cfg_path)
         if config.get('local_only') is not False or not config.get('remote') or not config.get('url'):
             return 'skipped_not_remote'
+        if target != (config['remote'], config['url']):
+            return 'skipped_target_changed'
         public = workspace / 'public'
         pending = workspace / 'identity_remote_pending.json'
         paths = [cfg_path, wf_path, pending, public, *(public / name for name in FILES)]
@@ -301,18 +312,18 @@ def backfill_remote_pages(warehouse, roots, *, execute=False):
                 data = json.loads(cfg.read_text())
                 if data.get('local_only') is not False:
                     continue
-                target = (('ssh', data.get('remote')), ('https', data.get('url')))
+                target = _target_keys(data)
                 targets.update(x for x in target if x[1])
-                entries.append((entry, target))
+                entries.append((entry, target, (data.get('remote'), data.get('url'))))
             except Exception as exc:
                 counts['failed'] += 1
                 failures.append({'session': entry.name, 'reason': type(exc).__name__})
-    for entry, target in entries:
+    for entry, target, raw_target in entries:
         try:
             if any(targets[x] > 1 for x in target):
                 counts['skipped_shared_destination'] += 1
                 continue
-            counts[_session(entry, warehouse, load_dictionary, execute)] += 1
+            counts[_session(entry, warehouse, load_dictionary, execute, raw_target)] += 1
         except Exception as exc:
             counts['failed'] += 1
             failures.append({'session': entry.name, 'reason': type(exc).__name__})
