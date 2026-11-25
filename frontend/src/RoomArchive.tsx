@@ -48,11 +48,11 @@ export function RoomArchive({base,roomId}:{base:string;roomId:string}){
      <div><span>累计看过（分场）</span>{selected.watched_sessions?.length?selected.watched_sessions.map(w=><section key={w.key}>
       <strong>{number(w.value)}</strong><small style={{display:'block'}}>开播 {clock(w.start)}</small>
      </section>):<strong>—</strong>}</div>
-     <div><span>礼物价值</span><strong>{selected.gift_value_yuan==null?'—':'¥'+selected.gift_value_yuan.toFixed(2)}{selected.gift_amount_unknown?'+':''}</strong><small>{number(selected.gift_count)} 件</small></div>
+     <div><span>礼物价值</span><strong>{selected.gift_value_yuan==null?'—':'¥'+selected.gift_value_yuan.toFixed(2)}{selected.gift_amount_unknown?'+':''}</strong><small>{selected.gift_count_unknown?'至少 ':''}{number(selected.gift_count)} 件</small></div>
       {'fans_club_close' in selected&&<div><span>粉丝团人数</span><strong>{number(selected.fans_club_close)}</strong>
        {selected.fans_club_close!=null&&selected.fans_club_change!=null&&selected.fans_club_change_since&&
         <small>较 {selected.fans_club_change_since.slice(5)} {selected.fans_club_change>0?'+':''}{number(selected.fans_club_change)}</small>}</div>}
-      <div><span>净涨粉</span><strong>{selected.followers_change==null?'—':(selected.followers_change>0?'+':'')+number(selected.followers_change)}</strong></div>
+      <div><span>净涨粉</span><strong>{selected.followers_change==null?'—':(selected.followers_change>0?'+':'')+number(selected.followers_change)}</strong>{selected.followers_partial&&<small>记录不全</small>}</div>
     </section>
     <h2>当天场次</h2><section className="archive-sessions">{sessions.map(s=><article className="archive-panel" key={s.key}>
      <div className="archive-section-title"><h3>{clock(s.start)} — {clock(s.end)}</h3><span className={'archive-status '+s.status}>{status[s.status]||'处理中'}</span></div>

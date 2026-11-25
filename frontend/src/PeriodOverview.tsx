@@ -9,7 +9,8 @@ export type PeriodSummary={days:number;start:string;end:string;observed_days:num
  fans_club_change?:number|null;fans_club_change_since?:string|null};
 export function GiftShareValue({share}:{share:GiftShare}){
  const value=share.percentage??share.confirmed_percentage;
- return <>{value==null?'—':value.toFixed(2)+'%'}</>;
+ return <>{value==null?'—':value.toFixed(2)+'%'}{share.percentage==null&&value!=null&&
+  <small className="period-detail">（数据不全）</small>}</>;
 }
 const signed=(value:number|null|undefined)=>value==null?'—':(value>0?'+':'')+value.toLocaleString('zh-CN');
 // 跨年时保留年份，避免很久以前的基线只显示月日。

@@ -16,6 +16,7 @@ it('展示滚动窗口、零值和可选占比，缺失不填零',()=>{
  expect(screen.getAllByText('—')).toHaveLength(2);
  expect(screen.getByText('25.00%')).toBeTruthy();
  expect(screen.getByText('50.00%')).toBeTruthy();
+ expect(screen.getAllByText('（数据不全）')).toHaveLength(1);
  expect(screen.queryByText(/已确认送礼|已知总标价|覆盖 42\/43/)).toBeNull();
 });
 
