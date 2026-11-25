@@ -122,18 +122,12 @@ def advance(config, state, now):
     if not uses_ai and not talk_final and phase == 'offline_review':
         state['stage'] = phase = 'finalizing'
     if phase == 'created':
-        if uses_ai and not state.get('ai_preflight'):
-            ai_control(config, 'preflight', model=config['model'])
-            state['ai_preflight'] = True
         if not config.get('local_only', False) and not state.get('remote_prepared'):
             host, directory = config['remote'].split(':', 1)
             subprocess.run(['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', host,
                             'mkdir -p -- ' + shlex.quote(directory)],
                            check=True, capture_output=True, timeout=30)
             state['remote_prepared'] = True
-        if uses_ai and not config.get('ai_session'):
-            config.update(ai_session=ensure_ai(config, 'update_periodic'), ai_enabled=True)
-            atomic_json(config_path, {k: v for k, v in config.items() if not k.startswith('_')})
         state['stage'] = 'live'
         return
     if phase == 'live':
@@ -154,7 +148,18 @@ def advance(config, state, now):
             verify_remote(config)
             state['ready'] = True
         slot = int(now // 300)
-        if uses_ai and state.get('ai_slot') != slot:
+        if (uses_ai and live_state.get('last_health', {}).get('asr_enabled') is True
+                and state.get('ai_slot') != slot):
+            starting_ai = not state.get('ai_preflight') or not config.get('ai_session')
+            if not state.get('ai_preflight'):
+                ai_control(config, 'preflight', model=config['model'])
+                state['ai_preflight'] = True
+            if not config.get('ai_session'):
+                config.update(ai_session=ensure_ai(config, 'update_periodic'), ai_enabled=True)
+                atomic_json(config_path, {k: v for k, v in config.items() if not k.startswith('_')})
+            if starting_ai:
+                # 预检和创建可能跨过下播或截止点；下一轮重新读取实时状态再派发。
+                return
             state['ai_slot'] = slot
             # 提交之前落盘；响应丢失不重复派发同一轮。
             atomic_json(workspace / 'workflow.json', state)
@@ -281,7 +286,7 @@ def advance(config, state, now):
             raise ValueError('离线复核已到批次上限，尚有未审窗口')
         state['review_batches'] = state.get('review_batches', 0) + 1
         atomic_json(workspace / 'workflow.json', state)
-        final_config = {**config, 'ai_session': state['final_session'],
+        final_config = {**config, 'ai_session': state['final_session'], 'ai_enabled': True,
                         'model': config.get('final_model', config['model'])}
         watch.ai_once(final_config, {'cutoff': state['cutoff']}, source, now, final=True)
         return
