@@ -106,3 +106,6 @@ def test_html_only_changes_activity_user_cell():
     assert backfill._update_html(page, before, [], [{'gift_users': 1}]) == page.replace('<td>0+</td>', '<td>1</td>')
     with pytest.raises(ValueError, match='区间身份'):
         backfill._update_html(page.replace('>song<', '>other<'), before, [], [{'gift_users': 1}])
+    legacy = page.replace('<td>0+</td>', '').replace('<tbody>', '<thead><tr><th>礼物数</th><th>金额（元）</th></tr></thead><tbody>')
+    assert backfill._update_html(legacy, before, [], [{'gift_users': 1}]) == legacy.replace(
+        '<td>10</td>', '<td>1</td><td>10</td>').replace('<th>金额（元）</th>', '<th>送礼人数</th><th>金额（元）</th>')
