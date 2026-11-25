@@ -317,40 +317,61 @@ def test_offline_uses_full_asr_pipeline_without_writing_source_or_duplicate_work
     assert media.read_bytes() == b'synthetic-media' and media.stat().st_mtime_ns == before.st_mtime_ns
 
 
-def test_end_to_end_lifecycle_uses_offline_reviews_and_same_public_url(tmp_path, monkeypatch):
+@pytest.mark.parametrize(('live_asr', 'cross_deadline'), [(False, False), (True, False), (True, True)])
+def test_end_to_end_lifecycle_uses_offline_reviews_and_same_public_url(tmp_path, monkeypatch, live_asr, cross_deadline):
     service, candidate = automation(tmp_path)
     manager = SessionWorkflows(service, settings(tmp_path))
     record = manager.prepare('123456', candidate)
     path = manager.initialize(record)
     config = load_config(path)
     config['finalize_parallel'] = False  # 继续覆盖旧单会话逐批模式的兼容路径。
-    state = {'stage': 'created', 'ai_preflight': True}
+    state = {'stage': 'created'}
     moment = epoch(START) + 60
     candidate['status_checked_utc'] = iso(moment)
     platform = {'candidates': [candidate], 'sources': [{'room_id': '123456', 'status': 'capturing'}]}
     api = {'rooms': [{'room_id': '123456', 'recorded_seconds': 50, 'recording_bytes': 123,
-                      'recording_status': 'recording', 'asr_enabled': True}], 'asr_ready': True, 'queue_depth': 0}
+                       'recording_status': 'recording', 'asr_enabled': live_asr}], 'asr_ready': live_asr, 'queue_depth': 0}
     monkeypatch.setattr(runner.subprocess, 'run', lambda *a, **k: None)
-    monkeypatch.setattr(runner, 'ai_control', lambda c, op, **kw: {'id': kw.get('title', 'id'), 'type': 'idle'})
+    ai_calls = []
+    def control(c, op, **kw):
+        nonlocal moment
+        ai_calls.append((op, kw.get('title', '').split(' ')[0]))
+        if cross_deadline and op == 'create' and kw['title'].startswith('update_periodic '):
+            moment = c['deadline'] + 1
+        return {'id': kw.get('title', 'id'), 'type': 'idle'}
+    monkeypatch.setattr(runner, 'ai_control', control)
     monkeypatch.setattr(runner.watch, 'request', lambda u: platform if u.endswith('/platform') else api)
     monkeypatch.setattr(runner.watch.time, 'time', lambda: moment)
     published = []
     monkeypatch.setattr(runner.watch, 'publish', lambda c, d: published.append(c['url']))
     monkeypatch.setattr(runner, 'verify_remote', lambda *a: None)
     def review(c, s, source, now, **kw):
+        assert c['ai_enabled'] and c['ai_session']
         if kw.get('final'):
             atomic_json(path.parent / 'annotations.json', {'reviews': [
                 {'seq': row['seq'], 'fingerprint': fingerprint(row), 'label': 'speaking',
                  'music_source': 'none', 'investigation_version': 2} for row in source['segments']]})
+        else:
+            ai_calls.append(('prompt', 'live'))
     monkeypatch.setattr(runner.watch, 'ai_once', review)
     runner.advance(config, state, moment)
+    assert not ai_calls
     config = load_config(path)
     config['finalize_parallel'] = False
+    if cross_deadline:
+        config['deadline'] = moment + 1
     runner.advance(config, state, moment)
     assert state['stage'] == 'live' and state['ready']
+    assert ai_calls == ([('preflight', ''), ('create', 'update_periodic')] if live_asr else [])
+    runner.advance(config, state, moment)
+    assert ai_calls.count(('prompt', 'live')) == int(live_asr and not cross_deadline)
+    assert bool(load_config(path).get('ai_session')) == live_asr
+    if cross_deadline:
+        assert state['stage'] == 'stopping' and 'ai_slot' not in state
     candidate.update(live_status=0, offline_checks=2)
     platform['sources'][0]['status'] = 'stopped'
-    runner.advance(config, state, moment)
+    if not cross_deadline:
+        runner.advance(config, state, moment)
     assert state['stage'] == 'stopping'
     runner.advance(config, state, moment)
     monkeypatch.setattr(runner, 'recording_files', lambda *a: {})
@@ -375,6 +396,7 @@ def test_end_to_end_lifecycle_uses_offline_reviews_and_same_public_url(tmp_path,
     assert state['stage'] == 'finalizing'  # 成功完成后给协调会话120秒收尾。
     runner.advance(config, state, moment + 120)
     assert state['stage'] == 'completed' and len(set(published)) == 1
+    assert ('create', 'finalize') in ai_calls
     page = (path.parent / 'public/index.html').read_text()
     assert 'setInterval' not in page and '离线新增原文' not in page
     assert json.loads((path.parent / 'public/snapshot.json').read_text())['activity']
