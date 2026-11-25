@@ -28,7 +28,7 @@ def test_missing_amount_and_optional_share():
     assert all('gift_share' not in row for row in result)
     result = period_overview([day('2026-01-08', 0, 10, unknown=1)], now=now,
                              share_amounts={'2026-01-08': 5}, share_label='测试观众')
-    assert result[0]['gift_share'] == {'label': '测试观众', 'percentage': None}
+    assert result[0]['gift_share'] == {'label': '测试观众', 'percentage': None, 'confirmed_percentage': 50}
 
 
 @pytest.mark.parametrize('rows,expected', [
@@ -39,6 +39,24 @@ def test_missing_amount_and_optional_share():
 ])
 def test_overall_preserves_audited_history(rows, expected):
     assert summary_gift_share(rows, '测试观众') == {'label': '测试观众', 'percentage': expected}
+
+
+def test_summary_share_keeps_confirmed_amounts_and_discloses_incomplete_coverage():
+    rows = [{'metrics': {'amount': 100, 'amount_nonself': 75, 'paid_donors_nonself': None}},
+            {'metrics': {'amount': None, 'amount_nonself': None}}]
+    assert summary_gift_share(rows, '测试观众') == {
+        'label': '测试观众', 'percentage': None, 'confirmed_percentage': 25,
+        'covered_sessions': 1, 'total_sessions': 2,
+    }
+
+
+def test_summary_share_includes_priced_subtotal_from_incomplete_session():
+    rows = [{'metrics': {'amount': None, 'amount_nonself': None, 'amount_priced': 100,
+                         'amount_nonself_priced': 75}}, {'metrics': {'amount': 50, 'amount_nonself': 50}}]
+    share = summary_gift_share(rows, '测试观众')
+    assert share['percentage'] is None
+    assert share['confirmed_percentage'] == pytest.approx(25 / 150 * 100)
+    assert share['partial_sessions'] == 1
 
 
 def club(date, value):

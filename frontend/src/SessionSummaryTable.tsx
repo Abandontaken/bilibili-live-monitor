@@ -19,7 +19,10 @@ export function SessionSummaryTable({rows,base=''}:{rows:SummaryRow[];base?:stri
     <a href={row.detail_url} target="_blank" rel="noreferrer">{row.date} · {row.session} ↗</a>:row.url?
     <a href={row.url}>{row.date} · {row.session} ↗</a>:row.date+' · '+row.session}
     {row.status!=='completed'&&row.updated_at&&<span className="archive-row-state">{row.status==='live'?'直播中':'整理中'} · {new Date(row.updated_at).toLocaleTimeString('zh-CN',{timeZone:'Asia/Shanghai',hour:'2-digit',minute:'2-digit',hour12:false})} 更新</span>}</td>
-   <td>{row.hours==null?'—':row.hours.toFixed(2)+' 小时'}</td>{columns.map(([key])=><td key={key}>{show(row.metrics[key],key)}</td>)}
+    <td>{row.hours==null?'—':row.hours.toFixed(2)+' 小时'}</td>{columns.map(([key])=><td key={key}>{
+      key==='paid_donors_nonself'&&row.metrics[key]==null&&row.metrics.paid_donors_nonself_minimum!=null
+       ?'至少 '+show(row.metrics.paid_donors_nonself_minimum,key):show(row.metrics[key],key)
+    }</td>)}
    <td>{row.status==='completed'?'已完成':row.status==='live'?'直播中':'整理中'}</td>
   </tr>)}</tbody></table></div>
   {!rows.length&&<p>暂无场次汇总。</p>}

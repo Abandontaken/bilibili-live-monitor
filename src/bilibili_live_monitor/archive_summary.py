@@ -64,6 +64,12 @@ def shared_summaries(path, local_rows, origin=None):
                                 (match.get('summary') or {}).get('gift_value_yuan')) if match else None
             values['amount_nonself'] = None
             values['paid_donors_nonself'] = None
+        else:
+            if type(minimum := metrics.get('paid_donors_nonself_minimum')) is int and minimum >= 0:
+                values['paid_donors_nonself_minimum'] = minimum
+            priced = metrics.get('amount_priced'), metrics.get('amount_nonself_priced')
+            if all(type(value) in (int, float) and math.isfinite(value) for value in priced):
+                values['amount_priced'], values['amount_nonself_priced'] = priced
         remote_path = row.get('url')
         detail_url = (origin + remote_path if origin and isinstance(remote_path, str)
                       and re.fullmatch(r'/(?:s|share)/[A-Za-z0-9_-]+/', remote_path) else None)

@@ -210,6 +210,41 @@ def overlay_session_gift_identities(
     return {**source, 'items': new_items}, counters
 
 
+def overlay_archive_gift_identities(source, warehouse_path, windows):
+    """周期统计复用数仓礼物字典；不使用需要单场上下文的榜单推断。"""
+    from bisect import bisect_right
+
+    starts = [start for start, _ in windows]
+    parts = {}
+    items = list(source['items'])
+
+    def window_index(at):
+        stamp = epoch(at)
+        i = bisect_right(starts, stamp) - 1
+        return i if i >= 0 and stamp <= windows[i][1] else None
+
+    for index, (_, at, item) in enumerate(items):
+        i = window_index(at)
+        if i is not None:
+            parts.setdefault(i, {'indices': [], 'raw': [], 'needs_overlay': False})
+            parts[i]['indices'].append(index)
+            parts[i]['needs_overlay'] |= item.get('identity_status') == 'unresolved'
+    for row in source['raw']:
+        part = parts.get(window_index(row[0]))
+        if part and part['needs_overlay']:
+            part['raw'].append(row)
+    dictionary = _load_identity_dictionary(warehouse_path)
+    for part in parts.values():
+        if part['needs_overlay']:
+            indices = part['indices']
+            resolved, _ = overlay_session_gift_identities(
+                {'items': [items[index] for index in indices], 'raw': part['raw']}, *dictionary,
+            )
+            for index, row in zip(indices, resolved['items'], strict=True):
+                items[index] = row
+    return {**source, 'items': items}
+
+
 def _recompute_summaries(
     existing_snapshot: dict[str, Any],
     resolved_source: dict[str, Any],

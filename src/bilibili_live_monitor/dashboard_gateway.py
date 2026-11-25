@@ -254,7 +254,8 @@ def create_gateway(config, *, transport=None, prewarm_archives=False):
                                        gift_share=archive.get('gift_share', {}).get(room_id),
                                        historical_windows=archive.get('historical_windows', {}).get(room_id, []),
                                        historical_root=archive.get('historical_root'),
-                                       history_sources=archive.get('history_sources', {}).get(room_id, []))
+                                        history_sources=archive.get('history_sources', {}).get(room_id, []),
+                                        warehouse_database=archive.get('warehouse_database'))
         data['mode'] = row.get('mode', 'account')
         if summary_file:
             from .archive_summary import shared_summaries
@@ -472,17 +473,47 @@ def create_gateway(config, *, transport=None, prewarm_archives=False):
         if not re.fullmatch(r'[a-f0-9]{24}', key) or asset not in ('index.html', 'snapshot.json', 'data.json') or not row.get('session_root'):
             raise HTTPException(404, '结果不存在')
         archive = row.get('archive', {})
-        # 依次查本实例、旧归档及跨实例交接前的场次目录；只返回其中已生成的公开文件。
-        roots = [row['session_root'], archive.get('historical_root')] + [
-            item.get('session_root') for items in archive.get('history_sources', {}).values() for item in items]
-        for candidate in [Path(r).resolve() for r in roots if isinstance(r, str) and r]:
-            root, path = candidate, (candidate / key / 'public' / asset).resolve()
-            if path.is_relative_to(root) and path.is_file():
-                break
-        if not path.is_relative_to(root) or not path.is_file():
+        from .room_archive import history_cutoffs, read_object, session_priority, session_record
+        from .time_utils import epoch
+        roots = [(r, None, None) for r in (row['session_root'], archive.get('historical_root'))]
+        roots += [(item['session_root'], rid, item) for rid, items in archive.get('history_sources', {}).items()
+                  for item in history_cutoffs(items)]
+        chosen = fallback = None
+        for candidate, room, bounds in roots:
+            if not isinstance(candidate, str) or not candidate:
+                continue
+            root = Path(candidate).resolve()
+            directory = root / key
+            path = (directory / 'public' / asset).resolve()
+            if not path.is_relative_to(root):
+                continue
+            try:
+                cfg, start, end, workflow, _ = session_record(root, directory)
+            except (OSError, ValueError, TypeError, KeyError):
+                if fallback is None and path.is_file():
+                    if bounds is not None:
+                        try:
+                            cfg = read_object(root, directory / 'config.json')
+                            if str(cfg.get('room_id')) != room:
+                                continue
+                            stamp = cfg.get('start_utc')
+                            if stamp is not None and not bounds['since_epoch'] <= epoch(stamp) < bounds['until_epoch']:
+                                continue
+                        except (OSError, ValueError, TypeError, KeyError):
+                            continue
+                    fallback = ((), root, path)
+                continue
+            if bounds and (str(cfg.get('room_id')) != room or not bounds['since_epoch'] <= start < bounds['until_epoch']):
+                continue
+            priority = session_priority(start, end, workflow)
+            if chosen is None or priority > chosen[0]:
+                chosen = (priority, root, path)
+        selected = chosen or fallback
+        if selected is None or not selected[2].is_file():
             raise HTTPException(404, '结果尚未生成')
+        _, root, path = selected
         if asset == 'index.html' and row.get('archive'):
-            from .room_archive import read_json, read_object
+            from .room_archive import read_json
             from .session_overview import session_overview
             try:
                 config = read_json(root, root / key / 'config.json')
