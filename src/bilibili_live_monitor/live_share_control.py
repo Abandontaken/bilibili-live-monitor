@@ -187,11 +187,11 @@ def export_snapshot(config):
     return {'output': str(destination), 'published': False, 'phase': snapshot['phase'], 'cutoff': iso(cutoff)}
 
 
-def verify_snapshot(config):
+def verify_snapshot(config, *, public_dir=None, validation_only=False):
     from .activity_summary import accounting_errors
     from .annotation_history import read_annotations
     workspace = Path(config['workspace'])
-    public = workspace / 'public'
+    public = public_dir if public_dir is not None else workspace / 'public'
     snapshot = json.loads((public / 'snapshot.json').read_text())
     page = (public / 'index.html').read_text()
     errors = accounting_errors(snapshot)
@@ -217,6 +217,11 @@ def verify_snapshot(config):
     stopped_phases = {'completed', 'finalizing'} if config.get('workflow_key') else {'completed'}
     if (state.get('phase') == 'completed' or state.get('stop_intent')) and snapshot.get('phase') not in stopped_phases:
         errors.append('completed_page_still_live')
+    for row in snapshot.get('activity_summary', []):
+        if row.get('title') and html.escape(row['title'], quote=True) not in page:
+            errors.append('title_missing_from_html')
+    if validation_only:
+        return {'valid': not errors, 'errors': errors}
     known = set(config.get('approved_songs', [])) | set(verified_titles(workspace))
     annotations = read_annotations(workspace)
     current = {s['seq']: fingerprint(s) for s in source['segments'] if s.get('is_final') and s.get('text')}
@@ -232,9 +237,6 @@ def verify_snapshot(config):
                       if isinstance(row, dict) and isinstance(row.get('id'), str) and row['id'] in candidate_ids
                       and isinstance(row.get('song'), str) and row['song'] and row['song'] not in known}
     unpublished = sorted(set(unpublished) | request_titles)
-    for row in snapshot.get('activity_summary', []):
-        if row.get('title') and html.escape(row['title'], quote=True) not in page:
-            errors.append('title_missing_from_html')
     return {'valid': not errors, 'errors': errors, 'unpublished_songs': unpublished,
             'unreviewed_windows': len(current.keys() - reviews.keys()),
             'unnamed_singing_windows': sum(r.get('label') == 'singing' and not r.get('song') for r in reviews.values()),

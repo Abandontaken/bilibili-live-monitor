@@ -64,6 +64,19 @@ def _has_point_in_closed_range(epochs, lower, upper):
     return idx < len(epochs) and epochs[idx] <= upper
 
 
+def nonself_donor_counts(gifts):
+    confirmed = len({str(g[3]) for g in gifts if g[3] is not None and (g[2] or 0) > 0})
+    incomplete = any(g[2] is None or (g[2] > 0 and g[3] is None) for g in gifts)
+    return (None, confirmed) if incomplete else (confirmed, None)
+
+
+def partial_gift_amounts(gifts, others):
+    if not any(gift[2] is None for gift in gifts) or not any(gift[2] is not None for gift in gifts):
+        return {}
+    return {'amount_priced': sum(gift[2] or 0 for gift in gifts) / 1000,
+            'amount_nonself_priced': sum(gift[2] or 0 for gift in others) / 1000}
+
+
 def aggregate_prepared_metrics(prepared, lower, upper, excluded_uids=None):
     if not (math.isfinite(lower) and math.isfinite(upper) and lower <= upper):
         raise ValueError('invalid_metric_time_range')
@@ -90,17 +103,21 @@ def aggregate_prepared_metrics(prepared, lower, upper, excluded_uids=None):
     )
     known_amount = observed and all(gift[2] is not None for gift in gifts)
     amount = round(sum(gift[2] for gift in gifts) / 1000, 2) if known_amount else None
-    others = donors = None
-    if excluded_uids is not None and known_amount and all(not gift[2] or gift[3] is not None for gift in gifts):
+    others = donors = minimum = None
+    partial = {}
+    if excluded_uids is not None and observed:
         excluded = set(map(str, excluded_uids))
         selected = [gift for gift in gifts if str(gift[3]) not in excluded]
-        others = round(sum(gift[2] for gift in selected) / 1000, 2)
-        donors = len({str(gift[3]) for gift in selected if gift[2] > 0})
+        donors, minimum = nonself_donor_counts(selected)
+        partial = partial_gift_amounts(gifts, selected)
+        if known_amount:
+            others = round(sum(gift[2] for gift in selected) / 1000, 2)
     return {'online_mean': weighted / seconds if seconds else None,
             'online_peak': max((value for _, value in online), default=None),
             'watched_last': watched[-1][1] if watched else None,
             'followers_net': fans[-1][1] - fans[0][1] if len(fans) >= 2 else None,
-            'amount': amount, 'amount_nonself': others, 'paid_donors_nonself': donors}
+            'amount': amount, 'amount_nonself': others, 'paid_donors_nonself': donors, **partial,
+            **({'paid_donors_nonself_minimum': minimum} if minimum is not None else {})}
 
 
 def aggregate_metrics(source, lower, upper, excluded_uids=None):

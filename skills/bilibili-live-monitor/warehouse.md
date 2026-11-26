@@ -58,3 +58,7 @@ bili-live warehouse backfill-pages \
 3. **不伪造历史待跟进**：仅更新 `gift_summary`（每人送礼汇总）与 `activity_summary`（含单曲去重送礼人数 `gift_users`），原场已封口的 `followups`（灯牌与盲盒点歌跟进）保持不变。
 4. **差量触发**：重算结果与磁盘现有 `public/snapshot.json` 一致时记为 `unchanged` 跳过，不触碰锁或静态文件。
 5. **锁保护、原生校验与留痕回滚**：`--execute` 非阻塞获取 `workflow.lock` 与 `publisher.lock`，原子写出 `public/index.html` 与 `public/snapshot.json` 后强制运行 `verify_snapshot` 校验金额守恒与零隐私字段泄漏；校验失败立即原子回滚旧字节，通过后在场次目录追加 `identity_backfill_history.jsonl` 审计摘要并更新 `workflow.json` 的 `final_artifacts`。
+
+## 已发布场次回填
+
+`bili-live warehouse backfill-remote-pages --warehouse /PRIVATE/warehouse.sqlite3 --session-root /PRIVATE/live_sessions` 只读预演。`--execute` 处理已完成且已有远端地址的场次，只发布该场原有的 HTML 和 JSON。只允许使用本场送礼表已展示的名字，不公开新的跨房名字或哈希后缀。时间、礼物总计、点歌跟进和其他场次指标不变。先校验候选，再发布并读回两文件，最后更新本地。若传输中断，私有 `identity_remote_pending.json` 保留可重试候选；本地、远端或发布目标出现第三种版本时停止并报告失败。

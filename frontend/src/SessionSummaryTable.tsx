@@ -11,7 +11,6 @@ export function SessionSummaryTable({rows,base=''}:{rows:SummaryRow[];base?:stri
    key==='online_mean'?value.toFixed(2):key.startsWith('amount')?'¥'+value.toFixed(2):
     (key==='followers_net'&&value>0?'+':'')+value.toLocaleString('zh-CN');
  return <section className="archive-panel session-summary" aria-label="场次汇总"><h2>场次汇总</h2>
-  <p>按开播日期查看完整场次，跨天直播不拆分。暂无记录的指标显示为 —。</p>
   <div className="session-summary-scroll" tabIndex={0} aria-label="场次汇总表，可横向滚动"><table><thead><tr>
    <th>日期 · 场次</th><th>时长</th>{columns.map(([key,label])=><th key={key}>{label}</th>)}<th>状态</th>
    </tr></thead><tbody id="rows">{rows.map((row,index)=><tr key={row.key||row.date+row.session+index}>
@@ -19,7 +18,10 @@ export function SessionSummaryTable({rows,base=''}:{rows:SummaryRow[];base?:stri
     <a href={row.detail_url} target="_blank" rel="noreferrer">{row.date} · {row.session} ↗</a>:row.url?
     <a href={row.url}>{row.date} · {row.session} ↗</a>:row.date+' · '+row.session}
     {row.status!=='completed'&&row.updated_at&&<span className="archive-row-state">{row.status==='live'?'直播中':'整理中'} · {new Date(row.updated_at).toLocaleTimeString('zh-CN',{timeZone:'Asia/Shanghai',hour:'2-digit',minute:'2-digit',hour12:false})} 更新</span>}</td>
-   <td>{row.hours==null?'—':row.hours.toFixed(2)+' 小时'}</td>{columns.map(([key])=><td key={key}>{show(row.metrics[key],key)}</td>)}
+    <td>{row.hours==null?'—':row.hours.toFixed(2)+' 小时'}</td>{columns.map(([key])=><td key={key}>{
+      key==='paid_donors_nonself'&&row.metrics[key]==null&&row.metrics.paid_donors_nonself_minimum!=null
+       ?'至少 '+show(row.metrics.paid_donors_nonself_minimum,key):show(row.metrics[key],key)
+    }</td>)}
    <td>{row.status==='completed'?'已完成':row.status==='live'?'直播中':'整理中'}</td>
   </tr>)}</tbody></table></div>
   {!rows.length&&<p>暂无场次汇总。</p>}

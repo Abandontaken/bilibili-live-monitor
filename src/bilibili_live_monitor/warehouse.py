@@ -167,10 +167,12 @@ SELECT
     e.*,
     CASE
         WHEN e.is_mystery = 1 THEN NULL
+        WHEN e.inference_method = 'blind_box_first_rank_window' THEN NULL
         ELSE COALESCE(e.raw_uid, u_md5.uid, e.resolved_crc32_uid, u_face_user.uid, e.inferred_uid)
     END AS resolved_uid,
     CASE
         WHEN e.is_mystery = 1 THEN 'mystery:' || e.session_key || ':' || e.event_seq
+        WHEN e.inference_method = 'blind_box_first_rank_window' THEN 'anon:' || e.session_key || ':' || e.event_seq
         WHEN COALESCE(e.raw_uid, u_md5.uid, e.resolved_crc32_uid, u_face_user.uid, e.inferred_uid) IS NOT NULL
             THEN 'uid:' || COALESCE(e.raw_uid, u_md5.uid, e.resolved_crc32_uid, u_face_user.uid, e.inferred_uid)
         WHEN e.clue_md5 IS NOT NULL THEN 'md5:' || e.clue_md5
@@ -180,6 +182,7 @@ SELECT
     END AS actor_key,
     CASE
         WHEN e.is_mystery = 1 THEN 'mystery'
+        WHEN e.inference_method = 'blind_box_first_rank_window' THEN 'unresolved'
         WHEN e.raw_uid IS NOT NULL THEN 'native_uid'
         WHEN u_md5.uid IS NOT NULL THEN 'global_md5'
         WHEN e.resolved_crc32_uid IS NOT NULL THEN 'crc32_first_char'
@@ -1435,6 +1438,7 @@ def _resolve_danmaku_crc32_and_presence(wh: sqlite3.Connection) -> dict[str, int
            AND u_md5.uid IS NULL
            AND e.clue_face_sha1 = u_face.face_sha1
         WHERE e.is_mystery = 0
+          AND e.inference_method IS NOT 'blind_box_first_rank_window'
           AND COALESCE(e.raw_uid, u_md5.uid, u_face.uid, e.inferred_uid) IS NOT NULL
         GROUP BY e.session_key, e.room_id, firm_uid
         """
@@ -2155,6 +2159,11 @@ def configure_parser(commands) -> argparse.ArgumentParser:
     mode.add_argument('--dry-run', action='store_true', help='仅只读预演差量变更，不写任何文件（默认）')
     mode.add_argument('--execute', action='store_true', help='获取场次锁并原子写回有变化的本地看板产物')
 
+    remote = sub.add_parser('backfill-remote-pages', help='校验并回填已发布场次的送礼身份')
+    remote.add_argument('--warehouse', type=Path, required=True)
+    remote.add_argument('--session-root', type=Path, action='append', required=True)
+    remote.add_argument('--execute', action='store_true', help='发布有变化的页面；默认只读预演')
+
     stats = sub.add_parser('stats', help='输出数仓全局统计摘要与分档消解率 JSON')
     stats.add_argument('--warehouse', type=Path, required=True, help='本地数仓 SQLite 路径')
     return parser
@@ -2177,9 +2186,14 @@ def main(args) -> int:
                 session_roots=args.session_root,
                 execute=bool(args.execute),
             )
+        elif args.warehouse_command == 'backfill-remote-pages':
+            from .warehouse_remote_backfill import backfill_remote_pages
+            result = backfill_remote_pages(args.warehouse, args.session_root, execute=args.execute)
         else:
             result = warehouse_stats(args.warehouse)
         print(json.dumps(result, ensure_ascii=False, indent=2))
+        if args.warehouse_command == 'backfill-remote-pages' and result['failures']:
+            return 1
         return 0
     except (ValueError, TypeError, KeyError, OSError, sqlite3.Error) as error:
         print(json.dumps({'error': f'{type(error).__name__}: {error}'}, ensure_ascii=False))

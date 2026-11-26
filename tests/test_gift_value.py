@@ -143,6 +143,14 @@ def test_crm_revalues_frozen_history_by_event_identity_without_mutating_it(tmp_p
     refreshed = refresh_archive_values(rows, config)
     assert refreshed[0]['metrics'] == {'amount': 2233, 'amount_nonself': 0, 'paid_donors_nonself': 0, 'online_mean': 10}
     assert rows[0]['metrics']['amount'] == 15
+    with sqlite3.connect(path) as db:
+        anonymous = {'author': '匿***', 'gift': {**gift, 'event_id': 'another-order'}}
+        del anonymous['gift']['sender_uid']
+        db.execute('INSERT INTO timeline VALUES(2,?,?,?,?)', ('456', 'gift', at, json.dumps(anonymous)))
+    assert refresh_archive_values(rows, config)[0]['metrics'] == {
+        'amount': 4466, 'amount_nonself': 2233, 'paid_donors_nonself': None, 'online_mean': 10,
+        'paid_donors_nonself_minimum': 0,
+    }
     no_records = refresh_archive_values([{**rows[0], 'start_utc': '2026-01-02T11:00:00Z',
                                          'updated_at': '2026-01-02T13:00:00Z', 'metrics': {'amount': 0}}], config)
     assert no_records[0]['metrics']['amount'] is None

@@ -6,6 +6,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .activity_summary import gift_observations, summarize_gifters
+from .archive_metrics import nonself_donor_counts, partial_gift_amounts
 from .gift_value import VALUE_BASIS, value_fields
 from .time_utils import epoch, iso
 
@@ -85,6 +86,9 @@ def refresh_archive_values(rows, config):
             start, end = row.get('start_utc') or fallback[0], row.get('updated_at') or fallback[1]
             metrics = row['metrics']
             metrics.update(amount=None, amount_nonself=None, paid_donors_nonself=None)
+            metrics.pop('paid_donors_nonself_minimum', None)
+            metrics.pop('amount_priced', None)
+            metrics.pop('amount_nonself_priced', None)
             row['gift_value_basis'] = VALUE_BASIS
             if not start or not end:
                 continue
@@ -95,15 +99,17 @@ def refresh_archive_values(rows, config):
             events = gift_observations(source, platform_uid=True)
             if not events:
                 continue
+            excluded = set(map(str, config.get('exclude_account_uids', [])))
+            others = [event for event in events if str(event[3]) not in excluded]
+            donors, minimum = nonself_donor_counts(others)
+            metrics['paid_donors_nonself'] = donors
+            if minimum is not None:
+                metrics['paid_donors_nonself_minimum'] = minimum
             if any(event[2] is None for event in events):
+                metrics.update(partial_gift_amounts(events, others))
                 continue
             metrics['amount'] = sum(event[2] for event in events) / 1000
-            excluded = set(map(str, config.get('exclude_account_uids', [])))
-            if any(event[2] and event[3] is None for event in events):
-                continue
-            others = [event for event in events if str(event[3]) not in excluded]
             metrics['amount_nonself'] = sum(event[2] for event in others) / 1000
-            metrics['paid_donors_nonself'] = len({event[3] for event in others if event[2] > 0})
     return result
 
 

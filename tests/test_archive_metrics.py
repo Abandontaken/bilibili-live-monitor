@@ -78,7 +78,9 @@ def test_gift_dedup_exclusion_and_unknown_identity():
     data['items'].append(gift(None, 'c', 1000))
     metrics = aggregate_metrics(data, LOWER, UPPER, {'123'})
     assert metrics['amount'] == 16
-    assert metrics['amount_nonself'] is metrics['paid_donors_nonself'] is None
+    assert metrics['amount_nonself'] == 6
+    assert metrics['paid_donors_nonself'] is None
+    assert metrics['paid_donors_nonself_minimum'] == 1
 
 
 def test_unknown_gift_amount_does_not_hide_viewer_metrics():
